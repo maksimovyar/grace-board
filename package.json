@@ -1,0 +1,16 @@
+{
+  "name": "grace-board",
+  "version": "0.1.0",
+  "description": "Local kanban dispatch board for the grace-feature-dev pipeline",
+  "type": "commonjs",
+  "license": "MIT",
+  "author": "maksimovyar",
+  "homepage": "https://github.com/maksimovyar/grace-board#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/maksimovyar/grace-board.git" },
+  "bugs": { "url": "https://github.com/maksimovyar/grace-board/issues" },
+  "keywords": ["claude-code", "kanban", "agents", "grace", "autonomous", "pipeline"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js"
+  }
+}

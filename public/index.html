@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>grace · board — диспетчерская</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ffffff'/%3E%3Ccircle cx='16' cy='16' r='6' fill='none' stroke='%23D85B22' stroke-width='2.4'/%3E%3Ccircle cx='16' cy='16' r='2' fill='%23C98A12'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<header class="console">
+  <div class="console__brand">
+    <span class="console__mark" aria-hidden="true"></span>
+    <div>
+      <h1 class="console__title">grace<span>·</span>board</h1>
+      <p class="console__sub">диспетчерская · команда работает сама</p>
+    </div>
+  </div>
+  <nav class="strip" id="strip" aria-label="станции"></nav>
+  <button class="btn btn--solid" id="openComposer" type="button">+ Новая задача</button>
+</header>
+
+<main class="board" id="board" aria-label="kanban board"></main>
+
+<div class="hint">Перетаскивай <b>карточки</b> между станциями · нажми карточку — откроется задача · <b>+ Новая задача</b></div>
+
+<!-- ── DETAIL DRAWER (Backlog / прочее — без вопросов) ─────────────── -->
+<div class="sheet" id="detail" hidden>
+  <div class="sheet__scrim" data-close></div>
+  <div class="sheet__panel" id="detailPanel"></div>
+</div>
+
+<!-- ── ASKING DRAWER (функционал + архитектура) ────────────────────── -->
+<div class="sheet sheet--wide" id="ask" hidden>
+  <div class="sheet__scrim" data-close></div>
+  <div class="sheet__panel" id="askPanel"></div>
+</div>
+
+<!-- ── NEW TASK / EDIT COMPOSER ─────────────────────────────────────── -->
+<div class="sheet" id="composer" hidden>
+  <div class="sheet__scrim" data-close></div>
+  <form class="sheet__panel" id="composerForm" autocomplete="off">
+    <div class="sheet__head"><h2 class="sheet__title" id="composerTitle">Новая задача</h2><button class="sheet__close" type="button" data-close aria-label="Закрыть">✕</button></div>
+    <p class="sheet__hint">Появится в <strong>Backlog</strong>. Перетащи её через рычаг запуска — и команда возьмёт задачу в работу.</p>
+
+    <label class="field"><span class="field__label">Проект</span>
+      <input class="field__input" name="project" required placeholder="напр. Emotions" />
+      <span class="field__note">имя папки в корне проектов</span></label>
+
+    <label class="field"><span class="field__label">Тема</span>
+      <input class="field__input" name="theme" required placeholder="Коротко — что делаем" /></label>
+
+    <label class="field"><span class="field__label">Описание <span class="field__opt"><span id="cnt">0</span> / 2000</span></span>
+      <textarea class="field__input field__input--area" name="description" rows="5" maxlength="2000" placeholder="Подробно: поведение, сценарии, что важно…"></textarea></label>
+
+    <div class="field-row">
+      <label class="field"><span class="field__label">Макеты <span class="field__opt">ссылка</span></span>
+        <input class="field__input" name="designLink" type="url" placeholder="https://figma.com/…" /></label>
+      <label class="field"><span class="field__label">Требования <span class="field__opt">ссылка</span></span>
+        <input class="field__input" name="requirementsLink" type="url" placeholder="https://…/spec" /></label>
+    </div>
+
+    <div class="field"><span class="field__label">Вложения <span class="field__opt">скриншоты / файлы требований</span></span>
+      <label class="dropzone" id="dropzone">
+        <span class="dropzone__icon">⎙</span><span class="dropzone__text">Перетащи сюда или выбери файлы</span>
+        <input type="file" id="fileInput" multiple hidden />
+      </label>
+      <ul class="att-list" id="attList"></ul>
+    </div>
+
+    <div class="sheet__divider">Настройки прогона</div>
+    <label class="field"><span class="field__label">GRACE‑разметка</span>
+      <div class="seg" id="rigorSeg">
+        <button type="button" class="seg__opt is-on" data-rigor="grace">Включена</button>
+        <button type="button" class="seg__opt" data-rigor="off">Выключена</button>
+      </div>
+      <span class="field__note">семантический экзоскелет + LDD‑логи в коде</span></label>
+
+    <div class="sheet__actions">
+      <button class="btn btn--ghost" type="button" data-close>Отмена</button>
+      <button class="btn btn--solid" type="submit" id="composerSubmit">В Backlog</button>
+    </div>
+  </form>
+</div>
+
+<!-- ── LOG VIEWER ───────────────────────────────────────────────────── -->
+<div class="sheet logsheet" id="logsheet" hidden>
+  <div class="sheet__scrim" data-close></div>
+  <div class="sheet__panel">
+    <div class="sheet__head">
+      <div class="runtabs">
+        <button class="runtab is-active" type="button" data-runtab="plan">План</button>
+        <button class="runtab" type="button" data-runtab="log">Лог прогона</button>
+      </div>
+      <button class="sheet__close" type="button" data-close aria-label="Закрыть">✕</button>
+    </div>
+    <div class="runview" id="planView">
+      <div class="planstatus" id="planStatus"></div>
+      <pre class="planbody" id="planDoc"></pre>
+    </div>
+    <div class="runview" id="logView" hidden>
+      <div class="logmeta" id="logMeta"></div>
+      <pre class="logbody" id="logBody"></pre>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

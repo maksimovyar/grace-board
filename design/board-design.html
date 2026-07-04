@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>grace · board — дизайн доски</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ffffff'/%3E%3Ccircle cx='16' cy='16' r='6' fill='none' stroke='%23D85B22' stroke-width='2.4'/%3E%3Ccircle cx='16' cy='16' r='2' fill='%23C98A12'/%3E%3C/svg%3E" />
+<style>
+/* ───────────────────────────────────────────────────────────────────────────
+   grace-board — DESIGN MOCKUP · «дневная диспетчерская» (светлая тема)
+   Прохладный светлый пульт: бумажно-стальной фон, графитовые чернила, белые
+   карточки. Идентичность фаз — спектр сигналов (серый → синий → янтарь → уголь →
+   фиолет → бирюза → зелёный → красный), один тон на станцию.
+   Display: Bricolage Grotesque · Body: Hanken Grotesk · Машинный голос: JetBrains Mono.
+   Подпись: рычаг запуска после Backlog (перетащил карточку → вспышка) + тихий
+   «рабочий пульс» на лампе карточек, которые сейчас держит агент.
+   Статичный дизайн-превью: данные зашиты, drag-and-drop живой, остальное — демо.
+   ─────────────────────────────────────────────────────────────────────────── */
+:root{
+  --bg:#E7EBF1; --bg-2:#EEF1F6; --well:#DFE4EC; --surface:#FFFFFF; --surface-2:#F4F6FA;
+  --line:#D4DBE5; --line-2:#BFC8D6;
+  --ink:#1B2027; --ink-soft:#525C6B; --ink-faint:#868F9E;
+  --s-backlog:#6B7480; --s-todo:#2F73C2; --s-asking:#C98A12; --s-implementing:#D85B22;
+  --s-verifying:#8B53E0; --s-reviewing:#149B8B; --s-ready:#2E9E50; --s-blocked:#D33F35;
+  --ember:#D85B22; --amber:#E6A11E;
+  --radius:13px; --radius-sm:8px;
+  --shadow:0 1px 2px rgba(27,40,68,.06),0 8px 22px rgba(27,40,68,.07);
+  --shadow-lift:0 2px 6px rgba(27,40,68,.10),0 20px 44px rgba(27,40,68,.14);
+  --display:"Bricolage Grotesque",system-ui,sans-serif;
+  --sans:"Hanken Grotesk",system-ui,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; font-family:var(--sans); color:var(--ink); -webkit-font-smoothing:antialiased;
+  background:
+    radial-gradient(1200px 600px at 80% -10%,rgba(216,91,34,.05),transparent 60%),
+    radial-gradient(900px 520px at 10% 110%,rgba(47,115,194,.05),transparent 60%),
+    var(--bg);
+  display:flex; flex-direction:column; min-height:100%;
+}
+
+/* ── console header ── */
+.console{display:flex;align-items:center;gap:26px;padding:15px 24px;border-bottom:1px solid var(--line);
+  background:rgba(238,241,246,.85);backdrop-filter:blur(10px);position:sticky;top:0;z-index:20}
+.console__brand{display:flex;align-items:center;gap:13px}
+.console__mark{width:30px;height:30px;border-radius:9px;border:2.4px solid var(--ember);position:relative;flex:none;box-shadow:0 0 0 4px rgba(216,91,34,.08)}
+.console__mark::after{content:"";position:absolute;inset:0;margin:auto;width:7px;height:7px;border-radius:50%;background:var(--amber)}
+.console__title{font-family:var(--display);font-weight:800;font-size:20px;margin:0;letter-spacing:-.02em}
+.console__title span{color:var(--ember);margin:0 1px}
+.console__sub{margin:2px 0 0;font-size:11.5px;color:var(--ink-faint);font-family:var(--mono)}
+.strip{display:flex;align-items:center;gap:4px;margin-left:auto;flex-wrap:wrap}
+.strip__cell{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;color:var(--ink-soft);
+  border:1px solid var(--line);border-radius:999px;padding:4px 11px 4px 9px;background:var(--surface)}
+.strip__lamp{width:8px;height:8px;border-radius:50%;flex:none;box-shadow:0 0 7px currentColor}
+.strip__n{color:var(--ink);font-weight:700}
+.btn{font-family:var(--display);font-weight:600;font-size:14px;border-radius:10px;padding:10px 16px;cursor:pointer;white-space:nowrap;
+  border:1px solid transparent;transition:transform .12s ease,background .18s ease,border-color .18s ease}
+.btn--solid{color:#fff;background:var(--ember)}
+.btn--solid:hover{background:#c44f1b;transform:translateY(-1px)}
+.btn--ghost{color:var(--ink-soft);background:var(--surface);border-color:var(--line-2)}
+.btn--ghost:hover{color:var(--ink);border-color:var(--ink-soft)}
+.btn--danger{color:var(--s-blocked);background:transparent;border-color:rgba(211,63,53,.4)}
+.btn--danger:hover{background:rgba(211,63,53,.08);border-color:var(--s-blocked)}
+
+/* ── board ── */
+.board{flex:1;display:flex;align-items:stretch;gap:0;padding:22px 24px 30px;overflow-x:auto;overflow-y:hidden}
+.station{flex:0 0 286px;display:flex;flex-direction:column;min-height:0}
+.station+.station{margin-left:16px}
+.station__head{display:flex;align-items:center;gap:9px;padding:0 4px 11px}
+.station__no{font-family:var(--mono);font-size:11px;color:var(--ink-faint)}
+.station__lamp{width:9px;height:9px;border-radius:50%;flex:none;box-shadow:0 0 8px currentColor}
+.station__name{font-family:var(--display);font-weight:600;font-size:14.5px;letter-spacing:-.01em}
+.station__count{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ink-soft);background:var(--surface);
+  border:1px solid var(--line);min-width:22px;text-align:center;padding:1px 7px;border-radius:999px}
+.well{flex:1;border:1px solid transparent;border-radius:var(--radius);background:var(--well);padding:7px;overflow-y:auto;min-height:90px;
+  transition:background .15s ease,border-color .15s ease,box-shadow .15s ease}
+.well.is-over{border-color:var(--line-2);box-shadow:inset 0 0 0 2px rgba(47,115,194,.25);background:#dbe2ec}
+.station--backlog .well{background:linear-gradient(var(--bg-2),var(--well));border:1px solid var(--line)}
+.station--blocked{flex:0 0 250px}
+.station--blocked .well{background:rgba(211,63,53,.05);border:1px solid rgba(211,63,53,.2)}
+.well__empty{font-family:var(--mono);font-size:11.5px;color:var(--ink-faint);text-align:center;padding:24px 10px;line-height:1.6;white-space:pre-line}
+
+/* the launch LEVER — the signature device + a live drop target */
+.lever{flex:0 0 60px;align-self:stretch;margin:0 5px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;position:relative;border-radius:var(--radius)}
+.lever.is-over{background:rgba(216,91,34,.08)}
+.lever::before{content:"";position:absolute;top:28px;bottom:28px;left:50%;width:2px;
+  background:repeating-linear-gradient(var(--ember) 0 7px,transparent 7px 14px);opacity:.55;transform:translateX(-50%)}
+.lever__knob{width:26px;height:26px;border-radius:50%;z-index:1;background:radial-gradient(circle at 35% 30%,#ffb27e,var(--ember));
+  box-shadow:0 0 0 4px rgba(216,91,34,.14),0 4px 10px rgba(27,40,68,.2)}
+.lever__label{font-family:var(--mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--ember);writing-mode:vertical-rl;transform:rotate(180deg);z-index:1}
+
+/* ── card ── */
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);
+  margin-bottom:9px;cursor:grab;overflow:hidden;transition:box-shadow .15s ease,transform .12s ease,border-color .15s ease}
+.card:hover{box-shadow:var(--shadow-lift);transform:translateY(-1px);border-color:var(--line-2)}
+.card:active{cursor:grabbing}
+.card.is-dragging{opacity:.4}
+.card__body{padding:12px 13px 11px;border-left:3px solid var(--line)}
+.card__meta{display:flex;align-items:center;gap:8px;margin-bottom:9px}
+.card__lamp{width:9px;height:9px;border-radius:50%;flex:none;box-shadow:0 0 8px currentColor}
+.card__project{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface-2);border:1px solid var(--line);
+  padding:2px 7px;border-radius:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
+.card__crew{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+.card__theme{font-family:var(--display);font-weight:600;font-size:15px;line-height:1.28;margin:0 0 5px;letter-spacing:-.01em}
+.card__desc{font-size:12.5px;line-height:1.45;margin:0 0 9px;color:var(--ink-soft);
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card__tags{display:flex;flex-wrap:wrap;gap:6px}
+.tag{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);display:inline-flex;align-items:center;gap:4px;
+  border:1px solid var(--line-2);border-radius:6px;padding:2px 7px;text-decoration:none;background:var(--surface-2)}
+.tag:hover{border-color:var(--ink-soft);color:var(--ink)}
+.card__ask{display:flex;align-items:center;gap:8px;margin-top:9px;font-family:var(--mono);font-size:11.5px;color:#3a2706;font-weight:700;
+  background:var(--amber);border-radius:var(--radius-sm);padding:8px 11px;cursor:pointer}
+.card__ask .dot{width:7px;height:7px;border-radius:50%;background:#3a2706;animation:blip 1.3s ease-in-out infinite}
+.card__ask .arr{margin-left:auto}
+.card__blocked{margin:9px 13px 0;padding:8px 10px;border-radius:var(--radius-sm);background:rgba(211,63,53,.08);
+  border:1px solid rgba(211,63,53,.25);font-size:11.5px;line-height:1.45;color:#a8362e}
+.card__stamp{margin:9px 13px 0;padding-top:8px;border-top:1px dashed var(--line-2);font-family:var(--mono);
+  font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-faint)}
+.card__foot{display:flex;align-items:center;gap:4px;padding:9px 11px 10px}
+.card__act,.card__del{background:none;border:none;cursor:pointer;font-family:var(--mono);font-size:11px;color:var(--ink-faint);padding:3px 6px;border-radius:6px}
+.card__act:hover{color:var(--ink);background:var(--surface-2)}
+.card__del{margin-left:auto}
+.card__del:hover{color:var(--s-blocked);background:rgba(211,63,53,.08)}
+.card[data-col="backlog"] .card__body{border-left-color:var(--s-backlog)}
+.card[data-col="todo"] .card__body{border-left-color:var(--s-todo)}
+.card[data-col="asking"] .card__body{border-left-color:var(--s-asking)}
+.card[data-col="implementing"] .card__body{border-left-color:var(--s-implementing)}
+.card[data-col="verifying"] .card__body{border-left-color:var(--s-verifying)}
+.card[data-col="reviewing"] .card__body{border-left-color:var(--s-reviewing)}
+.card[data-col="ready"] .card__body{border-left-color:var(--s-ready)}
+.card[data-col="blocked"] .card__body{border-left-color:var(--s-blocked)}
+.card[data-working="1"] .card__lamp{animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.78)}}
+@keyframes blip{0%,100%{opacity:1}50%{opacity:.25}}
+@keyframes ignite{0%{box-shadow:0 0 0 0 rgba(216,91,34,.5),var(--shadow)}60%{box-shadow:0 0 0 12px rgba(216,91,34,0),var(--shadow-lift)}100%{box-shadow:var(--shadow)}}
+.card.is-ignite{animation:ignite .75s ease-out}
+
+/* ── sheet (drawer + composer share chrome) ── */
+.sheet{position:fixed;inset:0;z-index:40}
+.sheet[hidden]{display:none}
+.sheet__scrim{position:absolute;inset:0;background:rgba(40,52,74,.34);backdrop-filter:blur(2px)}
+.sheet__panel{position:absolute;top:0;right:0;height:100%;width:min(440px,94vw);background:var(--bg-2);
+  border-left:1px solid var(--line-2);box-shadow:-28px 0 70px rgba(27,40,68,.22);padding:22px 24px 28px;overflow-y:auto;
+  display:flex;flex-direction:column;gap:15px;animation:slidein .22s ease}
+.sheet--wide .sheet__panel{width:min(580px,96vw)}
+@keyframes slidein{from{transform:translateX(28px);opacity:.5}to{transform:none;opacity:1}}
+.sheet__head{display:flex;align-items:center;gap:10px}
+.sheet__title{font-family:var(--display);font-weight:700;font-size:19px;margin:0;letter-spacing:-.01em}
+.sheet__close{margin-left:auto;background:none;border:none;font-size:16px;cursor:pointer;color:var(--ink-soft)}
+.sheet__close:hover{color:var(--ink)}
+.sheet__hint{margin:-4px 0 0;font-size:13px;color:var(--ink-soft);line-height:1.5}
+.sheet__hint strong{color:var(--ember)}
+.sheet__divider{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink-faint);border-top:1px solid var(--line);padding-top:14px}
+.sheet__actions{display:flex;gap:10px;justify-content:flex-end;margin-top:auto;padding-top:6px}
+
+/* ── fields ── */
+.field{display:flex;flex-direction:column;gap:6px}
+.field-row{display:flex;gap:12px}
+.field-row .field{flex:1;min-width:0}
+.field__label{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-soft)}
+.field__opt{color:var(--ink-faint);text-transform:none;letter-spacing:0}
+.field__input{font-family:var(--sans);font-size:14px;color:var(--ink);background:var(--surface);border:1px solid var(--line-2);
+  border-radius:9px;padding:10px 12px;width:100%;resize:vertical}
+.field__input::placeholder{color:var(--ink-faint)}
+.field__input:focus{outline:2px solid var(--s-todo);outline-offset:1px;border-color:transparent}
+.field__input--area{line-height:1.55;min-height:92px}
+.field__note{font-size:11px;color:var(--ink-faint)}
+.seg{display:inline-flex;background:var(--surface);border:1px solid var(--line-2);border-radius:9px;padding:3px;gap:3px}
+.seg__opt{font-family:var(--sans);font-size:13px;font-weight:600;color:var(--ink-soft);background:none;border:none;border-radius:6px;padding:7px 14px;cursor:pointer}
+.seg__opt.is-on{color:#fff;background:var(--ember)}
+.dropzone{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;border:1.5px dashed var(--line-2);
+  border-radius:11px;padding:18px;cursor:pointer;color:var(--ink-faint);text-align:center;transition:border-color .15s ease,background .15s ease;background:var(--surface)}
+.dropzone:hover{border-color:var(--ember);background:rgba(216,91,34,.05);color:var(--ink-soft)}
+.dropzone__icon{font-size:20px}
+.dropzone__text{font-size:12px}
+.att-list{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:6px}
+.att{display:flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:7px 9px}
+.att__thumb{width:34px;height:34px;border-radius:6px;flex:none;background:var(--surface-2);border:1px solid var(--line);
+  display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:9px;color:var(--ink-faint)}
+.att__thumb--img{background-size:cover;background-position:center}
+.att__name{font-size:12.5px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;text-decoration:none}
+.att__name:hover{color:var(--ember)}
+.att__size{font-family:var(--mono);font-size:10px;color:var(--ink-faint)}
+.att__del{background:none;border:none;color:var(--ink-faint);cursor:pointer;font-size:13px;padding:2px 4px}
+.att__del:hover{color:var(--s-blocked)}
+
+/* ── drawer detail ── */
+.dt__badges{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.badge{font-family:var(--mono);font-size:11px;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line-2);
+  border-radius:999px;padding:3px 10px;color:var(--ink-soft);background:var(--surface)}
+.badge .station__lamp{width:8px;height:8px}
+.dt__theme{font-family:var(--display);font-weight:700;font-size:22px;line-height:1.2;margin:2px 0 0;letter-spacing:-.015em}
+.dt__label{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-faint)}
+.dt__desc{font-size:14px;line-height:1.6;color:var(--ink-soft);white-space:pre-wrap;margin:6px 0 0}
+.dt__links{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+.dt__note{font-size:12.5px;color:var(--ink-faint);background:var(--surface);border:1px dashed var(--line-2);border-radius:9px;padding:10px 12px;line-height:1.5}
+.dt__note b{color:var(--s-asking)}
+
+/* questionnaire blocks */
+.qblock{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:15px 16px}
+.qblock+.qblock{margin-top:13px}
+.qblock__head{display:flex;align-items:center;gap:9px;margin-bottom:4px}
+.qblock__no{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;font-family:var(--mono);font-size:12px;font-weight:700;color:#fff}
+.qblock--func .qblock__no{background:var(--s-asking)}
+.qblock--arch .qblock__no{background:var(--s-verifying)}
+.qblock__title{font-family:var(--display);font-weight:600;font-size:15px}
+.qblock__sub{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);margin:0 0 12px 31px}
+.qrow{margin-bottom:12px}
+.qrow__q{display:block;font-size:13.5px;line-height:1.45;color:var(--ink);margin-bottom:5px}
+.qrow__q b{color:var(--s-asking);font-family:var(--mono);font-weight:700;margin-right:5px}
+.qrow__a{width:100%;font-family:var(--sans);font-size:13.5px;color:var(--ink);background:var(--surface-2);border:1px solid var(--line-2);
+  border-radius:8px;padding:8px 10px;resize:vertical;min-height:40px}
+.qrow__a:focus{outline:2px solid var(--s-asking);outline-offset:1px;border-color:transparent}
+.qrow__ans{font-size:13px;line-height:1.5;color:var(--ink-soft);background:var(--surface-2);border-left:2px solid var(--line-2);padding:6px 10px;border-radius:0 6px 6px 0}
+.qblock__send{width:100%;margin-top:2px;font-family:var(--display);font-weight:600;font-size:14px;color:#fff;background:var(--s-asking);border:none;padding:10px;border-radius:9px;cursor:pointer}
+.qblock--arch .qblock__send{background:var(--s-verifying)}
+.qblock__send:hover{filter:brightness(1.06)}
+.qblock__done{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--s-ready);font-family:var(--mono);margin-top:2px}
+
+/* architecture decisions — variant cards with pros/cons (the agent proposes, you pick) */
+.decision{margin-bottom:16px}
+.decision__q{font-size:14px;font-weight:600;color:var(--ink);margin-bottom:9px;line-height:1.4}
+.decision__q b{color:var(--s-verifying);font-family:var(--mono);font-weight:700;margin-right:6px}
+.opt{display:block;position:relative;border:1.5px solid var(--line);border-radius:11px;padding:11px 13px 11px 38px;margin-bottom:8px;cursor:pointer;
+  background:var(--surface);transition:border-color .14s ease,background .14s ease,box-shadow .14s ease}
+.opt:hover{border-color:var(--line-2)}
+.opt input{position:absolute;left:13px;top:14px;accent-color:var(--s-verifying);width:15px;height:15px;cursor:pointer}
+.opt:has(input:checked){border-color:var(--s-verifying);background:rgba(139,83,224,.05);box-shadow:0 0 0 1px var(--s-verifying)}
+.opt__title{font-family:var(--display);font-weight:600;font-size:13.5px;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.opt__rec{font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#fff;background:var(--s-verifying);border-radius:5px;padding:1px 6px}
+.opt__desc{font-size:12.5px;line-height:1.45;color:var(--ink-soft);margin:4px 0 7px}
+.opt__pc{display:flex;flex-direction:column;gap:3px}
+.opt__pc span{font-size:12px;line-height:1.4;display:flex;gap:6px}
+.pro{color:#1f7a42}.pro::before{content:"+";font-weight:700;color:var(--s-ready)}
+.con{color:#a8362e}.con::before{content:"−";font-weight:700;color:var(--s-blocked)}
+.opt--own{padding-left:38px}
+.opt--own .opt__title{color:var(--ink-soft)}
+.opt--own input{top:13px}
+.optown__in{width:100%;margin-top:7px;font-family:var(--sans);font-size:13px;color:var(--ink);background:var(--surface-2);border:1px solid var(--line-2);border-radius:8px;padding:7px 9px}
+
+/* hint banner */
+.hint{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:30;background:var(--surface);
+  border:1px solid var(--line-2);color:var(--ink-soft);font-size:12.5px;font-family:var(--mono);padding:9px 16px;border-radius:999px;box-shadow:var(--shadow-lift)}
+.hint b{color:var(--ember)}
+
+:focus-visible{outline:2px solid var(--s-todo);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media (max-width:760px){.strip{display:none}.console{gap:14px;padding:13px 16px}.board{padding:16px}.field-row{flex-direction:column;gap:15px}}
+</style>
+</head>
+<body>
+
+<header class="console">
+  <div class="console__brand">
+    <span class="console__mark" aria-hidden="true"></span>
+    <div>
+      <h1 class="console__title">grace<span>·</span>board</h1>
+      <p class="console__sub">диспетчерская · команда работает сама</p>
+    </div>
+  </div>
+  <nav class="strip" aria-label="станции">
+    <span class="strip__cell" data-strip="backlog"><span class="strip__lamp" style="color:var(--s-backlog)"></span>Backlog <span class="strip__n">2</span></span>
+    <span class="strip__cell" data-strip="todo"><span class="strip__lamp" style="color:var(--s-todo)"></span>To do <span class="strip__n">1</span></span>
+    <span class="strip__cell" data-strip="asking"><span class="strip__lamp" style="color:var(--s-asking)"></span>Asking <span class="strip__n">1</span></span>
+    <span class="strip__cell" data-strip="implementing"><span class="strip__lamp" style="color:var(--s-implementing)"></span>Impl <span class="strip__n">1</span></span>
+    <span class="strip__cell" data-strip="verifying"><span class="strip__lamp" style="color:var(--s-verifying)"></span>Verify <span class="strip__n">1</span></span>
+    <span class="strip__cell" data-strip="reviewing"><span class="strip__lamp" style="color:var(--s-reviewing)"></span>Review <span class="strip__n">1</span></span>
+    <span class="strip__cell" data-strip="ready"><span class="strip__lamp" style="color:var(--s-ready)"></span>Ready <span class="strip__n">1</span></span>
+  </nav>
+  <button class="btn btn--solid" onclick="openComposer()" type="button">+ Новая задача</button>
+</header>
+
+<main class="board">
+
+  <!-- ── Backlog ── -->
+  <section class="station station--backlog" data-col="backlog">
+    <header class="station__head"><span class="station__no">01</span><span class="station__lamp" style="color:var(--s-backlog)"></span><span class="station__name">Backlog</span><span class="station__count">2</span></header>
+    <div class="well">
+
+      <article class="card" data-col="backlog">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-backlog)"></span><span class="card__project">Emotions</span></div>
+          <h3 class="card__theme">Экран дневника настроения</h3>
+          <p class="card__desc">Сетка дней месяца, тап по дню открывает запись с эмодзи‑шкалой, заметкой и тегами триггеров.</p>
+          <div class="card__tags"><a class="tag" onclick="event.stopPropagation()">⧉ макеты</a><a class="tag" onclick="event.stopPropagation()">▤ требования</a><span class="tag">📎 2</span></div>
+        </div>
+        <div class="card__foot"><button class="card__del" onclick="event.stopPropagation()" title="Отменить">✕ отмена</button></div>
+      </article>
+
+      <article class="card" data-col="backlog">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-backlog)"></span><span class="card__project">grace-board</span></div>
+          <h3 class="card__theme">Экспорт доски в CSV</h3>
+          <p class="card__desc">Кнопка «Экспорт» выгружает все карточки с историей фаз и таймстемпами одним файлом.</p>
+          <div class="card__tags"><span class="tag">grace</span></div>
+        </div>
+        <div class="card__foot"><button class="card__del" onclick="event.stopPropagation()" title="Отменить">✕ отмена</button></div>
+      </article>
+
+    </div>
+  </section>
+
+  <!-- ── launch lever ── -->
+  <div class="lever" id="lever" title="перетащи карточку через рычаг — команда возьмёт задачу"><span class="lever__knob"></span><span class="lever__label">launch</span></div>
+
+  <!-- ── To do ── -->
+  <section class="station" data-col="todo">
+    <header class="station__head"><span class="station__no">02</span><span class="station__lamp" style="color:var(--s-todo)"></span><span class="station__name">To do</span><span class="station__count">1</span></header>
+    <div class="well">
+      <article class="card" data-col="todo">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-todo)"></span><span class="card__project">Notes</span><span class="card__crew">в очереди</span></div>
+          <h3 class="card__theme">Поиск по тегам</h3>
+          <p class="card__desc">Фильтр заметок по одному или нескольким тегам, подсказки при вводе.</p>
+          <div class="card__tags"><a class="tag" onclick="event.stopPropagation()">▤ требования</a></div>
+        </div>
+        <div class="card__stamp">⟶ отправлено · сегодня 09:14</div>
+        <div class="card__foot"><button class="card__act" onclick="event.stopPropagation()">⊟ лог</button><button class="card__del" onclick="event.stopPropagation()">✕ отмена</button></div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── Asking ── -->
+  <section class="station" data-col="asking">
+    <header class="station__head"><span class="station__no">03</span><span class="station__lamp" style="color:var(--s-asking)"></span><span class="station__name">Asking</span><span class="station__count">1</span></header>
+    <div class="well">
+      <article class="card" data-col="asking">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-asking)"></span><span class="card__project">Emotions</span><span class="card__crew">нужны вы</span></div>
+          <h3 class="card__theme">Импорт данных из Apple Health</h3>
+          <p class="card__desc">Подтянуть сон и пульс, сопоставить с записями настроения за день.</p>
+          <div class="card__ask" onclick="event.stopPropagation();openAsk()"><span class="dot"></span>Блок 1 готов · 4 решения по архитектуре<span class="arr">→</span></div>
+        </div>
+        <div class="card__foot"><button class="card__act" onclick="event.stopPropagation()">⊟ лог</button><button class="card__del" onclick="event.stopPropagation()">✕ отмена</button></div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── Implementing ── -->
+  <section class="station" data-col="implementing">
+    <header class="station__head"><span class="station__no">04</span><span class="station__lamp" style="color:var(--s-implementing)"></span><span class="station__name">Implementing</span><span class="station__count">1</span></header>
+    <div class="well">
+      <article class="card" data-col="implementing" data-working="1">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-implementing)"></span><span class="card__project">grace-board</span><span class="card__crew">gfd-coder</span></div>
+          <h3 class="card__theme">Тёмная тема для доски</h3>
+          <p class="card__desc">Палитра «ночной диспетчерской», переключатель в шапке, запоминание выбора.</p>
+          <div class="card__tags"><a class="tag" onclick="event.stopPropagation()">⧉ макеты</a><span class="tag">grace</span></div>
+        </div>
+        <div class="card__foot"><button class="card__act" onclick="event.stopPropagation()">⊟ лог</button><button class="card__act" onclick="event.stopPropagation()">↻ перезапуск</button><button class="card__del" onclick="event.stopPropagation()">✕ отмена</button></div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── Verifying ── -->
+  <section class="station" data-col="verifying">
+    <header class="station__head"><span class="station__no">05</span><span class="station__lamp" style="color:var(--s-verifying)"></span><span class="station__name">Verifying</span><span class="station__count">1</span></header>
+    <div class="well">
+      <article class="card" data-col="verifying" data-working="1">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-verifying)"></span><span class="card__project">Notes</span><span class="card__crew">gfd-verifier</span></div>
+          <h3 class="card__theme">Редактирование заметки</h3>
+          <p class="card__desc">Инлайн‑правка, автосейв черновика, отмена изменений по Esc.</p>
+          <div class="card__tags"><span class="tag">grace</span></div>
+        </div>
+        <div class="card__foot"><button class="card__act" onclick="event.stopPropagation()">⊟ лог</button><button class="card__del" onclick="event.stopPropagation()">✕ отмена</button></div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── Reviewing ── -->
+  <section class="station" data-col="reviewing">
+    <header class="station__head"><span class="station__no">06</span><span class="station__lamp" style="color:var(--s-reviewing)"></span><span class="station__name">Reviewing</span><span class="station__count">1</span></header>
+    <div class="well">
+      <article class="card" data-col="reviewing" data-working="1">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-reviewing)"></span><span class="card__project">Emotions</span><span class="card__crew">gfd-reviewer</span></div>
+          <h3 class="card__theme">Виджет на главный экран</h3>
+          <p class="card__desc">Быстрая отметка настроения прямо с домашнего экрана, без открытия приложения.</p>
+          <div class="card__tags"><a class="tag" onclick="event.stopPropagation()">⧉ макеты</a></div>
+        </div>
+        <div class="card__foot"><button class="card__act" onclick="event.stopPropagation()">⊟ лог</button><button class="card__del" onclick="event.stopPropagation()">✕ отмена</button></div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── Ready for deploy ── -->
+  <section class="station" data-col="ready">
+    <header class="station__head"><span class="station__no">07</span><span class="station__lamp" style="color:var(--s-ready)"></span><span class="station__name">Ready for deploy</span><span class="station__count">1</span></header>
+    <div class="well">
+      <article class="card" data-col="ready">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-ready)"></span><span class="card__project">Notes</span><span class="card__crew">✓</span></div>
+          <h3 class="card__theme">Веб‑приложение для заметок</h3>
+          <p class="card__desc">Добавление, поиск по дате/теме/тегу, rich‑text. Готово к раскатке на VPS.</p>
+          <div class="card__tags"><span class="tag">grace</span></div>
+        </div>
+        <div class="card__stamp">✓ готово к деплою · все гейты зелёные</div>
+        <div class="card__foot"><button class="card__act" onclick="event.stopPropagation()">⊟ лог</button><button class="card__del" onclick="event.stopPropagation()">✕ удалить</button></div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── Blocked ── -->
+  <section class="station station--blocked" data-col="blocked">
+    <header class="station__head"><span class="station__no">—</span><span class="station__lamp" style="color:var(--s-blocked)"></span><span class="station__name">Blocked</span><span class="station__count">1</span></header>
+    <div class="well">
+      <article class="card" data-col="blocked">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-blocked)"></span><span class="card__project">grace-board</span><span class="card__crew">нужны вы</span></div>
+          <h3 class="card__theme">Синк с облаком</h3>
+        </div>
+        <div class="card__blocked">⚠ Прогон завершился, не достигнув ready. Открой лог и перезапусти.</div>
+        <div class="card__foot"><button class="card__act" onclick="event.stopPropagation()">⊟ лог</button><button class="card__act" onclick="event.stopPropagation()">↻ перезапуск</button><button class="card__del" onclick="event.stopPropagation()">✕ отмена</button></div>
+      </article>
+    </div>
+  </section>
+
+</main>
+
+<div class="hint">Перетаскивай <b>карточки</b> между станциями · нажми карточку — откроется задача · <b>+ Новая задача</b></div>
+
+<!-- ── DETAIL DRAWER (Backlog / To do / прочее — без вопросов) ─────────────── -->
+<div class="sheet" id="detail" hidden>
+  <div class="sheet__scrim" onclick="closeAll()"></div>
+  <div class="sheet__panel">
+    <div class="sheet__head">
+      <div class="dt__badges"><span class="badge"><span class="station__lamp" id="dBadgeLamp"></span><span id="dBadgeName">Backlog</span></span><span class="badge" id="dProject">Emotions</span></div>
+      <button class="sheet__close" onclick="closeAll()" aria-label="Закрыть">✕</button>
+    </div>
+    <h2 class="dt__theme" id="dTheme">Экран дневника настроения</h2>
+    <div><div class="dt__label">Описание</div><p class="dt__desc" id="dDesc">Сетка дней месяца. Тап по дню открывает запись: эмодзи‑шкала настроения, короткая заметка и теги триггеров. Месяц листается свайпом, today выделен.</p></div>
+    <div class="dt__links"><a class="tag">⧉ макеты Figma</a><a class="tag">▤ требования (ссылка)</a></div>
+    <div><div class="dt__label">Вложения</div>
+      <ul class="att-list">
+        <li class="att"><span class="att__thumb att__thumb--img" style="background-image:linear-gradient(135deg,#cdd6e4,#eef1f6)"></span><a class="att__name">mood-grid.png</a><span class="att__size">186 КБ</span><button class="att__del">✕</button></li>
+        <li class="att"><span class="att__thumb">PDF</span><a class="att__name">triggers-spec.pdf</a><span class="att__size">64 КБ</span><button class="att__del">✕</button></li>
+      </ul>
+    </div>
+    <div class="dt__note" id="dNote">Вопросы появятся, когда задача дойдёт до <b>Asking</b> — сначала по функционалу, затем по архитектуре.</div>
+    <div class="sheet__actions">
+      <button class="btn btn--danger" onclick="closeAll()">Отменить задачу</button>
+      <button class="btn btn--ghost" onclick="closeAll()">Изменить</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── ASKING DRAWER (только здесь есть «Ответить») ────────────────────────── -->
+<div class="sheet sheet--wide" id="ask" hidden>
+  <div class="sheet__scrim" onclick="closeAll()"></div>
+  <div class="sheet__panel">
+    <div class="sheet__head">
+      <div class="dt__badges"><span class="badge"><span class="station__lamp" style="color:var(--s-asking)"></span>Asking</span><span class="badge">Emotions</span></div>
+      <button class="sheet__close" onclick="closeAll()" aria-label="Закрыть">✕</button>
+    </div>
+    <h2 class="dt__theme">Импорт данных из Apple Health</h2>
+    <div><div class="dt__label">Описание</div><p class="dt__desc">Подтянуть из HealthKit сон, пульс и активность, сопоставить с дневными записями настроения. Показать корреляции на экране «Инсайты». Импорт по запросу, без фоновой синхронизации.</p></div>
+    <div class="dt__links"><a class="tag">⧉ макеты Figma</a><a class="tag">▤ требования (ссылка)</a></div>
+
+    <!-- блок 1 — функционал (отвечен) -->
+    <div class="qblock qblock--func">
+      <div class="qblock__head"><span class="qblock__no">1</span><span class="qblock__title">Вопросы по функционалу</span></div>
+      <p class="qblock__sub">смысл задачи · отвечено</p>
+      <div class="qrow"><span class="qrow__q"><b>1</b>Какие метрики импортируем в MVP?</span><div class="qrow__ans">Сон, пульс покоя и шаги. Остальное — потом.</div></div>
+      <div class="qrow"><span class="qrow__q"><b>2</b>За какой период тянем при первом импорте?</span><div class="qrow__ans">Последние 90 дней.</div></div>
+      <div class="qrow"><span class="qrow__q"><b>3</b>Что делать, если за день нет записи настроения?</span><div class="qrow__ans">Показывать метрику без корреляции.</div></div>
+      <div class="qblock__done">✓ ответы приняты · архитектор предложил решения ниже</div>
+    </div>
+
+    <!-- блок 2 — архитектура: по каждому вопросу варианты решений с плюсами/минусами -->
+    <div class="qblock qblock--arch">
+      <div class="qblock__head"><span class="qblock__no">2</span><span class="qblock__title">Вопросы по архитектуре</span></div>
+      <p class="qblock__sub">по каждому вопросу выбери решение — варианты с плюсами и минусами</p>
+
+      <!-- decision 1 -->
+      <div class="decision">
+        <div class="decision__q"><b>1</b>Где хранить импортированные метрики?</div>
+        <label class="opt"><input type="radio" name="d1" />
+          <div class="opt__title">Локально · SQLite на устройстве</div>
+          <div class="opt__desc">Метрики живут в локальной БД приложения, импорт по запросу.</div>
+          <div class="opt__pc"><span class="pro">просто, офлайн, приватно — медданные не покидают телефон</span><span class="con">нет синка между устройствами, аналитика только на клиенте</span></div>
+        </label>
+        <label class="opt"><input type="radio" name="d1" checked />
+          <div class="opt__title">Гибрид · кэш на устройстве + бэкап на бэке <span class="opt__rec">рекомендуем</span></div>
+          <div class="opt__desc">Чтение быстрое из локального кэша, агрегаты синкаются на сервер для инсайтов.</div>
+          <div class="opt__pc"><span class="pro">офлайн‑чтение + кросс‑девайс + серверная аналитика</span><span class="con">сложнее: две точки правды, нужна стратегия разрешения конфликтов</span></div>
+        </label>
+        <label class="opt"><input type="radio" name="d1" />
+          <div class="opt__title">Только бэк · Postgres</div>
+          <div class="opt__desc">Всё на сервере, клиент тонкий.</div>
+          <div class="opt__pc"><span class="pro">единая точка правды, тяжёлая аналитика на сервере</span><span class="con">медданные на сервере, не работает офлайн</span></div>
+        </label>
+        <label class="opt opt--own"><input type="radio" name="d1" /><div class="opt__title">Свой вариант</div><input class="optown__in" placeholder="опиши, как лучше…" onclick="event.stopPropagation()" /></label>
+      </div>
+
+      <!-- decision 2 -->
+      <div class="decision">
+        <div class="decision__q"><b>2</b>Как получать данные из HealthKit?</div>
+        <label class="opt"><input type="radio" name="d2" checked />
+          <div class="opt__title">Нативный модуль · Swift‑мост <span class="opt__rec">рекомендуем</span></div>
+          <div class="opt__desc">Прямой запрос к HealthKit на устройстве через нативный bridge.</div>
+          <div class="opt__pc"><span class="pro">полный доступ к данным, инкрементальные обновления</span><span class="con">только iOS, нужен нативный код и разрешения</span></div>
+        </label>
+        <label class="opt"><input type="radio" name="d2" />
+          <div class="opt__title">Экспорт‑файл от пользователя</div>
+          <div class="opt__desc">Пользователь выгружает Health‑архив, приложение парсит XML.</div>
+          <div class="opt__pc"><span class="pro">без нативного модуля, кросс‑платформенно</span><span class="con">ручной шаг, нет инкрементальности, тяжёлый XML</span></div>
+        </label>
+      </div>
+
+      <!-- decision 3 -->
+      <div class="decision">
+        <div class="decision__q"><b>3</b>Где считать корреляции метрик и настроения?</div>
+        <label class="opt"><input type="radio" name="d3" />
+          <div class="opt__title">На клиенте, на лету</div>
+          <div class="opt__desc">Пересчёт при открытии экрана «Инсайты».</div>
+          <div class="opt__pc"><span class="pro">мгновенно, без бэка, приватно</span><span class="con">тяжело на больших объёмах, дублируется на устройствах</span></div>
+        </label>
+        <label class="opt"><input type="radio" name="d3" checked />
+          <div class="opt__title">На бэке по расписанию <span class="opt__rec">рекомендуем</span></div>
+          <div class="opt__desc">Cron пересчитывает агрегаты раз в сутки, клиент читает готовое.</div>
+          <div class="opt__pc"><span class="pro">быстрый экран, тяжёлая математика на сервере</span><span class="con">данные не «прямо сейчас», нужен планировщик</span></div>
+        </label>
+      </div>
+
+      <!-- decision 4 -->
+      <div class="decision">
+        <div class="decision__q"><b>4</b>Защита медданных при хранении?</div>
+        <label class="opt"><input type="radio" name="d4" checked />
+          <div class="opt__title">Шифрование БД · SQLCipher <span class="opt__rec">рекомендуем</span></div>
+          <div class="opt__desc">Локальная база шифруется ключом из Keychain.</div>
+          <div class="opt__pc"><span class="pro">данные защищены даже при доступе к файлу</span><span class="con">небольшой оверхед, управление ключом</span></div>
+        </label>
+        <label class="opt"><input type="radio" name="d4" />
+          <div class="opt__title">Хранить только агрегаты</div>
+          <div class="opt__desc">Сырые метрики не сохраняем, только усреднённые показатели.</div>
+          <div class="opt__pc"><span class="pro">минимум чувствительных данных</span><span class="con">нельзя пересчитать инсайты по‑новому позже</span></div>
+        </label>
+      </div>
+
+      <button class="qblock__send" type="button">Принять решения и запустить сборку →</button>
+    </div>
+
+    <div class="sheet__actions">
+      <button class="btn btn--danger" onclick="closeAll()">Отменить задачу</button>
+      <button class="btn btn--ghost" onclick="closeAll()">Изменить</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── NEW TASK COMPOSER ───────────────────────────────────────────────────── -->
+<div class="sheet" id="composer" hidden>
+  <div class="sheet__scrim" onclick="closeAll()"></div>
+  <form class="sheet__panel" onsubmit="return false" autocomplete="off">
+    <div class="sheet__head"><h2 class="sheet__title">Новая задача</h2><button class="sheet__close" type="button" onclick="closeAll()" aria-label="Закрыть">✕</button></div>
+    <p class="sheet__hint">Появится в <strong>Backlog</strong>. Перетащи её через рычаг запуска — и команда возьмёт задачу в работу.</p>
+    <label class="field"><span class="field__label">Проект</span><input class="field__input" placeholder="напр. Emotions" /><span class="field__note">имя папки в корне проектов</span></label>
+    <label class="field"><span class="field__label">Тема</span><input class="field__input" placeholder="Коротко — что делаем" /></label>
+    <label class="field"><span class="field__label">Описание <span class="field__opt"><span id="cnt">0</span> / 2000</span></span>
+      <textarea class="field__input field__input--area" rows="5" maxlength="2000" oninput="document.getElementById('cnt').textContent=this.value.length" placeholder="Подробно: поведение, сценарии, что важно…"></textarea></label>
+    <div class="field-row">
+      <label class="field"><span class="field__label">Макеты <span class="field__opt">ссылка</span></span><input class="field__input" type="url" placeholder="https://figma.com/…" /></label>
+      <label class="field"><span class="field__label">Требования <span class="field__opt">ссылка</span></span><input class="field__input" type="url" placeholder="https://…/spec" /></label>
+    </div>
+    <div class="field"><span class="field__label">Вложения <span class="field__opt">скриншоты / файлы требований</span></span>
+      <label class="dropzone"><span class="dropzone__icon">⎙</span><span class="dropzone__text">Перетащи сюда или выбери файлы</span></label>
+      <ul class="att-list"><li class="att"><span class="att__thumb att__thumb--img" style="background-image:linear-gradient(135deg,#cdd6e4,#eef1f6)"></span><a class="att__name">screen-mockup.png</a><span class="att__size">312 КБ</span><button class="att__del" type="button">✕</button></li></ul>
+    </div>
+    <div class="sheet__divider">Настройки прогона</div>
+    <label class="field"><span class="field__label">GRACE‑разметка</span>
+      <div class="seg"><button type="button" class="seg__opt is-on" onclick="pick(this)">Включена</button><button type="button" class="seg__opt" onclick="pick(this)">Выключена</button></div>
+      <span class="field__note">семантический экзоскелет + LDD‑логи в коде</span></label>
+    <div class="sheet__actions"><button class="btn btn--ghost" type="button" onclick="closeAll()">Отмена</button><button class="btn btn--solid" type="button" onclick="closeAll()">В Backlog</button></div>
+  </form>
+</div>
+
+<script>
+/* ── статичный превью: открытие экранов + ЖИВОЙ drag-and-drop карточек ── */
+const STATIONS={
+  backlog:{name:'Backlog',c:'var(--s-backlog)'}, todo:{name:'To do',c:'var(--s-todo)'},
+  asking:{name:'Asking',c:'var(--s-asking)'}, implementing:{name:'Implementing',c:'var(--s-implementing)'},
+  verifying:{name:'Verifying',c:'var(--s-verifying)'}, reviewing:{name:'Reviewing',c:'var(--s-reviewing)'},
+  ready:{name:'Ready for deploy',c:'var(--s-ready)'}, blocked:{name:'Blocked',c:'var(--s-blocked)'}
+};
+const detail=document.getElementById('detail'), ask=document.getElementById('ask'), composer=document.getElementById('composer');
+function closeAll(){detail.hidden=ask.hidden=composer.hidden=true}
+function openAsk(){closeAll();ask.hidden=false}
+function openComposer(){closeAll();composer.hidden=false}
+function pick(el){el.parentElement.querySelectorAll('.seg__opt').forEach(o=>o.classList.remove('is-on'));el.classList.add('is-on')}
+addEventListener('keydown',e=>{if(e.key==='Escape')closeAll()});
+
+// Backlog / To do / прочее → детальный drawer (без вопросов); Asking → drawer с вопросами
+function openCard(card){
+  if(card.dataset.col==='asking'){openAsk();return;}
+  closeAll();
+  const col=card.dataset.col, s=STATIONS[col]||STATIONS.backlog;
+  document.getElementById('dBadgeName').textContent=s.name;
+  document.getElementById('dBadgeLamp').style.color=s.c;
+  document.getElementById('dProject').textContent=card.querySelector('.card__project')?.textContent||'';
+  document.getElementById('dTheme').textContent=card.querySelector('.card__theme')?.textContent||'';
+  const desc=card.querySelector('.card__desc')?.textContent;
+  document.getElementById('dDesc').textContent=desc||'Описание не задано.';
+  // подсказка про вопросы — только до этапа Asking
+  document.getElementById('dNote').style.display=(col==='backlog'||col==='todo')?'':'none';
+  detail.hidden=false;
+}
+
+// ── drag & drop ──
+let dragEl=null;
+function recount(){
+  document.querySelectorAll('.station').forEach(st=>{
+    const n=st.querySelector('.well').querySelectorAll('.card').length;
+    st.querySelector('.station__count').textContent=n;
+    const cell=document.querySelector('.strip__cell[data-strip="'+st.dataset.col+'"] .strip__n');
+    if(cell)cell.textContent=n;
+  });
+}
+function wire(){
+  document.querySelectorAll('.card').forEach(c=>{
+    c.setAttribute('draggable','true');
+    c.addEventListener('click',e=>{ if(e.target.closest('button,a,input'))return; openCard(c); });
+    c.addEventListener('dragstart',e=>{dragEl=c;c.classList.add('is-dragging');e.dataTransfer.effectAllowed='move'});
+    c.addEventListener('dragend',()=>{if(dragEl)dragEl.classList.remove('is-dragging');dragEl=null});
+  });
+  document.querySelectorAll('.well').forEach(w=>{
+    w.addEventListener('dragover',e=>{e.preventDefault();w.classList.add('is-over')});
+    w.addEventListener('dragleave',()=>w.classList.remove('is-over'));
+    w.addEventListener('drop',e=>{e.preventDefault();w.classList.remove('is-over');if(!dragEl)return;
+      const fromBacklog=dragEl.closest('.station').classList.contains('station--backlog');
+      const toCol=w.closest('.station').dataset.col;
+      dragEl.dataset.col=toCol;
+      // обновим лампу карточки под цвет станции
+      const lamp=dragEl.querySelector('.card__lamp'); if(lamp)lamp.style.color=STATIONS[toCol].c;
+      w.appendChild(dragEl);
+      if(fromBacklog && toCol!=='backlog'){dragEl.classList.remove('is-ignite');void dragEl.offsetWidth;dragEl.classList.add('is-ignite');}
+      recount();
+    });
+  });
+  // рычаг как drop-таргет: бросок на него = диспатч в To do
+  const lever=document.getElementById('lever');
+  lever.addEventListener('dragover',e=>{e.preventDefault();lever.classList.add('is-over')});
+  lever.addEventListener('dragleave',()=>lever.classList.remove('is-over'));
+  lever.addEventListener('drop',e=>{e.preventDefault();lever.classList.remove('is-over');if(!dragEl)return;
+    const todoWell=document.querySelector('.station[data-col="todo"] .well');
+    dragEl.dataset.col='todo'; const lamp=dragEl.querySelector('.card__lamp'); if(lamp)lamp.style.color=STATIONS.todo.c;
+    todoWell.appendChild(dragEl); dragEl.classList.remove('is-ignite');void dragEl.offsetWidth;dragEl.classList.add('is-ignite'); recount();
+  });
+}
+wire();
+</script>
+</body>
+</html>

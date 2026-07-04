@@ -1,0 +1,21 @@
+# dependencies / runtime
+node_modules/
+*.log
+
+# local state & secrets (never publish)
+data/
+.env
+.claude/settings.local.json
+
+# OS / editor cruft
+.DS_Store
+
+# local dev scratch (per-machine run artifacts)
+.grace-feature-dev/
+.playwright-mcp/
+dryrun_gfd/
+
+# screenshots: keep only the two the README uses; the rest are unrelated scratch
+/*.png
+!/board-screenshot.png
+!/agent-screenshot.png
