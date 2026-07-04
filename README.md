@@ -16,8 +16,8 @@ Zero dependencies, no build step — plain Node ≥ 18, bound to `127.0.0.1` (lo
 | `server.js`, `public/` | the board — a zero-dependency Node HTTP server + static UI |
 | `.claude/commands/grace-feature-dev.md` | the `/grace-feature-dev` slash command |
 | `.claude/agents/gfd-*.md` | the pipeline's sub-agents (architect, coder, explorer, reviewer, verifier) |
-| `.claude/skills/grace-*` | the GRACE framework skills (feature-dev, plan, fix, review, …) |
-| `install.sh` | links the command/agents/skills into your `~/.claude` |
+| `.claude/skills/grace-feature-dev` | the pipeline skill — board lifecycle, build phases, GRACE markup, anti-loop |
+| `install.sh` | links the command/agents/skill into your `~/.claude` |
 
 > The board is a **dispatcher**: it spawns `claude -p "/grace-feature-dev …"` runs
 > inside your *target* project. Those runs resolve the command, agents and skills from
@@ -32,7 +32,7 @@ Requires [Claude Code](https://claude.com/claude-code) (the `claude` CLI) and No
 git clone https://github.com/maksimovyar/grace-board.git
 cd grace-board
 
-# 1) install the /grace-feature-dev command, gfd-* agents and grace-* skills into ~/.claude
+# 1) install the /grace-feature-dev command, gfd-* agents and the skill into ~/.claude
 ./install.sh
 
 # 2) configure (optional — sane defaults otherwise)

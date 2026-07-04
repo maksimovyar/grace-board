@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Install the bundled GRACE extensions (the /grace-feature-dev command, the gfd-*
-# agents, and the grace-* skills) into your user-level Claude Code config so the
+# Install the bundled extensions (the /grace-feature-dev command, the gfd-* agents,
+# and the grace-feature-dev skill) into your user-level Claude Code config so the
 # board's headless runs can find them.
 #
 # WHY this is needed: grace-board launches `claude -p "/grace-feature-dev …"` inside
