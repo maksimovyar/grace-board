@@ -15,7 +15,6 @@ data/
 .playwright-mcp/
 dryrun_gfd/
 
-# screenshots: keep only the two the README uses; the rest are unrelated scratch
+# screenshots: keep only the one the README uses; the rest are unrelated scratch
 /*.png
 !/board-screenshot.png
-!/agent-screenshot.png
