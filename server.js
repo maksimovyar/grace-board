@@ -1136,6 +1136,17 @@ async function handleApi(req, res, urlPath) {
     const plan = planById(board, decodeURIComponent(mpone[1]));
     return plan ? sendJSON(res, 200, { plan: planView(board, plan) }) : sendJSON(res, 404, { error: "plan not found" });
   }
+  // DELETE /api/plans/:id -> archive a plan (hide its rail). Stage cards are left untouched —
+  // they keep their history/branch/manifest; only the run's rail is dismissed. Additive flag.
+  if (mpone && req.method === "DELETE") {
+    const board = readBoard();
+    const plan = planById(board, decodeURIComponent(mpone[1]));
+    if (!plan) return sendJSON(res, 404, { error: "plan not found" });
+    plan.archived = true;
+    writeBoard(board);
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "plan-archive", planId: plan.id }) + "\n"); } catch {}
+    return sendJSON(res, 200, { ok: true });
+  }
 
   // POST /api/plans/preflight -> S5 summary-gate items for a candidate plan (blockers/floor/forks)
   if (req.method === "POST" && urlPath === "/api/plans/preflight") {

@@ -264,6 +264,7 @@ function railHTML(plan) {
       <div class="rail__actions">
         <button class="rail__filter${filterOn ? " is-on" : ""}" type="button" data-planfilter="${esc(plan.id)}">⛁ только этот прогон</button>
         <button class="rail__pr" type="button" data-planpr="${esc(plan.id)}">Финальный PR в main →</button>
+        <button class="rail__close" type="button" data-planclose="${esc(plan.id)}" title="закрыть прогон (карточки останутся)">✕</button>
       </div>
     </div>
     <div class="dag">${nodes}<span class="dag__count">${done} / ${total} · строго последовательно (WIP=1)</span></div>
@@ -272,10 +273,16 @@ function railHTML(plan) {
 function renderRails() {
   const host = document.getElementById("railHost");
   if (!host) return;
-  const plans = (state.plans || []).filter((p) => (p.cardIds || []).some((id) => cardById(id)));
+  const plans = (state.plans || []).filter((p) => !p.archived && (p.cardIds || []).some((id) => cardById(id)));
   host.innerHTML = plans.map(railHTML).join("");
   host.querySelectorAll("[data-planfilter]").forEach((b) => b.addEventListener("click", () => { planFilter = planFilter === b.dataset.planfilter ? null : b.dataset.planfilter; render(); }));
   host.querySelectorAll("[data-planpr]").forEach((b) => b.addEventListener("click", () => onPlanPR(b.dataset.planpr)));
+  host.querySelectorAll("[data-planclose]").forEach((b) => b.addEventListener("click", () => onPlanClose(b.dataset.planclose)));
+}
+async function onPlanClose(planId) {
+  if (!confirm("Закрыть прогон? Плашка исчезнет, карточки останутся на доске.")) return;
+  try { await api(`/api/plans/${planId}`, { method: "DELETE" }); if (planFilter === planId) planFilter = null; toast("Прогон закрыт"); loadBoard(); }
+  catch (err) { toast("Не удалось закрыть: " + err.message); }
 }
 async function onPlanPR(planId) {
   const plan = (state.plans || []).find((p) => p.id === planId);
@@ -650,11 +657,14 @@ function toggleDep(cid, did) { const p = wizPicks[pickIndex(cid)]; if (!p) retur
 function updatePickCount() { document.getElementById("pickCount").textContent = "выбрано " + wizPicks.length; }
 let wizPreflight = { blockers: [], floor: [], forks: [] };
 async function renderGate() {
-  const g = document.getElementById("gate"), project = document.getElementById("lProject").value, n = wizPicks.length;
+  const g = document.getElementById("gate"), fire = document.getElementById("fire");
+  const project = document.getElementById("lProject").value, n = wizPicks.length;
+  if (fire) fire.disabled = true;                 // #4: block launch until preflight has resolved
   if (!n) { g.innerHTML = `<div class="gate-empty">Не выбрано ни одной карточки — вернись на шаг 2.</div>`; return; }
   g.innerHTML = `<div class="gate-empty">Свожу развилки/блокеры/пол…</div>`;
   try { wizPreflight = await api("/api/plans/preflight", { method: "POST", body: JSON.stringify({ project, cardIds: wizPicks.map((p) => p.cardId) }) }); }
   catch { wizPreflight = { blockers: [], floor: [], forks: [] }; }
+  if (fire) fire.disabled = false;                // preflight done → launch allowed
   const composeItem = `<div class="gate-item"><span class="gate-item__type">состав</span><div class="gate-item__q">${esc(project)} · ${n} этап(ов) · режим ${wizMode === "auto" ? "Auto" : "Ask"} · ветка autodev/plan-…</div></div>`;
   // blockers/forks — the human picks once here; the choice rides every stage seed (§2 Фаза 1)
   const gateItems = [...(wizPreflight.blockers || []), ...(wizPreflight.forks || [])].map((it) => {
