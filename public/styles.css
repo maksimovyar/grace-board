@@ -99,6 +99,8 @@ body{
 .tag{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);display:inline-flex;align-items:center;gap:4px;
   border:1px solid var(--line-2);border-radius:6px;padding:2px 7px;text-decoration:none;background:var(--surface-2)}
 .tag:hover{border-color:var(--ink-soft);color:var(--ink)}
+/* queue / dependency chips (Plan Run §5.1/§5.2) — reuse .tag, distinct tone */
+.tag--queue{border-color:rgba(47,115,194,.4);background:rgba(47,115,194,.08);color:#255a97}
 .card__ask{display:flex;align-items:center;gap:8px;margin-top:9px;font-family:var(--mono);font-size:11.5px;color:#3a2706;font-weight:700;
   background:var(--amber);border-radius:var(--radius-sm);padding:8px 11px;cursor:pointer}
 .card__ask .dot{width:7px;height:7px;border-radius:50%;background:#3a2706;animation:blip 1.3s ease-in-out infinite}
