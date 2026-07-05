@@ -17,6 +17,7 @@ const WORKING = new Set(["implementing", "verifying", "reviewing"]); // agent-he
 
 let state = { cards: [], updatedAt: null };
 let igniteId = null;
+let planFilter = null;   // S4: when set, the board shows only this plan's stages (rail «только этот прогон»)
 
 // ── helpers ────────────────────────────────────────────────────────────────
 const boardEl = document.getElementById("board");
@@ -49,6 +50,9 @@ function stripHTML() {
 
 function cardTags(card) {
   const t = [];
+  // S4: plan stage badge «этап N/M» — most salient for a plan card, shown first.
+  const plan = planOfCard(card);
+  if (plan) { const s = stageOf(card, plan); t.push(`<span class="tag tag--stage" title="этап прогона">этап ${s.n}/${s.m}</span>`); }
   // Queue / dependency state (§5.1/§5.2) — most salient, shown first. A queued card is
   // either waiting on unmet dependsOn (🔒), or on a busy project slot (⏳).
   if (card.queued) {
@@ -122,11 +126,20 @@ function resultHTML(card) {
   return `<div><div class="dt__label">Результат · манифест релиза</div><div class="result">${rows.join("")}${manifest}</div></div>`;
 }
 
+// S4: the plan a card belongs to (null = single card) + its 1-based stage index.
+const planOfCard = (card) => card.planId ? (state.plans || []).find((p) => p.id === card.planId) : null;
+function stageOf(card, plan) { const i = (plan.cardIds || []).indexOf(card.id); return { n: i + 1, m: (plan.cardIds || []).length }; }
+
 function cardHTML(card) {
   const st = STATIONS[card.column] || STATIONS.backlog;
+  const plan = planOfCard(card);
+  const stage = plan ? stageOf(card, plan) : null;
   const crew = st.crew ? `<span class="card__crew">${esc(st.crew)}</span>` : "";
   const working = WORKING.has(card.column) ? ` data-working="1"` : "";
   const ignite = card.id === igniteId ? " is-ignite" : "";
+  const planAttr = plan ? ` data-plan="${esc(plan.id)}"` : "";
+  const projectLabel = plan ? "⚡ Plan Run" : card.project;
+  const stagePrefix = stage ? `<span class="card__stage">S${stage.n} ·</span>` : "";
 
   // Asking banner — clickable, opens the questionnaire drawer
   let askBanner = "";
@@ -154,10 +167,10 @@ function cardHTML(card) {
 
   const desc = card.description ? `<p class="card__desc">${esc(card.description)}</p>` : "";
   return `
-    <article class="card${ignite}" draggable="true" data-id="${card.id}" data-col="${esc(card.column)}"${working}>
+    <article class="card${ignite}" draggable="true" data-id="${card.id}" data-col="${esc(card.column)}"${working}${planAttr}>
       <div class="card__body">
-        <div class="card__meta"><span class="card__lamp" style="color:${st.c}"></span><span class="card__project">${esc(card.project)}</span>${crew}</div>
-        <h3 class="card__theme">${esc(card.theme || card.description || "—")}</h3>
+        <div class="card__meta"><span class="card__lamp" style="color:${st.c}"></span><span class="card__project">${esc(projectLabel)}</span>${crew}</div>
+        <h3 class="card__theme">${stagePrefix}${esc(card.theme || card.description || "—")}</h3>
         ${desc}
         ${cardTags(card)}
         ${askBanner}
@@ -170,7 +183,7 @@ function cardHTML(card) {
 
 function stationHTML(col) {
   const st = STATIONS[col];
-  const cards = state.cards.filter((c) => c.column === col);
+  const cards = state.cards.filter((c) => c.column === col && (!planFilter || c.planId === planFilter));
   const empty = col === "backlog"
     ? "Добавь задачу и перетащи\nеё через рычаг запуска ⟶"
     : "—";
@@ -217,8 +230,65 @@ async function setAutonomy(v) {
   } catch (err) { toast("Не удалось: " + err.message); }
 }
 
+// ── S4: plan-rail(s) over the columns — a running big feature (§2, design v2) ──
+function dagNodeClass(card) {
+  if (!card) return "wait";
+  if (card.column === "blocked") return "blocked";
+  if (card.column === "ready") return "done";
+  if (card.dispatchedAt) return "live";     // asking / implementing / verifying / reviewing
+  return "wait";                             // queued or not-yet-dispatched todo
+}
+function railHTML(plan) {
+  const cards = (plan.cardIds || []).map((id) => cardById(id)).filter(Boolean);
+  const total = cards.length;
+  const done = cards.filter((c) => c.column === "ready").length;
+  const autoN = cards.reduce((n, c) => n + ((c.result && c.result.autoDecisions || []).length), 0);
+  const nodes = cards.map((c, i) => {
+    const cls = dagNodeClass(c);
+    const dot = cls === "done" ? "✓" : cls === "live" ? "●" : cls === "blocked" ? "!" : "○";
+    return `${i ? '<span class="dag__arrow">→</span>' : ""}<span class="dag__node dag__node--${cls}" title="${esc(c.theme || "")}"><span class="dag__dot">${dot}</span>S${i + 1}</span>`;
+  }).join("");
+  const filterOn = planFilter === plan.id;
+  return `<section class="rail" data-plan-rail="${esc(plan.id)}">
+    <div class="rail__top">
+      <span class="rail__badge">⚡ прогон</span>
+      <div class="rail__goal">
+        <h2 class="rail__title">${esc(plan.goal || "Прогон " + plan.id)}</h2>
+        <div class="rail__meta">
+          <span class="rail__chip rail__chip--branch">⎇ ${esc(plan.integrationBranch)}</span>
+          <span class="rail__chip rail__chip--auto">режим: ${plan.mode === "auto" ? "Auto" : "Ask"}</span>
+          <span class="rail__chip">🧩 ${total} этап.</span>
+          <span class="rail__chip">🤖 авто-решений: ${autoN}</span>
+        </div>
+      </div>
+      <div class="rail__actions">
+        <button class="rail__filter${filterOn ? " is-on" : ""}" type="button" data-planfilter="${esc(plan.id)}">⛁ только этот прогон</button>
+        <button class="rail__pr" type="button" data-planpr="${esc(plan.id)}">Финальный PR в main →</button>
+      </div>
+    </div>
+    <div class="dag">${nodes}<span class="dag__count">${done} / ${total} · строго последовательно (WIP=1)</span></div>
+  </section>`;
+}
+function renderRails() {
+  const host = document.getElementById("railHost");
+  if (!host) return;
+  const plans = (state.plans || []).filter((p) => (p.cardIds || []).some((id) => cardById(id)));
+  host.innerHTML = plans.map(railHTML).join("");
+  host.querySelectorAll("[data-planfilter]").forEach((b) => b.addEventListener("click", () => { planFilter = planFilter === b.dataset.planfilter ? null : b.dataset.planfilter; render(); }));
+  host.querySelectorAll("[data-planpr]").forEach((b) => b.addEventListener("click", () => onPlanPR(b.dataset.planpr)));
+}
+async function onPlanPR(planId) {
+  const plan = (state.plans || []).find((p) => p.id === planId);
+  try {
+    const m = await api(`/api/plans/${planId}/manifest`);
+    const floor = (m.floor || []).length ? ` · ⚠ пол: ${m.floor.length}` : "";
+    toast(`Интеграционная ветка <strong>${esc(plan ? plan.integrationBranch : planId)}</strong> · ${m.stageCount} этап.${floor} · мерж в main — гейт человека`);
+  } catch (err) { toast("Не удалось: " + err.message); }
+}
+
 function render() {
   ensureAutonomyToggle(); paintAutonomy();
+  renderRails();
   stripEl.innerHTML = stripHTML();
   const parts = [stationHTML("backlog")];
   parts.push(`<div class="lever" data-drop="todo" id="lever" title="перетащи карточку через рычаг — команда возьмёт задачу"><span class="lever__knob"></span><span class="lever__label">launch</span></div>`);
@@ -518,6 +588,95 @@ form.addEventListener("submit", async (e) => {
   } catch (err) { toast("Не удалось сохранить: " + err.message); }
   finally { btn.disabled = false; }
 });
+
+// ── S4: launch wizard (⚡ Прогон) — assemble a plan from EXISTING board cards ──
+const launchEl = document.getElementById("launch");
+let wizStep = 1, wizMode = "ask", wizPicks = [];   // wizPicks: ordered [{cardId, deps:Set<cardId>}]
+const assemblable = (project) => state.cards.filter((c) => c.project === project && (c.column === "backlog" || c.column === "todo") && !c.dispatchedAt && !c.planId);
+const pickIndex = (id) => wizPicks.findIndex((p) => p.cardId === id);
+function syncProjName() { const v = document.getElementById("lProject").value; document.querySelectorAll("#lProjName,#lProjName2").forEach((e) => (e.textContent = v || "проекта")); }
+function setWizMode(v) { wizMode = v; document.querySelectorAll("#lMode .seg__opt").forEach((o) => o.classList.toggle("is-on", o.dataset.auto === v)); }
+function openLaunch() {
+  closeAll();
+  wizPicks = []; setWizMode(state.autonomy === "auto" ? "auto" : "ask");
+  const projects = [...new Set(state.cards.filter((c) => (c.column === "backlog" || c.column === "todo") && !c.dispatchedAt && !c.planId).map((c) => c.project))];
+  const sel = document.getElementById("lProject");
+  sel.innerHTML = projects.length ? projects.map((p) => `<option>${esc(p)}</option>`).join("") : `<option value="">— нет свободных карточек —</option>`;
+  document.getElementById("lGoal").value = "";
+  syncProjName(); wizGoto(1);
+  launchEl.hidden = false;
+}
+function wizGoto(n) {
+  wizStep = n;
+  launchEl.querySelectorAll(".lpane").forEach((p) => p.classList.toggle("is-on", +p.dataset.pane === n));
+  launchEl.querySelectorAll(".steps__i").forEach((s) => { const k = +s.dataset.step; s.classList.toggle("is-on", k === n); s.classList.toggle("is-done", k < n); });
+  if (n === 2) renderDraft();
+  if (n === 3) renderGate();
+  launchEl.querySelector(".launch__panel").scrollTop = 0;
+}
+function renderDraft() {
+  const project = document.getElementById("lProject").value;
+  const cards = assemblable(project);
+  const draft = document.getElementById("draft");
+  if (!cards.length) { draft.innerHTML = `<div class="gate-empty">Нет незавершённых карточек в Backlog/To do этого проекта. Заведи их на доске.</div>`; updatePickCount(); return; }
+  draft.innerHTML = cards.map((c) => {
+    const idx = pickIndex(c.id), on = idx >= 0;
+    const others = wizPicks.filter((p) => p.cardId !== c.id);
+    const deps = (on && others.length) ? `<div class="stagedeps"><span class="stagedeps__lk">зависит:</span>${others.map((p) => {
+      const dn = `S${pickIndex(p.cardId) + 1}`, active = wizPicks[idx].deps.has(p.cardId), oc = cardById(p.cardId);
+      return `<button type="button" class="depchip${active ? " is-on" : ""}" data-dep="${esc(c.id)}|${esc(p.cardId)}" title="${esc(oc ? oc.theme : "")}">${dn}</button>`;
+    }).join("")}</div>` : "";
+    return `<div class="stagerow" data-on="${on ? 1 : 0}">
+      <label class="pick"><input type="checkbox" data-pick="${esc(c.id)}" ${on ? "checked" : ""}/></label>
+      <span class="stagerow__id">${on ? "S" + (idx + 1) : "—"}</span>
+      <span class="stagerow__t" title="${esc(c.theme || "")}">${esc(c.theme || "—")}</span>
+      <span class="stagerow__col" style="color:${lampColor(c.column)}">${esc((STATIONS[c.column] || {}).name || c.column)}</span>
+      ${deps}
+    </div>`;
+  }).join("");
+  draft.querySelectorAll("[data-pick]").forEach((cb) => cb.addEventListener("change", () => togglePick(cb.dataset.pick)));
+  draft.querySelectorAll("[data-dep]").forEach((ch) => ch.addEventListener("click", () => { const [cid, did] = ch.dataset.dep.split("|"); toggleDep(cid, did); }));
+  updatePickCount();
+}
+function togglePick(id) {
+  const i = pickIndex(id);
+  if (i >= 0) { wizPicks.splice(i, 1); wizPicks.forEach((p) => p.deps.delete(id)); }
+  else wizPicks.push({ cardId: id, deps: new Set() });
+  renderDraft();
+}
+function toggleDep(cid, did) { const p = wizPicks[pickIndex(cid)]; if (!p) return; p.deps.has(did) ? p.deps.delete(did) : p.deps.add(did); renderDraft(); }
+function updatePickCount() { document.getElementById("pickCount").textContent = "выбрано " + wizPicks.length; }
+function renderGate() {
+  const g = document.getElementById("gate"), project = document.getElementById("lProject").value, n = wizPicks.length;
+  if (!n) { g.innerHTML = `<div class="gate-empty">Не выбрано ни одной карточки — вернись на шаг 2.</div>`; return; }
+  const rows = wizPicks.map((p, i) => {
+    const c = cardById(p.cardId), deps = [...p.deps].map((d) => `S${pickIndex(d) + 1}`).join(", ") || "—";
+    return `<div class="stagerow" data-on="1"><span class="stagerow__id">S${i + 1}</span><span class="stagerow__t">${esc(c ? c.theme : "")}</span><span class="stagerow__col" style="color:var(--ink-faint)">deps: ${esc(deps)}</span></div>`;
+  }).join("");
+  g.innerHTML = `<div class="gate-item"><span class="gate-item__type">состав</span><div class="gate-item__q">${esc(project)} · ${n} этап(ов) · режим ${wizMode === "auto" ? "Auto" : "Ask"} · ветка autodev/plan-…</div></div>`
+    + `<div class="plandraft">${rows}</div>`
+    + `<p class="lnote" style="margin-top:8px;color:var(--ink-faint)">План-уровневые развилки/блокеры/пол сводятся здесь (S5). Сейчас — запуск состава по DAG (WIP=1).</p>`;
+}
+async function fireLaunch(btn) {
+  const project = document.getElementById("lProject").value;
+  if (!project || !wizPicks.length) { toast("Выбери проект и хотя бы одну карточку"); return; }
+  const stages = wizPicks.map((p) => ({ cardId: p.cardId, dependsOn: [...p.deps] }));
+  btn.disabled = true; btn.textContent = "Запускаю…";
+  try {
+    const { plan } = await api("/api/plans", { method: "POST", body: JSON.stringify({ project, goal: document.getElementById("lGoal").value.trim(), mode: wizMode, stages }) });
+    launchEl.hidden = true;
+    toast(`⚡ Прогон запущен · <strong>${esc(plan.integrationBranch)}</strong>`);
+    loadBoard();
+  } catch (err) { btn.disabled = false; btn.textContent = "✅ Утвердить и запустить прогон →"; toast("Не удалось запустить: " + err.message); }
+}
+document.getElementById("openLaunch").addEventListener("click", openLaunch);
+launchEl.querySelectorAll("[data-lclose]").forEach((b) => b.addEventListener("click", () => (launchEl.hidden = true)));
+launchEl.querySelectorAll("[data-go]").forEach((b) => b.addEventListener("click", () => wizGoto(+b.dataset.go)));
+document.querySelectorAll("#lMode .seg__opt").forEach((o) => o.addEventListener("click", () => setWizMode(o.dataset.auto)));
+document.getElementById("lProject").addEventListener("change", () => { wizPicks = []; syncProjName(); if (wizStep === 2) renderDraft(); });
+document.getElementById("toBoard").addEventListener("click", () => { launchEl.hidden = true; openComposer(null); });
+document.getElementById("fire").addEventListener("click", (e) => fireLaunch(e.currentTarget));
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !launchEl.hidden) launchEl.hidden = true; });
 
 // ── run viewer (План · Лог) ──────────────────────────────────────────────────
 const logBody = document.getElementById("logBody"), logMeta = document.getElementById("logMeta");
