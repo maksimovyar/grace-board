@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>grace · board — запуск «большой фичи» (Plan Run, v2)</title>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <!-- реальные токены проекта — источник дизайна (§3.1): html · public/ -->
+  <link rel="stylesheet" href="../public/styles.css" />
+  <style>
+    /* ── Plan Run v2 · «Запуск большой фичи» ─────────────────────────────
+       Что нового против plan-run-surfaces.html:
+       — цельный, встроенный в доску сценарий ЗАПУСКА прогона (мастер),
+       — plan-rail над колонками = запущенная «большая фича» на доске (DAG-прогресс,
+         интеграционная ветка, AUTO, один PR),
+       — кликабельно: ⚡ Прогон → мастер (цель → этапы → сводный гейт) → плашка на доске.
+       Все классы аддитивные (префикс pr-/launch-/rail-), реюз существующих
+       (.card .tag .seg .btn .opt .qblock). Кандидаты в public/styles.css на S4/S5. */
+
+    /* фон-подложка страницы под доску (мокап на всю высоту) */
+    body{min-height:100vh}
+
+    /* кнопка запуска ПРОГОНА в шапке — точка входа Plan Run (S4), тон плана (verifying) */
+    .btn--run{color:#fff;background:var(--s-verifying);display:inline-flex;align-items:center;gap:7px}
+    .btn--run:hover{filter:brightness(1.07);transform:translateY(-1px)}
+    .auto-seg{display:inline-flex;align-items:center;gap:9px}
+    .auto-seg__label{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-soft)}
+    .seg__opt.is-on[data-auto="auto"]{background:var(--s-verifying)}
+
+    /* ── PLAN RAIL — запущенная «большая фича» поверх колонок ─────────── */
+    .rail{margin:0 24px 16px;background:linear-gradient(180deg,#fff,var(--surface-2));
+      border:1.5px solid var(--line-2);border-left:4px solid var(--s-verifying);border-radius:var(--radius);
+      box-shadow:var(--shadow);padding:14px 18px;position:relative}
+    .rail[hidden]{display:none}
+    .rail__top{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap}
+    .rail__badge{font-family:var(--mono);font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+      color:#fff;background:var(--s-verifying);border-radius:5px;padding:2px 8px;flex:none;margin-top:3px}
+    .rail__goal{flex:1;min-width:240px}
+    .rail__title{font-family:var(--display);font-weight:700;font-size:16px;letter-spacing:-.01em;margin:0}
+    .rail__meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:7px}
+    .rail__chip{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
+      border:1px solid var(--line);border-radius:6px;padding:3px 9px;display:inline-flex;align-items:center;gap:5px;text-decoration:none}
+    .rail__chip a,.rail__chip{color:var(--ink-soft)}
+    .rail__chip--branch{color:var(--s-todo);border-color:rgba(47,115,194,.35);background:rgba(47,115,194,.06)}
+    .rail__chip--auto{color:#6a3fc0;border-color:rgba(139,83,224,.4);background:rgba(139,83,224,.08)}
+    .rail__actions{display:flex;align-items:center;gap:8px;margin-top:2px}
+    .rail__pr{font-family:var(--display);font-weight:600;font-size:12.5px;color:#fff;background:var(--s-verifying);
+      border:none;border-radius:9px;padding:8px 13px;cursor:pointer;white-space:nowrap}
+    .rail__pr:hover{filter:brightness(1.07)}
+    .rail__filter{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
+      border:1px solid var(--line-2);border-radius:9px;padding:7px 11px;cursor:pointer}
+    .rail__filter:hover{border-color:var(--ink-soft);color:var(--ink)}
+
+    /* DAG-прогресс: SD ✓ → SA ✓ → S0 ● → S1 ○ … — «карта» большой фичи */
+    .dag{display:flex;align-items:center;gap:0;flex-wrap:wrap;margin-top:13px;padding-top:12px;border-top:1px dashed var(--line)}
+    .dag__node{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;color:var(--ink-soft);
+      background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:4px 11px 4px 5px}
+    .dag__dot{width:17px;height:17px;border-radius:50%;flex:none;display:grid;place-items:center;font-size:9.5px;font-weight:700;color:#fff}
+    .dag__node--done .dag__dot{background:var(--s-ready)}
+    .dag__node--done{border-color:rgba(46,158,80,.4)}
+    .dag__node--live .dag__dot{background:var(--s-implementing);animation:pulse 1.5s ease-in-out infinite}
+    .dag__node--live{border-color:rgba(216,91,34,.5);color:var(--ink);font-weight:700;box-shadow:0 0 0 1px rgba(216,91,34,.2)}
+    .dag__node--wait .dag__dot{background:var(--line-2)}
+    .dag__node--wait{opacity:.7}
+    .dag__arrow{color:var(--line-2);font-size:13px;padding:0 6px}
+    .dag__count{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);align-self:center}
+
+    /* карточка внутри прогона получает лёгкую метку принадлежности */
+    .card[data-plan] .card__project{border-color:rgba(139,83,224,.4);background:rgba(139,83,224,.07);color:#6a3fc0}
+    /* dep-чипы прогона (реюз .tag) */
+    .tag--wait{border-color:rgba(201,138,18,.45);background:rgba(201,138,18,.10);color:#8a5e08}
+    .tag--queue{border-color:rgba(47,115,194,.4);background:rgba(47,115,194,.08);color:#255a97}
+    .tag--files{border-color:var(--line-2)}
+    .tag--auto{border-color:rgba(139,83,224,.4);background:rgba(139,83,224,.08);color:#6a3fc0}
+    .tag--stage{border-color:rgba(139,83,224,.4);background:rgba(139,83,224,.10);color:#6a3fc0;font-weight:700}
+
+    /* ── LAUNCH WIZARD — центральный модал запуска большой фичи ──────── */
+    .launch{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:24px}
+    .launch[hidden]{display:none}
+    .launch__scrim{position:absolute;inset:0;background:rgba(40,52,74,.40);backdrop-filter:blur(3px)}
+    .launch__panel{position:relative;width:min(760px,96vw);max-height:92vh;overflow:auto;background:var(--bg-2);
+      border:1px solid var(--line-2);border-radius:16px;box-shadow:var(--shadow-lift);padding:22px 26px 24px;
+      display:flex;flex-direction:column;gap:16px;animation:slidein .22s ease}
+    .launch__head{display:flex;align-items:center;gap:12px}
+    .launch__mark{width:30px;height:30px;border-radius:9px;background:var(--s-verifying);color:#fff;display:grid;place-items:center;font-size:16px;flex:none}
+    .launch__title{font-family:var(--display);font-weight:700;font-size:20px;margin:0;letter-spacing:-.01em}
+    .launch__sub{font-family:var(--mono);font-size:11px;color:var(--ink-faint);margin:2px 0 0}
+    .launch__close{margin-left:auto;background:none;border:none;font-size:17px;cursor:pointer;color:var(--ink-soft)}
+    .launch__close:hover{color:var(--ink)}
+
+    /* степпер шагов */
+    .steps{display:flex;align-items:center;gap:0;margin:-2px 0 2px}
+    .steps__i{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--ink-faint)}
+    .steps__n{width:22px;height:22px;border-radius:50%;flex:none;display:grid;place-items:center;font-weight:700;font-size:11px;
+      color:var(--ink-faint);background:var(--surface);border:1.5px solid var(--line-2)}
+    .steps__i.is-on .steps__n{color:#fff;background:var(--s-verifying);border-color:var(--s-verifying)}
+    .steps__i.is-on{color:var(--ink)}
+    .steps__i.is-done .steps__n{color:#fff;background:var(--s-ready);border-color:var(--s-ready)}
+    .steps__bar{flex:1;height:1.5px;background:var(--line-2);margin:0 10px;min-width:18px}
+
+    .lpane{display:none;flex-direction:column;gap:14px}
+    .lpane.is-on{display:flex}
+
+    /* черновик плана — редактируемый список этапов (реюз стиля из v1) */
+    .plandraft{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:6px 16px 15px}
+    .stagerow{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
+    .stagerow:first-of-type{border-top:none}
+    .pick{display:flex;flex:none}
+    .pick input{width:16px;height:16px;accent-color:var(--s-verifying);cursor:pointer}
+    .stagerow__id{font-family:var(--mono);font-size:10.5px;color:#fff;background:var(--s-verifying);border-radius:5px;padding:1px 7px;flex:none;min-width:26px;text-align:center}
+    .stagerow__t{flex:1;min-width:0;font-size:13.5px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .stagerow__col{font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;flex:none;font-weight:700}
+    .stagerow__dep{font-family:var(--mono);font-size:10px;color:var(--ink-faint);flex:none;min-width:64px;text-align:right}
+    /* невыбранная задача — приглушена, id серый (не получит id этапа) */
+    .stagerow[data-on="0"]{opacity:.5}
+    .stagerow[data-on="0"] .stagerow__id{background:var(--line-2)}
+    .linklike{background:none;border:none;padding:0;font:inherit;color:var(--s-todo);cursor:pointer;text-decoration:underline}
+    .linklike:hover{color:var(--s-verifying)}
+
+    .lk{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-soft)}
+    .lnote{font-size:12.5px;color:var(--ink-soft);line-height:1.5;margin:0}
+    .lnote code,.launch code{font-family:var(--mono);font-size:.92em;background:var(--surface);border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+    .lin{font-family:var(--sans);font-size:14px;color:var(--ink);background:var(--surface);border:1px solid var(--line-2);border-radius:9px;padding:10px 12px;width:100%;resize:vertical}
+    .lin:focus{outline:2px solid var(--s-verifying);outline-offset:1px;border-color:transparent}
+    .lrow{display:flex;gap:12px;flex-wrap:wrap}
+    .lrow>label{flex:1;min-width:200px;display:flex;flex-direction:column;gap:6px}
+    .lfoot{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-top:2px}
+
+    /* research-вердикт (§3.2) — нужен ли дизайн-этап */
+    .verdict{display:flex;gap:11px;align-items:flex-start;background:rgba(139,83,224,.06);border:1px solid rgba(139,83,224,.25);
+      border-radius:11px;padding:12px 14px}
+    .verdict__ic{font-size:17px;flex:none;margin-top:1px}
+    .verdict__b{font-size:12.5px;line-height:1.5;color:var(--ink-soft)}
+    .verdict__b b{color:var(--ink)}
+
+    /* сводный гейт внутри мастера (S5) */
+    .gate-item{border:1.5px solid var(--line);border-radius:11px;padding:12px 13px;margin-bottom:11px;background:var(--surface)}
+    .gate-item__type{font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;border-radius:5px;padding:1px 7px;color:#fff}
+    .gate-item--fork .gate-item__type{background:var(--s-verifying)}
+    .gate-item--blocker .gate-item__type{background:var(--s-blocked)}
+    .gate-item--floor .gate-item__type{background:var(--s-asking)}
+    .gate-item__scope{font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-left:8px}
+    .gate-item__q{font-size:14px;font-weight:600;color:var(--ink);margin:8px 0 9px;line-height:1.4}
+
+    /* маленький разъяснитель под шапкой */
+    .pagenote{margin:0 24px 14px;font-size:12.5px;color:var(--ink-soft);line-height:1.5;
+      background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--s-verifying);border-radius:10px;padding:11px 14px}
+    .pagenote code{font-family:var(--mono);font-size:.92em}
+  </style>
+</head>
+<body>
+
+<!-- ── шапка: ⚡ Прогон (большая фича) рядом с + Новая задача, тумблер AUTO ── -->
+<header class="console">
+  <div class="console__brand">
+    <span class="console__mark" aria-hidden="true"></span>
+    <div>
+      <h1 class="console__title">grace<span>·</span>board</h1>
+      <p class="console__sub">диспетчерская · запуск большой фичи · v2</p>
+    </div>
+  </div>
+  <nav class="strip" aria-label="станции" style="margin-left:auto">
+    <span class="strip__cell"><span class="strip__lamp" style="color:var(--s-todo)"></span>To do <span class="strip__n">3</span></span>
+    <span class="strip__cell"><span class="strip__lamp" style="color:var(--s-implementing)"></span>Impl <span class="strip__n">1</span></span>
+    <span class="strip__cell"><span class="strip__lamp" style="color:var(--s-ready)"></span>Ready <span class="strip__n">2</span></span>
+  </nav>
+  <div class="auto-seg" title="глобальный режим автономии (оверрайд на карточке/прогоне)">
+    <span class="auto-seg__label">Режим</span>
+    <div class="seg" id="autoSeg">
+      <button type="button" class="seg__opt is-on" data-auto="ask">Ask</button>
+      <button type="button" class="seg__opt" data-auto="auto">Auto</button>
+    </div>
+  </div>
+  <button class="btn btn--run" type="button" id="openLaunch">⚡ Прогон</button>
+  <button class="btn btn--solid" type="button">+ Новая задача</button>
+</header>
+
+<p class="pagenote">
+  <b>Большая фича = прогон (Plan Run).</b> Кнопка <b>«⚡ Прогон»</b> берёт одну цель, раскладывает её на
+  этапы с зависимостями, сводит развилки/блокеры в один гейт — и уводит этапы на доску одной
+  интеграционной веткой <code>autodev/plan-&lt;id&gt;</code> → один PR в main. Ниже — доска с уже
+  запущенным прогоном (plan-rail) и мастер запуска по кнопке.
+</p>
+
+<!-- ── PLAN RAIL — запущенная большая фича над колонками ──────────────── -->
+<section class="rail" id="rail" hidden aria-label="запущенный прогон">
+  <div class="rail__top">
+    <span class="rail__badge">⚡ прогон</span>
+    <div class="rail__goal">
+      <h2 class="rail__title" id="railTitle">Движок Plan Run</h2>
+      <div class="rail__meta">
+        <span class="rail__chip rail__chip--branch">⎇ autodev/plan-run</span>
+        <span class="rail__chip rail__chip--auto" id="railMode">режим: Ask</span>
+        <span class="rail__chip">🧩 <span id="railStages">6</span> этапов</span>
+        <span class="rail__chip">🤖 авто-решений: 0</span>
+      </div>
+    </div>
+    <div class="rail__actions">
+      <button class="rail__filter" type="button">⛁ только этот прогон</button>
+      <button class="rail__pr" type="button">Финальный PR в main →</button>
+    </div>
+  </div>
+  <!-- DAG: карта большой фичи по этапам -->
+  <div class="dag" id="dag">
+    <span class="dag__node dag__node--done" title="готов"><span class="dag__dot">✓</span>SD</span>
+    <span class="dag__arrow">→</span>
+    <span class="dag__node dag__node--done"><span class="dag__dot">✓</span>SA</span>
+    <span class="dag__arrow">→</span>
+    <span class="dag__node dag__node--live"><span class="dag__dot">●</span>S0</span>
+    <span class="dag__arrow">→</span>
+    <span class="dag__node dag__node--wait"><span class="dag__dot">○</span>S1</span>
+    <span class="dag__arrow">→</span>
+    <span class="dag__node dag__node--wait"><span class="dag__dot">○</span>SR</span>
+    <span class="dag__arrow">→</span>
+    <span class="dag__node dag__node--wait"><span class="dag__dot">○</span>S3</span>
+    <span class="dag__count">2 / 6 · строго последовательно (WIP=1)</span>
+  </div>
+</section>
+
+<!-- ── ДОСКА: колонки с карточками прогона + одиночными ────────────────── -->
+<main class="board" aria-label="kanban board">
+
+  <section class="station station--backlog">
+    <div class="station__head"><span class="station__no">01</span><span class="station__lamp" style="color:var(--s-backlog)"></span><span class="station__name">Backlog</span><span class="station__count">1</span></div>
+    <div class="well">
+      <article class="card" data-col="backlog">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-backlog)"></span><span class="card__project">Emotions</span><span class="card__crew">одиночная</span></div>
+          <h3 class="card__theme">Экспорт дневника в PDF</h3>
+          <p class="card__desc">Обычная одиночная карточка — режим не меняется, тащишь через рычаг.</p>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <div class="lever" aria-hidden="true"><span class="lever__knob"></span><span class="lever__label">запуск</span></div>
+
+  <section class="station">
+    <div class="station__head"><span class="station__no">02</span><span class="station__lamp" style="color:var(--s-todo)"></span><span class="station__name">To do</span><span class="station__count">3</span></div>
+    <div class="well">
+      <article class="card" data-col="todo" data-plan="plan-run">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-todo)"></span><span class="card__project">⚡ Plan Run</span><span class="card__crew">в очереди</span></div>
+          <h3 class="card__theme"><span style="font-family:var(--mono);font-size:12px;color:#6a3fc0">S1 ·</span> dependsOn + DAG-шедулер</h3>
+          <div class="card__tags">
+            <span class="tag tag--wait">🔒 ждёт: S0</span>
+            <span class="tag tag--files">⎘ server.js, app.js</span>
+          </div>
+        </div>
+        <div class="card__stamp">⟶ в очереди · зависимость не закрыта</div>
+      </article>
+      <article class="card" data-col="todo" data-plan="plan-run">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-todo)"></span><span class="card__project">⚡ Plan Run</span><span class="card__crew">в очереди</span></div>
+          <h3 class="card__theme"><span style="font-family:var(--mono);font-size:12px;color:#6a3fc0">SR ·</span> Результат + манифест релиза</h3>
+          <div class="card__tags">
+            <span class="tag tag--wait">🔒 ждёт: S1</span>
+            <span class="tag tag--files">⎘ 3</span>
+          </div>
+        </div>
+        <div class="card__stamp">⟶ в очереди по цепочке DAG</div>
+      </article>
+      <article class="card" data-col="todo">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-todo)"></span><span class="card__project">DocsInside2</span><span class="card__crew">в очереди</span></div>
+          <h3 class="card__theme">Этап 1.2 · AuthN</h3>
+          <div class="card__tags"><span class="tag tag--queue">⏳ очередь #2 · проект занят</span></div>
+        </div>
+        <div class="card__stamp">⟶ ждёт слот проекта (WIP=1)</div>
+      </article>
+    </div>
+  </section>
+
+  <section class="station">
+    <div class="station__head"><span class="station__no">03</span><span class="station__lamp" style="color:var(--s-asking)"></span><span class="station__name">Asking</span><span class="station__count">0</span></div>
+    <div class="well"><div class="well__empty">пусто</div></div>
+  </section>
+
+  <section class="station">
+    <div class="station__head"><span class="station__no">04</span><span class="station__lamp" style="color:var(--s-implementing)"></span><span class="station__name">Implementing</span><span class="station__count">1</span></div>
+    <div class="well">
+      <article class="card" data-col="implementing" data-working="1" data-plan="plan-run">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-implementing)"></span><span class="card__project">⚡ Plan Run</span><span class="card__crew">gfd-coder</span></div>
+          <h3 class="card__theme"><span style="font-family:var(--mono);font-size:12px;color:#6a3fc0">S0 ·</span> Очередь WIP=1 + фикс cwd</h3>
+          <div class="card__tags">
+            <span class="tag tag--stage">этап 3/6</span>
+            <span class="tag tag--files">⎘ 2</span>
+          </div>
+        </div>
+        <div class="card__stamp">⟶ база = tip autodev/plan-run · видит коммиты SD, SA</div>
+        <div class="card__foot"><button class="card__act">⊟ лог</button></div>
+      </article>
+    </div>
+  </section>
+
+  <section class="station">
+    <div class="station__head"><span class="station__no">05</span><span class="station__lamp" style="color:var(--s-verifying)"></span><span class="station__name">Verifying</span><span class="station__count">1</span></div>
+    <div class="well">
+      <article class="card" data-col="verifying" data-working="1">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-verifying)"></span><span class="card__project">kaizen-planer</span><span class="card__crew">gfd-verifier</span></div>
+          <h3 class="card__theme">B1 · Критик релевантности</h3>
+          <div class="card__tags"><span class="tag">одиночная</span></div>
+        </div>
+        <div class="card__stamp">⟶ semantic-trace verify · внутренний статус прогона тоже проходит здесь</div>
+        <div class="card__foot"><button class="card__act">⊟ лог</button></div>
+      </article>
+    </div>
+  </section>
+
+  <section class="station">
+    <div class="station__head"><span class="station__no">06</span><span class="station__lamp" style="color:var(--s-reviewing)"></span><span class="station__name">Reviewing</span><span class="station__count">1</span></div>
+    <div class="well">
+      <article class="card" data-col="reviewing" data-working="1">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-reviewing)"></span><span class="card__project">Виноградарь</span><span class="card__crew">gfd-reviewer</span></div>
+          <h3 class="card__theme">Погодный виджет · экран</h3>
+          <div class="card__tags"><span class="tag">одиночная</span></div>
+        </div>
+        <div class="card__stamp">⟶ ревью диффа · этап прогона идёт по тем же станциям</div>
+        <div class="card__foot"><button class="card__act">⊟ лог</button></div>
+      </article>
+    </div>
+  </section>
+
+  <section class="station">
+    <div class="station__head"><span class="station__no">07</span><span class="station__lamp" style="color:var(--s-ready)"></span><span class="station__name">Ready for deploy</span><span class="station__count">2</span></div>
+    <div class="well">
+      <article class="card" data-col="ready" data-plan="plan-run">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-ready)"></span><span class="card__project">⚡ Plan Run</span><span class="card__crew">✓ verify</span></div>
+          <h3 class="card__theme"><span style="font-family:var(--mono);font-size:12px;color:#6a3fc0">SD ·</span> Дизайн новых поверхностей</h3>
+          <div class="card__tags"><span class="tag tag--stage">этап 1/6</span><span class="tag">design/plan-run-launch-v2.html</span></div>
+        </div>
+        <div class="card__stamp">⟶ фиделити-verify зелёный · дельты релиза скопились</div>
+      </article>
+      <article class="card" data-col="ready" data-plan="plan-run">
+        <div class="card__body">
+          <div class="card__meta"><span class="card__lamp" style="color:var(--s-ready)"></span><span class="card__project">⚡ Plan Run</span><span class="card__crew">✓ verify</span></div>
+          <h3 class="card__theme"><span style="font-family:var(--mono);font-size:12px;color:#6a3fc0">SA ·</span> Актуализация плана</h3>
+          <div class="card__tags"><span class="tag tag--stage">этап 2/6</span></div>
+        </div>
+        <div class="card__stamp">⟶ мокап ↔ этап сверены</div>
+      </article>
+    </div>
+  </section>
+
+</main>
+
+<div class="hint">Одиночные карточки — как раньше (рычаг). <b>Большая фича</b> — кнопкой <b>⚡ Прогон</b>.</div>
+
+<!-- ══ LAUNCH WIZARD — мастер запуска большой фичи ═════════════════════ -->
+<div class="launch" id="launch" hidden>
+  <div class="launch__scrim" data-lclose></div>
+  <div class="launch__panel">
+    <div class="launch__head">
+      <span class="launch__mark">⚡</span>
+      <div>
+        <h2 class="launch__title">Запуск большой фичи</h2>
+        <p class="launch__sub">Plan Run · собери из задач доски → один PR</p>
+      </div>
+      <button class="launch__close" type="button" data-lclose aria-label="Закрыть">✕</button>
+    </div>
+
+    <div class="steps" id="steps">
+      <span class="steps__i is-on" data-step="1"><span class="steps__n">1</span>Проект</span>
+      <span class="steps__bar"></span>
+      <span class="steps__i" data-step="2"><span class="steps__n">2</span>Задачи с доски</span>
+      <span class="steps__bar"></span>
+      <span class="steps__i" data-step="3"><span class="steps__n">3</span>Гейт → запуск</span>
+    </div>
+
+    <!-- ШАГ 1 · цель + режим + research-вердикт -->
+    <div class="lpane is-on" data-pane="1">
+      <div class="lrow">
+        <label>
+          <span class="lk">Проект</span>
+          <select class="lin" id="lProject">
+            <option>grace-board</option>
+            <option>DocsInside2</option>
+            <option>kaizen-planer</option>
+          </select>
+        </label>
+        <label>
+          <span class="lk">Режим автономии</span>
+          <div class="seg" id="lMode">
+            <button type="button" class="seg__opt is-on" data-auto="ask">Ask</button>
+            <button type="button" class="seg__opt" data-auto="auto">Auto</button>
+          </div>
+        </label>
+      </div>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span class="lk">Цель прогона · контекст для финального PR <span style="text-transform:none;color:var(--ink-faint)">(необязательно)</span></span>
+        <textarea class="lin" rows="2">Движок Plan Run: очередь, зависимости, манифест релиза, AUTO с полом.</textarea>
+      </label>
+      <div class="verdict">
+        <span class="verdict__ic">🧩</span>
+        <span class="verdict__b"><b>Прогон собирается из задач доски.</b> На следующем шаге — все незавершённые
+          карточки <b id="lProjName">grace-board</b> (Backlog + To do). Отметь, что войдёт в прогон,
+          и задай порядок/зависимости. Новые задачи руками тут не заводятся — сначала карточка на доске.</span>
+      </div>
+      <div class="lfoot">
+        <button class="btn btn--ghost" type="button" data-lclose>Отмена</button>
+        <button class="btn btn--run" type="button" data-go="2">К задачам проекта →</button>
+      </div>
+    </div>
+
+    <!-- ШАГ 2 · сбор прогона из карточек доски (не ручной ввод) -->
+    <div class="lpane" data-pane="2">
+      <p class="lnote"><b>Задачи <b id="lProjName2">grace-board</b> на доске.</b> Отметь, что войдёт в прогон; порядок
+        и зависимости — стрелкой/чипом. Порядок строго последовательный (WIP=1). Дизайн-этап
+        <code>SD</code> предложен первым, т.к. фича вводит новые поверхности — он загейтит граф (§2).</p>
+      <div class="plandraft" id="draft">
+        <div class="stagerow" data-on="1"><label class="pick"><input type="checkbox" checked /></label><span class="stagerow__id">SD</span><span class="stagerow__t">Дизайн новых поверхностей</span><span class="stagerow__col" style="color:var(--s-backlog)">Backlog</span><span class="stagerow__dep">deps: —</span></div>
+        <div class="stagerow" data-on="1"><label class="pick"><input type="checkbox" checked /></label><span class="stagerow__id">SA</span><span class="stagerow__t">Актуализация плана по макетам</span><span class="stagerow__col" style="color:var(--s-backlog)">Backlog</span><span class="stagerow__dep">deps: SD</span></div>
+        <div class="stagerow" data-on="1"><label class="pick"><input type="checkbox" checked /></label><span class="stagerow__id">S0</span><span class="stagerow__t">Очередь WIP=1 + фикс cwd</span><span class="stagerow__col" style="color:var(--s-todo)">To do</span><span class="stagerow__dep">deps: SA</span></div>
+        <div class="stagerow" data-on="1"><label class="pick"><input type="checkbox" checked /></label><span class="stagerow__id">S1</span><span class="stagerow__t">dependsOn + DAG-шедулер</span><span class="stagerow__col" style="color:var(--s-todo)">To do</span><span class="stagerow__dep">deps: S0</span></div>
+        <div class="stagerow" data-on="1"><label class="pick"><input type="checkbox" checked /></label><span class="stagerow__id">SR</span><span class="stagerow__t">Результат + манифест релиза</span><span class="stagerow__col" style="color:var(--s-todo)">To do</span><span class="stagerow__dep">deps: S1</span></div>
+        <div class="stagerow" data-on="1"><label class="pick"><input type="checkbox" checked /></label><span class="stagerow__id">S3</span><span class="stagerow__t">Режим AUTO + жёсткий пол</span><span class="stagerow__col" style="color:var(--s-backlog)">Backlog</span><span class="stagerow__dep">deps: SR</span></div>
+        <div class="stagerow" data-on="0"><label class="pick"><input type="checkbox" /></label><span class="stagerow__id">—</span><span class="stagerow__t">Экспорт лога в CSV (разовая, вне фичи)</span><span class="stagerow__col" style="color:var(--s-backlog)">Backlog</span><span class="stagerow__dep">не в прогоне</span></div>
+      </div>
+      <p class="lnote" style="margin:2px 0 0;color:var(--ink-faint)">
+        Нет нужной задачи? <button class="linklike" id="toBoard" type="button">Заведи карточку на доске</button>
+        (или «+ Новая задача»), затем вернись в прогон. Прогон не создаёт задачи с нуля.
+      </p>
+      <div class="lfoot">
+        <button class="btn btn--ghost" type="button" data-go="1">← Назад</button>
+        <div style="display:flex;gap:10px;align-items:center"><span class="lk" id="pickCount" style="text-transform:none">выбрано 6</span><button class="btn btn--run" type="button" data-go="3">К сводному гейту →</button></div>
+      </div>
+    </div>
+
+    <!-- ШАГ 3 · сводный гейт (S5) → запуск -->
+    <div class="lpane" data-pane="3">
+      <p class="lnote"><b>Сводный гейт.</b> План-уровневые развилки (дедуп) + блокеры + жёсткий пол — решаем разом.
+        Решения пропишутся в seed каждой карточки, этапы не переспросят. Низкоуровневое агент решит сам.</p>
+
+      <div class="gate-item gate-item--fork">
+        <span class="gate-item__type">развилка</span><span class="gate-item__scope">затрагивает: S0, S1, S4</span>
+        <div class="gate-item__q">Очередь — флаг на карточке или отдельная колонка станции?</div>
+        <label class="opt"><input type="radio" name="g1" checked /><div class="opt__title">Флаг queued<span class="opt__rec">рекомендуем</span></div><div class="opt__desc">Карточка в To do с флагом. Минимум изменений состояния.</div></label>
+        <label class="opt"><input type="radio" name="g1" /><div class="opt__title">Колонка «Очередь»</div><div class="opt__desc">Отдельная станция перед To do — новая колонка во всех вью.</div></label>
+      </div>
+
+      <div class="gate-item gate-item--blocker">
+        <span class="gate-item__type">блокер</span><span class="gate-item__scope">карточка S4</span>
+        <div class="gate-item__q">Источник дизайна проекта не задан (§3.1). Завести <code>## Дизайн</code> в CLAUDE.md?</div>
+        <label class="opt"><input type="radio" name="g2" checked /><div class="opt__title">html · public/ (self-heal)<span class="opt__rec">рекомендуем</span></div></label>
+        <label class="opt"><input type="radio" name="g2" /><div class="opt__title">figma · указать ссылку</div></label>
+      </div>
+
+      <div class="lfoot">
+        <button class="btn btn--ghost" type="button" data-go="2">← Назад</button>
+        <button class="btn btn--run" type="button" id="fire">✅ Утвердить и запустить прогон →</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+
+  // — открыть/закрыть мастер —
+  const launch=$('#launch'), rail=$('#rail');
+  $('#openLaunch').onclick=()=>{launch.hidden=false;goto(1);};
+  $$('[data-lclose]').forEach(b=>b.onclick=()=>launch.hidden=true);
+  launch.addEventListener('keydown',e=>{if(e.key==='Escape')launch.hidden=true;});
+
+  // — шаги мастера —
+  function goto(n){
+    $$('.lpane').forEach(p=>p.classList.toggle('is-on',p.dataset.pane==n));
+    $$('.steps__i').forEach(s=>{
+      const k=+s.dataset.step;
+      s.classList.toggle('is-on',k==n);
+      s.classList.toggle('is-done',k<n);
+    });
+    launch.querySelector('.launch__panel').scrollTop=0;
+  }
+  $$('[data-go]').forEach(b=>b.onclick=()=>goto(+b.dataset.go));
+
+  // — выбор задач доски: чекбокс включает/исключает карточку из прогона —
+  function selCount(){return $$('#draft .stagerow[data-on="1"]').length;}
+  $('#draft').addEventListener('change',e=>{
+    if(e.target.type!=='checkbox')return;
+    e.target.closest('.stagerow').dataset.on=e.target.checked?'1':'0';
+    $('#pickCount').textContent='выбрано '+selCount();
+  });
+  // «завести карточку на доске» — прогон не создаёт задачи, уводим на доску
+  $('#toBoard').onclick=()=>launch.hidden=true;
+
+  // — синхронизация имени проекта в тексте мастера —
+  $('#lProject').onchange=e=>{
+    $$('#lProjName,#lProjName2').forEach(el=>el.textContent=e.target.value);
+  };
+
+  // — тумблеры Ask/Auto (шапка + мастер, синхронно) —
+  function wireSeg(sel){
+    $$(sel+' .seg__opt').forEach(o=>o.onclick=()=>{
+      o.parentElement.querySelectorAll('.seg__opt').forEach(x=>x.classList.remove('is-on'));
+      o.classList.add('is-on');
+      const v=o.dataset.auto;
+      // отражаем в plan-rail, если прогон запущен
+      $('#railMode').textContent='режим: '+(v==='auto'?'Auto':'Ask');
+    });
+  }
+
+  // — тумблеры Ask/Auto (шапка + мастер, синхронно) —
+  function wireSeg(sel){
+    $$(sel+' .seg__opt').forEach(o=>o.onclick=()=>{
+      o.parentElement.querySelectorAll('.seg__opt').forEach(x=>x.classList.remove('is-on'));
+      o.classList.add('is-on');
+      const v=o.dataset.auto;
+      // отражаем в plan-rail, если прогон запущен
+      $('#railMode').textContent='режим: '+(v==='auto'?'Auto':'Ask');
+    });
+  }
+  wireSeg('#autoSeg'); wireSeg('#lMode');
+
+  // — ЗАПУСК: закрыть мастер, показать plan-rail на доске —
+  $('#fire').onclick=()=>{
+    const mode=$('#lMode .seg__opt.is-on').dataset.auto;
+    $('#railMode').textContent='режим: '+(mode==='auto'?'Auto':'Ask');
+    $('#railStages').textContent=selCount();
+    launch.hidden=true;
+    rail.hidden=false;
+    rail.scrollIntoView({behavior:'smooth',block:'start'});
+  };
+</script>
+</body>
+</html>
