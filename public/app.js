@@ -65,6 +65,9 @@ function cardTags(card) {
   }
   if (Array.isArray(card.files) && card.files.length)
     t.push(`<span class="tag tag--files" title="${esc(card.files.join(", "))}">⎘ ${card.files.length}</span>`);
+  // SR: release-manifest chip — the card carries a non-empty deploy{} run-book (§6.1).
+  if (manifestHasItems(card.deploy))
+    t.push(`<span class="tag tag--rel" title="манифест релиза — открой карточку">⛁ релиз</span>`);
   const dl = card.designLink ? safeUrl(card.designLink) : null;
   if (dl) t.push(`<a class="tag" href="${esc(dl)}" target="_blank" rel="noopener" data-stop>⧉ макеты</a>`);
   const rl = card.requirementsLink ? safeUrl(card.requirementsLink) : null;
@@ -73,6 +76,43 @@ function cardTags(card) {
   if ((card.attachments || []).length) t.push(`<span class="tag">📎 ${card.attachments.length}</span>`);
   if (card.rigor === "grace") t.push(`<span class="tag">grace</span>`);
   return t.length ? `<div class="card__tags">${t.join("")}</div>` : "";
+}
+
+// ── SR: «Результат» + release manifest (§6/§6.1) ─────────────────────────────
+const MANIFEST_SECTIONS = [["migrations", "Миграции"], ["env", "env"], ["services", "Сервисы/таймеры"], ["seed", "seed/скрипты"], ["manualChecks", "Ручная проверка"]];
+function manifestHasItems(d) {
+  return !!d && typeof d === "object" && MANIFEST_SECTIONS.some(([k]) => Array.isArray(d[k]) && d[k].length);
+}
+function manifestItemText(it) {
+  if (it && typeof it === "object") return it.name ? `${it.name}${it.value != null ? "=" + it.value : ""}${it.note ? " — " + it.note : ""}` : (it.path || it.file || it.id || JSON.stringify(it));
+  return String(it);
+}
+// The result aggregate on the card (server-built). Renders git link + outcome + AUTO forks
+// + block reason, then the 5-section manifest (empty = "проверял, пусто", missing = red).
+function resultHTML(card) {
+  const r = card.result;
+  const m = r && r.releaseManifest;
+  if (!r || (!m && !r.branchLink && !r.finishNote && !r.blockReason && !(r.autoDecisions || []).length)) return "";
+  const missing = new Set(r.manifestMissing || []);
+  const rows = [];
+  const blHref = r.branchLink && safeUrl(r.branchLink);
+  if (r.branchLink) rows.push(`<div class="res__row"><span class="res__k">⎇ ветка</span><span class="res__v">${blHref ? `<a href="${esc(blHref)}" target="_blank" rel="noopener">${esc(r.branchLink)}</a>` : esc(r.branchLink)}</span></div>`);
+  if (r.finishNote) rows.push(`<div class="res__row"><span class="res__k">итог</span><span class="res__v">${esc(r.finishNote)}</span></div>`);
+  if ((r.autoDecisions || []).length) rows.push(`<div class="res__row"><span class="res__k">🤖 авто</span><span class="res__v">${r.autoDecisions.map((d) => esc(d.chosenTitle || d.q || "решение")).join(" · ")}</span></div>`);
+  if (r.blockReason) rows.push(`<div class="res__row res__row--block"><span class="res__k">⚠ причина</span><span class="res__v">${esc(r.blockReason)}</span></div>`);
+  let manifest = "";
+  if (m) {
+    manifest = `<div class="manifest">` + MANIFEST_SECTIONS.map(([k, label]) => {
+      const items = m[k] || [], miss = missing.has(k);
+      const body = miss
+        ? `<span class="manifest__miss">ключ пропущен — не заполнен (→ verify фейлит)</span>`
+        : items.length
+          ? `<ul class="manifest__items">${items.map((it) => `<li>${esc(manifestItemText(it))}</li>`).join("")}</ul>`
+          : `<span class="manifest__empty">проверял, пусто</span>`;
+      return `<div class="manifest__sec${miss ? " is-miss" : ""}"><div class="manifest__label">${esc(label)}</div>${body}</div>`;
+    }).join("") + `</div>`;
+  }
+  return `<div><div class="dt__label">Результат · манифест релиза</div><div class="result">${rows.join("")}${manifest}</div></div>`;
 }
 
 function cardHTML(card) {
@@ -242,6 +282,7 @@ function openDetail(id) {
     ${linksHTML(card)}
     ${attViewHTML(card)}
     ${card.column === "blocked" && card.blockReason ? `<div class="card__blocked">⚠ ${esc(card.blockReason)}</div>` : ""}
+    ${resultHTML(card)}
     ${note}
     <div class="sheet__actions">
       <button class="btn btn--danger" type="button" data-del-detail>Отменить задачу</button>
