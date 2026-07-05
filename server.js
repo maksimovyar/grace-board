@@ -60,6 +60,11 @@ const BIN_PATH_HINT = process.env.GRACE_BIN_PATH || [
 // We run on a Claude subscription: no per-$ billing, so no budget cap. Models are
 // pinned per-agent in the gfd-* files; the orchestrator uses the session default.
 const RIGORS = ["grace", "off"];          // GRACE semantic markup on/off
+const AUTONOMIES = ["ask", "auto"];       // Plan Run §5.3: ask = human picks forks · auto = agent picks, hard-floor still stops
+// Global autonomy default (board.autonomy), overridable per card (card.autonomy). Cached in a
+// module var so the prompt builders resolve effAutonomy() without threading `board` everywhere;
+// readBoard() refreshes it from disk on every read, PATCH /api/settings persists it.
+let GLOBAL_AUTONOMY = "ask";
 
 // ── run supervision: a launched run is watched, not fire-and-forget (issue #1) ─
 // A run that dies WITHOUT reaching `ready`, or stalls in one phase past this
@@ -104,6 +109,7 @@ function readBoard() {
   try {
     const b = JSON.parse(fs.readFileSync(BOARD_FILE, "utf8"));
     for (const c of b.cards || []) if (c.column) c.column = normalizeColumn(c.column);
+    if (AUTONOMIES.includes(b.autonomy)) GLOBAL_AUTONOMY = b.autonomy; // refresh the cached global default
     return b;
   } catch { return { updatedAt: null, cards: [] }; }
 }
@@ -343,6 +349,28 @@ function filesConflict(board, card) {
 const MANIFEST_SECTIONS = ["migrations", "env", "services", "seed", "manualChecks"];
 const hasDeploy = (deploy) => !!deploy && typeof deploy === "object" && MANIFEST_SECTIONS.some((s) => s in deploy);
 
+// Flatten one manifest item to a searchable string (for the mechanical floor / display).
+function itemStr(item) {
+  if (item && typeof item === "object") return [item.name, item.value, item.note, item.path, item.file, item.id, item.text, item.desc].filter(Boolean).join(" ");
+  return String(item);
+}
+// S3 · MECHANICAL FLOOR (roadmap §5.3, source 1 — deterministic, no agent). Reads ONLY the
+// deploy{} manifest a card already writes (SR) and flags objectively-visible irreversible
+// classes that ALWAYS stop for a human, even under autonomy=auto: destructive migration,
+// data deletion in a seed/backfill, a new secret env var. AUTO never merges main (git-floor),
+// so a flagged card's items just surface for human sign-off on the final PR — they don't auto-clear.
+const FLOOR_DESTRUCTIVE_RE = /\b(DROP\s+(TABLE|COLUMN|DATABASE|SCHEMA|INDEX|CONSTRAINT)|TRUNCATE|DELETE\s+FROM|ALTER\s+TABLE\b[\s\S]*\bDROP\b)/i;
+const FLOOR_SECRET_RE = /(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE)\b/i;
+function mechanicalFloor(deploy) {
+  if (!hasDeploy(deploy)) return [];
+  const { manifest } = normalizeManifest(deploy);
+  const flags = [];
+  for (const m of manifest.migrations) { const s = itemStr(m); if (FLOOR_DESTRUCTIVE_RE.test(s)) flags.push({ class: "destructive-migration", detail: s }); }
+  for (const sd of manifest.seed) { const s = itemStr(sd); if (FLOOR_DESTRUCTIVE_RE.test(s)) flags.push({ class: "data-deletion", detail: s }); }
+  for (const e of manifest.env) { const name = manifestItemKey("env", e); if (FLOOR_SECRET_RE.test(name)) flags.push({ class: "new-secret", detail: name }); }
+  return flags;
+}
+
 // Coerce a raw deploy{} block into exactly the 5 array sections, and report which keys
 // were absent (missing ≠ empty: [] means "checked, nothing to do"; absent means "forgot").
 function normalizeManifest(deploy) {
@@ -368,6 +396,7 @@ function buildResult(card) {
     autoDecisions: auto,
     releaseManifest: present ? manifest : null,
     manifestMissing: present ? missing : [],
+    floor: present ? mechanicalFloor(card.deploy) : [],   // S3: hard-floor flags (human sign-off), §5.3
   };
 }
 
@@ -429,11 +458,13 @@ function planReleaseManifest(board, planId) {
     .filter((c) => c.planId === planId)
     .sort((a, b) => readyAt(a) - readyAt(b));
   const { manifest, warnings } = accumulateReleaseManifest(cards);
+  const floor = cards.flatMap((c) => mechanicalFloor(c.deploy).map((f) => ({ ...f, stage: c.id })));
   return {
     planId,
     stageCount: cards.length,
     releaseManifest: manifest,
     warnings,
+    floor, // S3 §5.3: mechanical hard-floor flags across the plan → human sign-off on the final PR
     stages: cards.map((c) => ({ id: c.id, theme: c.theme, column: c.column, manifestMissing: buildResult(c).manifestMissing })),
   };
 }
@@ -487,6 +518,27 @@ function recordLaunch(card, launch, kind) {
   }
 }
 
+// region FUNC_autonomy — effective autonomy + the AUTO escalation-threshold override (§5.3)
+// ## @purpose Resolve a card's effective autonomy (own override → global default) and, when
+// ##   it's `auto`, emit the prompt block that FLIPS the ask-gate escalation threshold: don't
+// ##   escalate reversible forks — pick the strongest option, justify it, continue. The HARD
+// ##   FLOOR (irreversibility, cost, legal, provider, contract-shaping data model) still stops
+// ##   for a human even in AUTO; such a fork is tagged floor:true and left for the human.
+// ## @invariants ask (default) = byte-identical to today's behaviour — the block is empty.
+const effAutonomy = (card) => (card && AUTONOMIES.includes(card.autonomy)) ? card.autonomy : GLOBAL_AUTONOMY;
+function autonomyBlock(card) {
+  if (effAutonomy(card) !== "auto") return "";
+  return [
+    `РЕЖИМ AUTO (autonomy=auto) — НЕ эскалируй ОБРАТИМЫЕ решения человеку: по каждой развилке ВЫБЕРИ`,
+    `сильнейший вариант, зафиксируй краткое обоснование в "ownText" и ПРОДОЛЖАЙ без остановки.`,
+    `ЖЁСТКИЙ ПОЛ (стоп к человеку ДАЖЕ в AUTO — не выбирай сам): необратимость (деструктивная миграция,`,
+    `удаление данных), стоимость, юридика/резидентность/выбор провайдера, форма модели данных, влияющая`,
+    `на контракт. Развилку из пола помечай "floor":true в её объекте archQuestions и оставляй человеку.`,
+    `Мержить в main САМ НЕ имеешь права (git-пол) — доводи до "ready" в ветку, финальный PR утверждает человек.`,
+  ].join("\n");
+}
+// endregion FUNC_autonomy
+
 // region FUNC_spawnRun — detached headless Claude run (dir-scoped, logged)
 function spawnRun(projectDir, runDir, prompt, logName) {
   if (!AUTORUN) return { launched: false, reason: "GRACE_AUTORUN=0" };
@@ -507,10 +559,12 @@ function spawnRun(projectDir, runDir, prompt, logName) {
 function launchAskFunctional(card, projectDir, runDir) {
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
+  const auto = autonomyBlock(card);
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
     dirs ? `${dirs}\n` : ``,
+    auto ? `${auto}\n` : ``,
     `AUTONOMOUS HEADLESS — ЭТАП ASKING, БЛОК 1 (ФУНКЦИОНАЛ). Сделай discovery + краткую разведку, затем ОСТАНОВИСЬ.`,
     `ПОРОГ ЭСКАЛАЦИИ — спрашивать человека МОЖНО ТОЛЬКО если решение: (а) меняет ПОВЕДЕНИЕ продукта или объём`,
     `(что система делает/не делает для пользователя), ЛИБО (б) это настоящая развилка с внешними последствиями`,
@@ -540,11 +594,13 @@ function launchAskArchitecture(card, projectDir, runDir, funcQA, rigor) {
   const qa = (funcQA || []).map((p) => `Q: ${p.q}\nA: ${p.a || "(нет ответа)"}`).join("\n");
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
+  const auto = autonomyBlock(card);
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
     `Ответы по функционалу (блок 1):\n${qa}\n`,
     dirs ? `${dirs}\n` : ``,
+    auto ? `${auto}\n` : ``,
     `AUTONOMOUS HEADLESS — ЭТАП ASKING, БЛОК 2 (АРХИТЕКТУРА). На основе функциональных ответов реши, нужны ли`,
     `АРХИТЕКТУРНЫЕ развилки. ТОЛЬКО классифицируй и выйди — НЕ пиши код и НЕ строй build здесь (его запустит диспетчер).`,
     `ПОРОГ ЭСКАЛАЦИИ — развилка идёт человеку ТОЛЬКО если это настоящий выбор с внешними последствиями (стоимость,`,
@@ -573,12 +629,14 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
   const rigorLine = `Rigor: ${rigor || "off"}. Apply markup per grace-feature-dev SKILL §3 — grace = full semantic exoskeleton (MODULE/FUNCTION_CONTRACT) + LDD [IMP:N] logs; off = the repo's own idiom, no GRACE markers.`;
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
+  const auto = autonomyBlock(card);
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
     fq ? `Ответы по функционалу:\n${fq}\n` : ``,
     ad ? `Принятые архитектурные решения (человек выбрал — СОБЛЮДАЙ их):\n${ad}\n` : ``,
     dirs ? `${dirs}\n` : ``,
+    auto ? `${auto}\n` : ``,
     rigorLine,
     recovery ? `${recovery}\n` : ``,
     `AUTONOMOUS HEADLESS BUILD. Resume from board.json. Запусти полный процесс: architecture (СОБЛЮДАЯ выбранные`,
@@ -803,6 +861,40 @@ function syncFromPipeline() {
         card.history.push({ column: "asking", ts: card.lastColumnChangeAt, via: "auto-architecture" });
         try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "auto-architecture", cardId: card.id, launch }) + "\n"); } catch {}
         changed = true;
+      } else if (Array.isArray(pip.archQuestions) && pip.archQuestions.length
+                 && !(Array.isArray(pip.archDecisions) && pip.archDecisions.length)
+                 && effAutonomy(card) === "auto" && !card.autoResolved) {
+        // AUTO (§5.3): the arch run proposed REAL forks but there's no human in AUTO. Auto-pick the
+        // recommended option per fork — UNLESS a fork is hard-floor (floor:true from the narrow
+        // classifier folded into the arch run), which ALWAYS waits for a human even in AUTO. Any
+        // floor fork present → hold the whole gate for the human (card stays in `asking`).
+        card.autoResolved = true; // idempotent — evaluate the AUTO gate once per card
+        const forks = pip.archQuestions;
+        const floorForks = forks.filter((f) => f && (f.floor === true || (Array.isArray(f.options) && f.options.some((o) => o && o.floor))));
+        if (floorForks.length) {
+          card.autoFloorHeld = floorForks.map((f) => f.q || f.id);
+          card.lastColumnChangeAt = new Date().toISOString();
+          try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "auto-floor-hold", cardId: card.id, forks: card.autoFloorHeld }) + "\n"); } catch {}
+          changed = true;
+        } else {
+          const decisions = forks.map((d) => {
+            const opt = (Array.isArray(d.options) ? d.options : []).find((o) => o && o.recommended) || (d.options || [])[0] || {};
+            return { id: d.id, q: d.q, choice: opt.id || "auto", chosenTitle: opt.title || "авто-выбор", ownText: "AUTO: выбран рекомендованный вариант (обратимо, порог §5.3)" };
+          });
+          try { pip.archDecisions = decisions; pip.askStage = "done"; pip.column = "implementing"; fs.writeFileSync(pipFile, JSON.stringify(pip, null, 2)); } catch {}
+          const launch = launchBuild(card, projectDir, runDir, pip.answers || card.answers || [], decisions, rigor);
+          recordLaunch(card, launch, "build");
+          card.archDecisions = decisions;
+          card.result = buildResult(card); // reflect the AUTO forks in «Результат» immediately (🤖 N)
+          card.buildLaunched = true;
+          card.column = "implementing";
+          card.askStage = "done";
+          card.blockReason = null;
+          card.lastColumnChangeAt = new Date().toISOString();
+          card.history.push({ column: "implementing", ts: card.lastColumnChangeAt, via: "auto-resolve" });
+          try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "auto-resolve", cardId: card.id, autoDecisions: decisions.length, launch }) + "\n"); } catch {}
+          changed = true;
+        }
       }
     }
 
@@ -916,6 +1008,15 @@ async function handleApi(req, res, urlPath) {
     return sendJSON(res, 200, readBoard());
   }
 
+  // PATCH /api/settings -> board-wide defaults. Today: the global autonomy (§5.3 header toggle).
+  if (req.method === "PATCH" && urlPath === "/api/settings") {
+    const b = await readBody(req);
+    const board = readBoard();
+    if (AUTONOMIES.includes(b.autonomy)) { board.autonomy = b.autonomy; GLOBAL_AUTONOMY = b.autonomy; }
+    writeBoard(board);
+    return sendJSON(res, 200, { autonomy: board.autonomy || GLOBAL_AUTONOMY });
+  }
+
   // GET /api/plans/:planId/manifest -> plan.result.releaseManifest (§6.1): accumulated,
   // per-section, DAG-ordered over the plan's stage cards. Read-only; feeds the plan-rail (S4).
   const mpm = urlPath.match(/^\/api\/plans\/([^/]+)\/manifest$/);
@@ -951,6 +1052,7 @@ async function handleApi(req, res, urlPath) {
       planId: (typeof b.planId === "string" && b.planId.trim()) ? b.planId.trim() : null,
       dependsOn: Array.isArray(b.dependsOn) ? b.dependsOn.filter((x) => typeof x === "string") : [],
       files: Array.isArray(b.files) ? b.files.filter((x) => typeof x === "string") : [],
+      autonomy: AUTONOMIES.includes(b.autonomy) ? b.autonomy : null,   // S3: null = inherit the global default (§5.3)
       column: "backlog",
       createdAt: new Date().toISOString(),
       dispatchedAt: null,
@@ -1163,6 +1265,7 @@ async function handleApi(req, res, urlPath) {
     if (b.designLink !== undefined) card.designLink = String(b.designLink).trim() || null;
     if (b.requirementsLink !== undefined) card.requirementsLink = String(b.requirementsLink).trim() || null;
     if (b.rigor !== undefined && RIGORS.includes(b.rigor)) card.rigor = b.rigor;
+    if (b.autonomy !== undefined) card.autonomy = AUTONOMIES.includes(b.autonomy) ? b.autonomy : null; // null = inherit global (§5.3)
     writeBoard(board);
     return sendJSON(res, 200, { card });
   }
