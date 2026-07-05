@@ -646,24 +646,41 @@ function togglePick(id) {
 }
 function toggleDep(cid, did) { const p = wizPicks[pickIndex(cid)]; if (!p) return; p.deps.has(did) ? p.deps.delete(did) : p.deps.add(did); renderDraft(); }
 function updatePickCount() { document.getElementById("pickCount").textContent = "выбрано " + wizPicks.length; }
-function renderGate() {
+let wizPreflight = { blockers: [], floor: [], forks: [] };
+async function renderGate() {
   const g = document.getElementById("gate"), project = document.getElementById("lProject").value, n = wizPicks.length;
   if (!n) { g.innerHTML = `<div class="gate-empty">Не выбрано ни одной карточки — вернись на шаг 2.</div>`; return; }
+  g.innerHTML = `<div class="gate-empty">Свожу развилки/блокеры/пол…</div>`;
+  try { wizPreflight = await api("/api/plans/preflight", { method: "POST", body: JSON.stringify({ project, cardIds: wizPicks.map((p) => p.cardId) }) }); }
+  catch { wizPreflight = { blockers: [], floor: [], forks: [] }; }
+  const composeItem = `<div class="gate-item"><span class="gate-item__type">состав</span><div class="gate-item__q">${esc(project)} · ${n} этап(ов) · режим ${wizMode === "auto" ? "Auto" : "Ask"} · ветка autodev/plan-…</div></div>`;
+  // blockers/forks — the human picks once here; the choice rides every stage seed (§2 Фаза 1)
+  const gateItems = [...(wizPreflight.blockers || []), ...(wizPreflight.forks || [])].map((it) => {
+    const opts = (it.options || []).map((o) => `<label class="opt"><input type="radio" name="gate-${esc(it.id)}" value="${esc(o.id)}" data-gate="${esc(it.id)}" data-q="${esc(it.q)}" data-title="${esc(o.title)}" ${o.recommended ? "checked" : ""}/><div class="opt__title">${esc(o.title)}${o.recommended ? `<span class="opt__rec">рекомендуем</span>` : ""}</div></label>`).join("");
+    const kind = it.type === "blocker" ? "gate-item--blocker" : "gate-item--fork";
+    return `<div class="gate-item ${kind}"><span class="gate-item__type">${it.type === "blocker" ? "блокер" : "развилка"}</span><div class="gate-item__q">${esc(it.q)}</div>${opts}</div>`;
+  }).join("");
+  const floor = (wizPreflight.floor || []).length
+    ? `<div class="gate-item gate-item--floor"><span class="gate-item__type">пол</span><div class="gate-item__q">Жёсткий пол (§5.3) — нужна подпись человека:</div>${wizPreflight.floor.map((f) => `<div class="lnote" style="color:#a8362e">• ${esc(f.class)}: ${esc(f.detail)}</div>`).join("")}</div>`
+    : "";
   const rows = wizPicks.map((p, i) => {
     const c = cardById(p.cardId), deps = [...p.deps].map((d) => `S${pickIndex(d) + 1}`).join(", ") || "—";
     return `<div class="stagerow" data-on="1"><span class="stagerow__id">S${i + 1}</span><span class="stagerow__t">${esc(c ? c.theme : "")}</span><span class="stagerow__col" style="color:var(--ink-faint)">deps: ${esc(deps)}</span></div>`;
   }).join("");
-  g.innerHTML = `<div class="gate-item"><span class="gate-item__type">состав</span><div class="gate-item__q">${esc(project)} · ${n} этап(ов) · режим ${wizMode === "auto" ? "Auto" : "Ask"} · ветка autodev/plan-…</div></div>`
-    + `<div class="plandraft">${rows}</div>`
-    + `<p class="lnote" style="margin-top:8px;color:var(--ink-faint)">План-уровневые развилки/блокеры/пол сводятся здесь (S5). Сейчас — запуск состава по DAG (WIP=1).</p>`;
+  g.innerHTML = composeItem + gateItems + floor + `<div class="plandraft">${rows}</div>`
+    + `<p class="lnote" style="margin-top:8px;color:var(--ink-faint)">Решения выше принимаются РАЗ на уровне прогона и прописываются в seed каждой карточки — этапы их НЕ переспрашивают.</p>`;
+}
+function collectGateDecisions() {
+  return [...document.querySelectorAll('#gate input[type="radio"][data-gate]:checked')].map((el) => ({ id: el.dataset.gate, q: el.dataset.q, choice: el.value, chosenTitle: el.dataset.title }));
 }
 async function fireLaunch(btn) {
   const project = document.getElementById("lProject").value;
   if (!project || !wizPicks.length) { toast("Выбери проект и хотя бы одну карточку"); return; }
   const stages = wizPicks.map((p) => ({ cardId: p.cardId, dependsOn: [...p.deps] }));
+  const decisions = collectGateDecisions();
   btn.disabled = true; btn.textContent = "Запускаю…";
   try {
-    const { plan } = await api("/api/plans", { method: "POST", body: JSON.stringify({ project, goal: document.getElementById("lGoal").value.trim(), mode: wizMode, stages }) });
+    const { plan } = await api("/api/plans", { method: "POST", body: JSON.stringify({ project, goal: document.getElementById("lGoal").value.trim(), mode: wizMode, stages, decisions }) });
     launchEl.hidden = true;
     toast(`⚡ Прогон запущен · <strong>${esc(plan.integrationBranch)}</strong>`);
     loadBoard();

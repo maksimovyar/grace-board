@@ -496,6 +496,31 @@ function planStatus(board, plan) {
 }
 // Read projection for the rail: derived status + accumulated release manifest (§6.1).
 const planView = (board, plan) => ({ ...plan, status: planStatus(board, plan), result: { releaseManifest: planReleaseManifest(board, plan.id) } });
+
+// S5 · SUMMARY GATE preflight (roadmap §2 Фаза 1). Surfaces PLAN-LEVEL items the human
+// resolves ONCE before launch — deduped across stages — so individual stages don't re-ask:
+//   • blockers: objectively detectable pre-run gaps (today: the project's design source, §3.1);
+//   • floor: the mechanical hard-floor over any manifests already present (§5.3);
+//   • forks: plan-level architecture forks are surfaced by the stages' arch runs at runtime
+//     (LLM), not fabricated here — pre-run this is []. The human's answers ride each stage seed.
+function preflightPlan(board, project, cardIds) {
+  const blockers = [];
+  // §3.1 — the project must declare its design source; if CLAUDE.md doesn't, block once.
+  let hasDesign = false;
+  try { hasDesign = /(^|\n)\s*##\s+(Дизайн|Design)/i.test(fs.readFileSync(path.join(resolveProjectDir(project), "CLAUDE.md"), "utf8")); } catch {}
+  if (!hasDesign) blockers.push({
+    id: "design-source", type: "blocker",
+    q: "Источник дизайна проекта не задан (§3.1). Как объявить?",
+    options: [
+      { id: "html", title: "html · public/ (self-heal)", recommended: true },
+      { id: "figma", title: "figma · указать ссылку" },
+      { id: "none", title: "none · дизайн не нужен" },
+    ],
+  });
+  const cards = (cardIds || []).map((id) => board.cards.find((c) => c.id === id)).filter(Boolean);
+  const floor = cards.flatMap((c) => mechanicalFloor(c.deploy).map((f) => ({ ...f, stage: c.id })));
+  return { blockers, floor, forks: [] };
+}
 // endregion FUNC_plans
 
 // ── dispatch: write a grace-feature-dev-compatible seed into the project ─────
@@ -568,6 +593,17 @@ function autonomyBlock(card) {
     `Мержить в main САМ НЕ имеешь права (git-пол) — доводи до "ready" в ветку, финальный PR утверждает человек.`,
   ].join("\n");
 }
+// S5: plan-level decisions taken ONCE at the summary gate ride every stage seed so a stage
+// never re-asks what the plan already settled (roadmap §2 Фаза 1). Empty for single cards.
+function planDecisionsBlock(card) {
+  const d = Array.isArray(card.planDecisions) ? card.planDecisions.filter((x) => x && x.q) : [];
+  if (!d.length) return "";
+  return [
+    `ПЛАН-УРОВНЕВЫЕ РЕШЕНИЯ (приняты человеком на сводном гейте прогона — СОБЛЮДАЙ, НЕ переспрашивай):`,
+    ...d.map((x) => `• ${x.q} → ${x.chosenTitle || x.a || x.choice || "(решено)"}${x.ownText ? " — " + x.ownText : ""}`),
+    `Эти решения уже сделаны на уровне прогона: не выноси их снова в questions/archQuestions.`,
+  ].join("\n");
+}
 // endregion FUNC_autonomy
 
 // region FUNC_spawnRun — detached headless Claude run (dir-scoped, logged)
@@ -591,11 +627,13 @@ function launchAskFunctional(card, projectDir, runDir) {
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
   const auto = autonomyBlock(card);
+  const planDec = planDecisionsBlock(card);
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
     dirs ? `${dirs}\n` : ``,
     auto ? `${auto}\n` : ``,
+    planDec ? `${planDec}\n` : ``,
     `AUTONOMOUS HEADLESS — ЭТАП ASKING, БЛОК 1 (ФУНКЦИОНАЛ). Сделай discovery + краткую разведку, затем ОСТАНОВИСЬ.`,
     `ПОРОГ ЭСКАЛАЦИИ — спрашивать человека МОЖНО ТОЛЬКО если решение: (а) меняет ПОВЕДЕНИЕ продукта или объём`,
     `(что система делает/не делает для пользователя), ЛИБО (б) это настоящая развилка с внешними последствиями`,
@@ -626,12 +664,14 @@ function launchAskArchitecture(card, projectDir, runDir, funcQA, rigor) {
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
   const auto = autonomyBlock(card);
+  const planDec = planDecisionsBlock(card);
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
     `Ответы по функционалу (блок 1):\n${qa}\n`,
     dirs ? `${dirs}\n` : ``,
     auto ? `${auto}\n` : ``,
+    planDec ? `${planDec}\n` : ``,
     `AUTONOMOUS HEADLESS — ЭТАП ASKING, БЛОК 2 (АРХИТЕКТУРА). На основе функциональных ответов реши, нужны ли`,
     `АРХИТЕКТУРНЫЕ развилки. ТОЛЬКО классифицируй и выйди — НЕ пиши код и НЕ строй build здесь (его запустит диспетчер).`,
     `ПОРОГ ЭСКАЛАЦИИ — развилка идёт человеку ТОЛЬКО если это настоящий выбор с внешними последствиями (стоимость,`,
@@ -661,6 +701,7 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
   const auto = autonomyBlock(card);
+  const planDec = planDecisionsBlock(card);
   // S4: a plan stage commits to the plan's SHARED integration branch (base = its tip → sees
   // predecessors' commits, §4); a single card keeps its own autodev/<slug>. branchFor() is the
   // single source of the branch name across green-checkpoints, the final push, and resume.
@@ -675,6 +716,7 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
     ad ? `Принятые архитектурные решения (человек выбрал — СОБЛЮДАЙ их):\n${ad}\n` : ``,
     dirs ? `${dirs}\n` : ``,
     auto ? `${auto}\n` : ``,
+    planDec ? `${planDec}\n` : ``,
     rigorLine,
     recovery ? `${recovery}\n` : ``,
     `AUTONOMOUS HEADLESS BUILD. Resume from board.json. Запусти полный процесс: architecture (СОБЛЮДАЯ выбранные`,
@@ -1075,6 +1117,15 @@ async function handleApi(req, res, urlPath) {
     return plan ? sendJSON(res, 200, { plan: planView(board, plan) }) : sendJSON(res, 404, { error: "plan not found" });
   }
 
+  // POST /api/plans/preflight -> S5 summary-gate items for a candidate plan (blockers/floor/forks)
+  if (req.method === "POST" && urlPath === "/api/plans/preflight") {
+    const b = await readBody(req);
+    const project = String(b.project || "").trim();
+    if (!project || !isInsideRoot(resolveProjectDir(project))) return sendJSON(res, 400, { error: "valid project required" });
+    const cardIds = Array.isArray(b.cardIds) ? b.cardIds.filter((x) => typeof x === "string") : [];
+    return sendJSON(res, 200, preflightPlan(readBoard(), project, cardIds));
+  }
+
   // POST /api/plans -> ASSEMBLE a run from existing board cards (v2). Body:
   //   { project, goal?, mode:"ask"|"auto", stages:[ { cardId, dependsOn:[cardId,...] } ] }
   // Wires planId + integration branch + dependsOn onto the chosen cards and enqueues them.
@@ -1099,10 +1150,15 @@ async function handleApi(req, res, urlPath) {
     const integrationBranch = `autodev/plan-${id}`;
     const mode = AUTONOMIES.includes(b.mode) ? b.mode : "ask";
     const idset = new Set(ids);
+    // S5: plan-level decisions from the summary gate (deduped, human-made once) — sanitized,
+    // then stamped onto every stage so no stage re-asks them (planDecisionsBlock).
+    const decisions = (Array.isArray(b.decisions) ? b.decisions : [])
+      .filter((d) => d && d.q)
+      .map((d) => ({ id: String(d.id || ""), q: String(d.q), choice: String(d.choice || ""), chosenTitle: String(d.chosenTitle || d.a || ""), ownText: d.ownText ? String(d.ownText) : null }));
     const plan = {
       id, project, goal: String(b.goal || "").trim().slice(0, MAX_DESC) || null,
       integrationBranch, mode, cardIds: ids, status: "running",
-      createdAt: new Date().toISOString(), result: null,
+      decisions, createdAt: new Date().toISOString(), result: null,
     };
     board.plans.push(plan);
     // Wire every stage, then enqueue it exactly like the launch lever (§5.1): dispatch if the
@@ -1112,6 +1168,7 @@ async function handleApi(req, res, urlPath) {
       card.planId = id;
       card.integrationBranch = integrationBranch;
       card.autonomy = mode;
+      card.planDecisions = decisions; // S5: plan-level gate answers ride the stage seed
       card.dependsOn = Array.isArray(s.dependsOn) ? s.dependsOn.filter((x) => idset.has(x) && x !== s.cardId) : [];
       card.column = "todo";
       if (canDispatchNow(board, card)) {
