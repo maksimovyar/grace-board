@@ -621,8 +621,10 @@ function renderDraft() {
   if (!cards.length) { draft.innerHTML = `<div class="gate-empty">Нет незавершённых карточек в Backlog/To do этого проекта. Заведи их на доске.</div>`; updatePickCount(); return; }
   draft.innerHTML = cards.map((c) => {
     const idx = pickIndex(c.id), on = idx >= 0;
-    const others = wizPicks.filter((p) => p.cardId !== c.id);
-    const deps = (on && others.length) ? `<div class="stagedeps"><span class="stagedeps__lk">зависит:</span>${others.map((p) => {
+    // deps may only point at EARLIER-picked stages — this makes the DAG acyclic by construction
+    // (the server rejects cycles too, but a backward-only UI can't build one). §5.2
+    const earlier = on ? wizPicks.slice(0, idx) : [];
+    const deps = (on && earlier.length) ? `<div class="stagedeps"><span class="stagedeps__lk">зависит:</span>${earlier.map((p) => {
       const dn = `S${pickIndex(p.cardId) + 1}`, active = wizPicks[idx].deps.has(p.cardId), oc = cardById(p.cardId);
       return `<button type="button" class="depchip${active ? " is-on" : ""}" data-dep="${esc(c.id)}|${esc(p.cardId)}" title="${esc(oc ? oc.theme : "")}">${dn}</button>`;
     }).join("")}</div>` : "";
