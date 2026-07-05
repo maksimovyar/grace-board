@@ -313,6 +313,132 @@ function filesConflict(board, card) {
 }
 // endregion FUNC_dagGates
 
+// region FUNC_releaseManifest — «Результат» aggregate + 5-section release manifest (roadmap §6/§6.1)
+// ## @purpose Turn what a card ALREADY reports (branchLink, finishNote, blockReason,
+// ##   archDecisions, the deploy{} block the build writes at `ready`) into two derived
+// ##   artifacts: (a) card.result — the single "Результат" aggregate + git link, and
+// ##   (b) a 5-section RELEASE MANIFEST {migrations,env,services,seed,manualChecks}.
+// ##   A single card (planId:null) → its own manifest = task.result.releaseManifest,
+// ##   attached to its PR. A plan (planId set) → per-section accumulation of its stages'
+// ##   manifests (planReleaseManifest), attached to the final integration-branch PR.
+// ## @io (card | board,planId) -> result aggregate | plan-level accumulated manifest
+// ## @invariants
+// ## - ALL 5 keys are always present in a normalized manifest: [] = "checked, empty",
+// ##   a MISSING key = "forgot" → surfaced as manifestMissing (never silently defaulted away),
+// ##   so "correctly empty" is distinguishable from "omitted" (§6.1).
+// ## - Additive/forward-only: absent deploy{} → result carries no manifest, single-card
+// ##   path unchanged. No Plan entity is required here (it lands in S4) — accumulation is
+// ##   keyed by the planId field the card already carries since S0.
+// ## - Per-section merge (§6.1): env by variable NAME (value clash → warn); migrations/seed
+// ##   by path/id, EXACT-dup collapse only, DAG order preserved (order stages reached ready);
+// ##   services/manualChecks by identity, first-seen. NEVER content-dedup or re-sort migrations.
+// ## @modulemap
+// ## FUNC 3[calc] => normalizeManifest          — coerce deploy{} to 5 arrays + list missing keys
+// ## FUNC 4[calc] => buildResult                 — assemble card.result aggregate (git+forks+outcome+manifest)
+// ## FUNC 6[calc] => accumulateReleaseManifest   — per-section merge across ordered stages
+// ## FUNC 3[calc] => planReleaseManifest         — group a plan's cards (by planId), order, accumulate
+// GREP_SUMMARY: releaseManifest, deploy, result, manifest accumulation, migrations env services seed manualChecks, Plan Run §6.1
+// STRUCTURE: ▶ normalizeManifest → ⊕ buildResult(card) → ⚡ accumulateReleaseManifest(stages) → ⎋ planReleaseManifest(planId)
+
+const MANIFEST_SECTIONS = ["migrations", "env", "services", "seed", "manualChecks"];
+const hasDeploy = (deploy) => !!deploy && typeof deploy === "object" && MANIFEST_SECTIONS.some((s) => s in deploy);
+
+// Coerce a raw deploy{} block into exactly the 5 array sections, and report which keys
+// were absent (missing ≠ empty: [] means "checked, nothing to do"; absent means "forgot").
+function normalizeManifest(deploy) {
+  const manifest = {}, missing = [];
+  const src = deploy && typeof deploy === "object" ? deploy : {};
+  for (const s of MANIFEST_SECTIONS) {
+    if (Array.isArray(src[s])) manifest[s] = src[s];
+    else { manifest[s] = []; if (!(s in src)) missing.push(s); }
+  }
+  return { manifest, missing };
+}
+
+// The "Результат" aggregate (§6): git link + AUTO-taken forks + outcome + block reason +
+// this unit's own release manifest. Pure over fields the card already holds — no new data.
+function buildResult(card) {
+  const auto = (Array.isArray(card.archDecisions) ? card.archDecisions : []).filter((d) => d && d.ownText);
+  const { manifest, missing } = normalizeManifest(card.deploy);
+  const present = hasDeploy(card.deploy);
+  return {
+    branchLink: card.branchLink || null,
+    finishNote: card.finishNote || null,
+    blockReason: card.column === "blocked" ? (card.blockReason || null) : null,
+    autoDecisions: auto,
+    releaseManifest: present ? manifest : null,
+    manifestMissing: present ? missing : [],
+  };
+}
+
+// The § merge key for one manifest item (strings or {name/path/id} objects both tolerated).
+function manifestItemKey(section, item) {
+  if (item && typeof item === "object")
+    return section === "env"
+      ? String(item.name || item.key || JSON.stringify(item))
+      : String(item.path || item.file || item.id || item.name || JSON.stringify(item));
+  const s = String(item);
+  return section === "env" ? s.split("=")[0].trim() : s;
+}
+function envValue(item) {
+  if (item && typeof item === "object") return item.value != null ? String(item.value) : null;
+  const s = String(item), i = s.indexOf("=");
+  return i === -1 ? null : s.slice(i + 1).trim();
+}
+
+// Per-section accumulation across an ORDERED list of stage cards (§6.1). Order is the
+// caller's contract (= order stages reached `ready`) so migrations/seed stay topological.
+// Returns { manifest{5 keys}, warnings[] } — first-seen wins, only exact/same-name collapse.
+function accumulateReleaseManifest(orderedCards) {
+  const acc = {}, seen = {};
+  for (const s of MANIFEST_SECTIONS) { acc[s] = []; seen[s] = new Map(); }
+  const warnings = [];
+  for (const card of orderedCards) {
+    if (!hasDeploy(card.deploy)) continue;
+    const { manifest } = normalizeManifest(card.deploy);
+    for (const section of MANIFEST_SECTIONS) {
+      for (const item of manifest[section]) {
+        const key = manifestItemKey(section, item);
+        if (seen[section].has(key)) {
+          if (section === "env") {
+            const pv = envValue(seen[section].get(key)), nv = envValue(item);
+            if (pv != null && nv != null && pv !== nv)
+              warnings.push(`env ${key}: «${pv}» (ранее) ≠ «${nv}» (этап ${card.id})`);
+          }
+          continue; // same-name / exact-dup collapse; DAG order preserved by push-once
+        }
+        seen[section].set(key, item);
+        acc[section].push(item);
+      }
+    }
+  }
+  return { manifest: acc, warnings };
+}
+
+// The ts a card reached `ready` — for topological ordering of a plan's manifests. Falls
+// back to lastColumnChangeAt, then creation, so the ordering is always total & stable.
+function readyAt(card) {
+  const h = (card.history || []).find((e) => e.column === TERMINAL);
+  return Date.parse((h && h.ts) || card.lastColumnChangeAt || card.createdAt || "") || 0;
+}
+// plan.result.releaseManifest (§6.1): accumulate a plan's cards (by planId), ordered by
+// when they reached `ready`. Computed on demand from cards the plan already owns — no Plan
+// entity needed until S4, which will render the plan-rail on top of this shape.
+function planReleaseManifest(board, planId) {
+  const cards = board.cards
+    .filter((c) => c.planId === planId)
+    .sort((a, b) => readyAt(a) - readyAt(b));
+  const { manifest, warnings } = accumulateReleaseManifest(cards);
+  return {
+    planId,
+    stageCount: cards.length,
+    releaseManifest: manifest,
+    warnings,
+    stages: cards.map((c) => ({ id: c.id, theme: c.theme, column: c.column, manifestMissing: buildResult(c).manifestMissing })),
+  };
+}
+// endregion FUNC_releaseManifest
+
 // ── dispatch: write a grace-feature-dev-compatible seed into the project ─────
 function dispatch(card) {
   const projectDir = resolveProjectDir(card.project);
@@ -486,6 +612,14 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
     `НИКОГДА не "db push"/ручной DDL на прод-пути. Миграция forward-only и backward-compatible (аддитивная;`,
     `без деструктивных DROP без two-step). Запиши путь файла в top-level "migration" и в "finishNote".`,
     `Только db push без файла миграции = НЕ done.`,
+    `МАНИФЕСТ РЕЛИЗА (§6.1, ОБЯЗАТЕЛЬНО перед "ready"): запиши top-level "deploy" — объект РОВНО с 5`,
+    `ключами-массивами {"migrations":[],"env":[],"services":[],"seed":[],"manualChecks":[]}. Это ран-бук`,
+    `раскатки ЭТОЙ единицы: migrations — новые файлы миграций (forward-only) в порядке применения;`,
+    `env — новые/изменённые переменные окружения (строка "KEY=зачем" или {"name","value","note"}); services —`,
+    `новые/изменённые сервисы/воркеры/systemd-юниты/cron-таймеры; seed — сиды и разовые backfill-скрипты в`,
+    `порядке прогона; manualChecks — что прокликать руками после раскатки. ВСЕ 5 ключей ОБЯЗАТЕЛЬНЫ: пустой`,
+    `массив [] = «проверял, пусто», ОТСУТСТВИЕ ключа = «забыл» → карточка НЕ done. Одиночное поле "migration"`,
+    `продолжай писать для совместимости, но тот же путь ОБЯЗАН быть и в "deploy".migrations.`,
     `BRANCH & HANDOFF (ОБЯЗАТЕЛЬНО, не коммить в main напрямую): работай в выделенной ветке`,
     `"autodev/${card.slug}" — ответви её от свежего main в начале. Когда все гейты зелёные и до того как ставишь`,
     `"column":"ready": закоммить, "git push -u origin autodev/${card.slug}", и запиши в board.json top-level`,
@@ -511,6 +645,7 @@ function blockCard(card, reason) {
   card.column = "blocked";
   card.blockReason = reason;
   card.lastColumnChangeAt = new Date().toISOString();
+  card.result = buildResult(card); // SR: freeze the block reason into «Результат» (this card is skipped by the next sync pass)
   card.history.push({ column: "blocked", ts: card.lastColumnChangeAt, via: "supervisor", reason });
   try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "blocked", cardId: card.id, reason }) + "\n"); } catch {}
 }
@@ -599,6 +734,13 @@ function syncFromPipeline() {
         if (pip.branchLink && pip.branchLink !== card.branchLink) { card.branchLink = String(pip.branchLink); changed = true; }
         if (pip.finishNote && pip.finishNote !== card.finishNote) { card.finishNote = String(pip.finishNote); changed = true; }
         if (pip.migration && JSON.stringify(pip.migration) !== JSON.stringify(card.migration)) { card.migration = pip.migration; changed = true; }
+        // SR: mirror the 5-section release manifest the build writes at `ready` (generalises
+        // `migration`) + the archDecisions (an AUTO run's own forks feed result.autoDecisions).
+        if (pip.deploy && JSON.stringify(pip.deploy) !== JSON.stringify(card.deploy)) { card.deploy = pip.deploy; changed = true; }
+        if (Array.isArray(pip.archDecisions) && pip.archDecisions.length && JSON.stringify(pip.archDecisions) !== JSON.stringify(card.archDecisions || [])) { card.archDecisions = pip.archDecisions; changed = true; }
+        // Recompute the "Результат" aggregate from the freshly-mirrored fields (§6). Pure —
+        // only writes back (and flags `changed`) when it actually differs.
+        { const r = buildResult(card); if (JSON.stringify(r) !== JSON.stringify(card.result || null)) { card.result = r; changed = true; } }
         // B9: structured deferred[] → auto-spawn backlog cards (once per title, idempotent)
         if (Array.isArray(pip.deferred) && pip.deferred.length) {
           card.deferredSpawned = card.deferredSpawned || [];
@@ -772,6 +914,13 @@ async function handleApi(req, res, urlPath) {
   // GET /api/board
   if (req.method === "GET" && urlPath === "/api/board") {
     return sendJSON(res, 200, readBoard());
+  }
+
+  // GET /api/plans/:planId/manifest -> plan.result.releaseManifest (§6.1): accumulated,
+  // per-section, DAG-ordered over the plan's stage cards. Read-only; feeds the plan-rail (S4).
+  const mpm = urlPath.match(/^\/api\/plans\/([^/]+)\/manifest$/);
+  if (mpm && req.method === "GET") {
+    return sendJSON(res, 200, planReleaseManifest(readBoard(), decodeURIComponent(mpm[1])));
   }
 
   // POST /api/tasks  -> create in backlog
