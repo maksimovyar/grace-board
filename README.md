@@ -26,59 +26,63 @@ Zero dependencies, no build step — plain Node ≥ 18, bound to `127.0.0.1` (lo
 
 ## Why GRACE — the method behind the board
 
-GRACE (a methodology by Vladimir Ivanov) works *with* how an LLM actually behaves — a
-semantic processor that reads strictly left-to-right and whose attention silently
-degrades on long context — instead of anthropomorphizing it. Most user mistakes come
-from treating it like a human; the board and the `grace-feature-dev` pipeline encode the
-principles that avoid them. What you get out of it:
+GRACE is a methodology by Vladimir Ivanov, and its idea is simple: don't project human
+traits onto a language model, work with how it's actually built. And it's built in an
+unfamiliar way. It reads text only left to right and can't look back; on a long context
+its attention quietly drifts. Almost every mistake people make with AI comes from talking
+to it like a person. The board and the `grace-feature-dev` pipeline are built precisely to
+avoid those mistakes. Here's what that buys you in practice:
 
-- **Embedded documentation (a "semantic exoskeleton") instead of separate docs.**
-  Standalone docs have a ~45% chance of never being read by the agent, and once they
-  drift from the code they *poison* the context — the model builds its picture from the
-  doc, not the code. Docs written *into* the code can't be skipped, run ~20–30% of the
-  code size (≈3× smaller than standalone docs), and **cut tokens** — the expensive tokens
-  are generation, not reading. That's the **GRACE markup** toggle: it documents only what
-  isn't visible from the code (intent, design rationale, module map, use cases), not the
-  algorithm itself.
+- **Documentation lives inside the code, not in separate files.** A standalone doc gets
+  ignored by the agent almost half the time. And if it has drifted from the code, it only
+  makes things worse: the model trusts the doc over the code and forms the wrong picture.
+  When the description is written straight into the code, it can't be skipped. It's about
+  three times smaller than separate docs (roughly 20–30% of the code's size), and it saves
+  tokens on top — because what's expensive is generation, not reading. That's what the
+  **GRACE markup** toggle is for. And the point is to describe not the algorithm itself
+  (the model reads that fine on its own) but what you *can't* see from the code: why it was
+  written, why this design and not another, the module map, the use cases.
 
-- **Goal first, then decomposition.** Goal-alignment outranks your instructions, so a run
-  states its goal up front, then splits the root goal into a tree of subgoals — the
-  board's cards. Setting the *root* goal is the one thing the model won't do on its own
-  (left alone it drifts to inaction); that's your job in **Backlog**.
+- **The goal comes first, the breakdown into steps comes after.** For the model the goal
+  outweighs any of your instructions, so a run first spells out what it's after, and only
+  then splits that big goal into subgoals — the cards on the board. But the top goal itself
+  the model can't set: leave it alone and it drifts toward doing nothing. Only you can set
+  that goal, and that's what **Backlog** is for.
 
-- **Superposition of hypotheses, not rework.** An LLM has no good way to "change its
-  mind" — reversing a decision risks hallucination and a jump backwards. So instead of
-  redoing work, the **Asking · architecture** gate presents each fork as **2–4 variants
-  with pros/cons and a recommended pick**; choosing one just re-weights the options, which
-  is cheap for the model (3–5 hypotheses is the sweet spot for code).
+- **Don't redo — hold several options at once.** A model has nothing to really "change its
+  mind" with: a reversed decision easily pulls it into hallucinations and a jump backwards.
+  So instead of rewriting, at each fork (the **Asking · architecture** gate) it lays out
+  2–4 options with their pros and cons and suggests which to take. Picking one is cheap for
+  it — just tipping the balance toward a branch. For code, 3–5 such options is about right.
 
-- **Decisions locked before code is generated.** Backtracking is expensive for a model:
-  a reversed decision doesn't get erased, it lingers in the context as a contradiction and
-  drags quality down (the same context-poisoning as drifted docs). So the pipeline
-  front-loads every choice while the context is still "clean" — discovery → clarify →
-  architecture — and only then generates code, straight through, in one direction:
-  implement → verify → review. The payoff: no costly rewrites of already-generated code,
-  no half-old/half-new plan muddying the context, and cheaper, more predictable runs. The
-  flexibility you'd normally get from iterating is provided *before* the build instead — by
-  the 2–4 architecture variants you pick from, which cost the model almost nothing to
-  switch between.
+- **Every decision is made before the first line of code is written.** Rolling something
+  back is expensive for the model: a cancelled decision doesn't disappear, it stays in the
+  context as a contradiction and drags quality down — the same effect as a drifted doc. So
+  every choice is made up front, while the context is still clean: first discovery, then
+  clarify, then architecture. Only then comes the code — straight through, no U-turns:
+  implement, verify, review. The result: no rewriting code that's already been generated,
+  no context clogged with a mix of the old and new plan, and runs that come out cheaper and
+  more predictable. The flexibility you'd normally get from "build it, then rebuild it"
+  shows up earlier here — in those architecture options, which cost the model almost nothing
+  to switch between.
 
-- **Structured context for distributed attention.** Past ~10–20k tokens attention grows
-  "holes" (up to 96%) and the model quietly gets dumber *while reporting all-is-well*.
-  Paired tags/anchors and keyword saturation — in code **and** logs — keep a session
-  coherent across 200–300k tokens and let agents navigate by grep. The GRACE markup
-  carries this.
+- **The context is marked up so attention can hold onto it.** After the first 10–20k
+  tokens, gaps open up in attention (up to 96% of it), and the model gets dumber without
+  noticing — while cheerfully reporting that all is well. Paired anchor tags and a generous
+  scatter of keywords (in the code *and* the logs) keep a session coherent across 200–300k
+  tokens, and give agents something to grab onto when searching with grep. All of this is
+  carried by the GRACE markup.
 
-- **Independent verification (the board never lies).** Because the model claims "all
-  good" even when it isn't, trust isn't enough. The **Verify** phase runs a *separate*
-  agent doing Semantic Trace Verification — does the real execution path in the logs match
-  the planned data flow? — backed by green checkpoints that make each card an atomic
-  rollback point.
+- **A separate agent does the checking, because the model can't be taken at its word.** It
+  says "all good" even when things are bad, so there's little to trust here. In the
+  **Verify** phase an independent agent goes to work: it takes the logs from a real run and
+  checks whether the execution path matched what was planned. Its backstop is the green
+  checkpoints — each card becomes a point you can always roll back to.
 
-> Distilled from the GRACE methodology notes (V. Ivanov). The short version: causal
-> reading (only ever backwards) · goal outranks your instructions (it silently ignores
-> what it deems low-quality) · long-context attention gets dumber and lies about it · give
-> it vector capacity to think · stack choice matters more than requirements.
+> From the notes on the GRACE methodology (V. Ivanov). The short version: the model reads
+> only backwards; the goal matters more to it than your instructions, so anything it deems
+> weak it will quietly ignore; on a long context it gets dumber and hides it; it needs room
+> to "think"; and the choice of tech stack matters more than the requirements themselves.
 
 ## Quick start
 
