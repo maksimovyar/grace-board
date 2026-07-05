@@ -360,7 +360,7 @@ function itemStr(item) {
 // data deletion in a seed/backfill, a new secret env var. AUTO never merges main (git-floor),
 // so a flagged card's items just surface for human sign-off on the final PR — they don't auto-clear.
 const FLOOR_DESTRUCTIVE_RE = /\b(DROP\s+(TABLE|COLUMN|DATABASE|SCHEMA|INDEX|CONSTRAINT)|TRUNCATE|DELETE\s+FROM|ALTER\s+TABLE\b[\s\S]*\bDROP\b)/i;
-const FLOOR_SECRET_RE = /(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE)\b/i;
+const FLOOR_SECRET_RE = /(^|_)(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE)\b/i;
 function mechanicalFloor(deploy) {
   if (!hasDeploy(deploy)) return [];
   const { manifest } = normalizeManifest(deploy);
@@ -485,6 +485,26 @@ function planReleaseManifest(board, planId) {
 // GREP_SUMMARY: Plan, plan run, assemble from cards, planId, integrationBranch, plan-rail, §1 §2
 const PLAN_ASSEMBLABLE = new Set(["backlog", "todo"]);
 const planById = (board, id) => (board.plans || []).find((p) => p.id === id) || null;
+// A cyclic dependsOn graph would queue every stage forever (depsSatisfied never true) with no
+// dispatch and no error — a silent deadlock. Reject it at assembly. DFS over deps restricted to
+// the plan's own stages (self-edges ignored, matching how they're wired below).
+function stagesHaveCycle(stages) {
+  const inSet = new Set(stages.map((s) => s.cardId));
+  const dep = new Map(stages.map((s) => [s.cardId, (Array.isArray(s.dependsOn) ? s.dependsOn : []).filter((d) => d !== s.cardId && inSet.has(d))]));
+  const state = new Map(); // 0/undefined = unseen · 1 = on stack · 2 = done
+  const dfs = (id) => {
+    state.set(id, 1);
+    for (const d of dep.get(id) || []) {
+      const st = state.get(d) || 0;
+      if (st === 1) return true;                 // back-edge → cycle
+      if (st === 0 && dfs(d)) return true;
+    }
+    state.set(id, 2);
+    return false;
+  };
+  for (const s of stages) if ((state.get(s.cardId) || 0) === 0 && dfs(s.cardId)) return true;
+  return false;
+}
 // Derived status from the plan's stage columns (§2 lifecycle) — the cards are the truth.
 function planStatus(board, plan) {
   const cards = (plan.cardIds || []).map((id) => board.cards.find((c) => c.id === id)).filter(Boolean);
@@ -1145,6 +1165,7 @@ async function handleApi(req, res, urlPath) {
     if (cards.some((c) => c.project !== project)) return sendJSON(res, 400, { error: "a card does not belong to the project" });
     if (cards.some((c) => !PLAN_ASSEMBLABLE.has(c.column) || c.dispatchedAt)) return sendJSON(res, 400, { error: "only undispatched Backlog/To do cards can be assembled" });
     if (cards.some((c) => c.planId)) return sendJSON(res, 400, { error: "a card is already part of a plan" });
+    if (stagesHaveCycle(stages)) return sendJSON(res, 400, { error: "dependency cycle between stages — a plan DAG must be acyclic" });
 
     const id = crypto.randomUUID().slice(0, 8);
     const integrationBranch = `autodev/plan-${id}`;
