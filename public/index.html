@@ -21,10 +21,84 @@
     </div>
   </div>
   <nav class="strip" id="strip" aria-label="станции"></nav>
+  <button class="btn btn--run" id="openLaunch" type="button">⚡ Прогон</button>
   <button class="btn btn--solid" id="openComposer" type="button">+ Новая задача</button>
 </header>
 
+<!-- plan-rail(s) — запущенные прогоны над колонками (§2, S4); app.js наполняет из board.plans -->
+<div class="railhost" id="railHost"></div>
+
 <main class="board" id="board" aria-label="kanban board"></main>
+
+<!-- ══ LAUNCH WIZARD — мастер запуска большой фичи (Plan Run, S4·S5) ═══════════ -->
+<div class="launch" id="launch" hidden>
+  <div class="launch__scrim" data-lclose></div>
+  <div class="launch__panel">
+    <div class="launch__head">
+      <span class="launch__mark">⚡</span>
+      <div>
+        <h2 class="launch__title">Запуск большой фичи</h2>
+        <p class="launch__sub">Plan Run · собери из задач доски → один PR</p>
+      </div>
+      <button class="launch__close" type="button" data-lclose aria-label="Закрыть">✕</button>
+    </div>
+    <div class="steps" id="steps">
+      <span class="steps__i is-on" data-step="1"><span class="steps__n">1</span>Проект</span>
+      <span class="steps__bar"></span>
+      <span class="steps__i" data-step="2"><span class="steps__n">2</span>Задачи с доски</span>
+      <span class="steps__bar"></span>
+      <span class="steps__i" data-step="3"><span class="steps__n">3</span>Гейт → запуск</span>
+    </div>
+
+    <!-- ШАГ 1 · проект + режим + цель -->
+    <div class="lpane is-on" data-pane="1">
+      <div class="lrow">
+        <label><span class="lk">Проект</span>
+          <select class="lin" id="lProject"></select></label>
+        <label><span class="lk">Режим автономии</span>
+          <div class="seg" id="lMode"><button type="button" class="seg__opt is-on" data-auto="ask">Ask</button><button type="button" class="seg__opt" data-auto="auto">Auto</button></div></label>
+      </div>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span class="lk">Цель прогона · контекст для финального PR <span style="text-transform:none;color:var(--ink-faint)">(необязательно)</span></span>
+        <textarea class="lin" id="lGoal" rows="2" placeholder="Одной фразой: зачем этот прогон…"></textarea></label>
+      <div class="verdict">
+        <span class="verdict__ic">🧩</span>
+        <span class="verdict__b"><b>Прогон собирается из задач доски.</b> На следующем шаге — незавершённые карточки
+          <b id="lProjName">проекта</b> (Backlog + To do). Отметь, что войдёт в прогон, и задай порядок/зависимости.
+          Новые задачи тут не заводятся — сначала карточка на доске.</span>
+      </div>
+      <div class="lfoot">
+        <button class="btn btn--ghost" type="button" data-lclose>Отмена</button>
+        <button class="btn btn--run" type="button" data-go="2">К задачам проекта →</button>
+      </div>
+    </div>
+
+    <!-- ШАГ 2 · сбор прогона из карточек доски -->
+    <div class="lpane" data-pane="2">
+      <p class="lnote"><b>Задачи <b id="lProjName2">проекта</b> на доске.</b> Отметь, что войдёт в прогон; порядок = порядок
+        отметки. Зависимости — чипами «зависит:». Порядок строго последовательный (WIP=1).</p>
+      <div class="plandraft" id="draft"></div>
+      <p class="lnote" style="margin:2px 0 0;color:var(--ink-faint)">
+        Нет нужной задачи? <button class="linklike" id="toBoard" type="button">Заведи карточку на доске</button>, затем вернись.
+        Прогон не создаёт задачи с нуля.</p>
+      <div class="lfoot">
+        <button class="btn btn--ghost" type="button" data-go="1">← Назад</button>
+        <div style="display:flex;gap:10px;align-items:center"><span class="lk" id="pickCount" style="text-transform:none">выбрано 0</span><button class="btn btn--run" type="button" data-go="3">К сводному гейту →</button></div>
+      </div>
+    </div>
+
+    <!-- ШАГ 3 · сводный гейт (S5 наполнит) → запуск -->
+    <div class="lpane" data-pane="3">
+      <p class="lnote"><b>Сводный гейт.</b> Проверь состав прогона и запусти. План-уровневые развилки/блокеры/пол
+        сводятся здесь (S5). Низкоуровневое агент решит сам.</p>
+      <div id="gate"></div>
+      <div class="lfoot">
+        <button class="btn btn--ghost" type="button" data-go="2">← Назад</button>
+        <button class="btn btn--run" type="button" id="fire">✅ Утвердить и запустить прогон →</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <div class="hint">Перетаскивай <b>карточки</b> между станциями · нажми карточку — откроется задача · <b>+ Новая задача</b></div>
 

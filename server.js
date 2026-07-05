@@ -470,6 +470,34 @@ function planReleaseManifest(board, planId) {
 }
 // endregion FUNC_releaseManifest
 
+// region FUNC_plans — Plan entity: assemble a run from EXISTING board cards (roadmap §1/§2, v2)
+// ## @purpose A Plan is NOT generated from a goal by LLM decomposition — it is ASSEMBLED from
+// ##   unfinished cards the user already has on the board (Backlog + To do of one project).
+// ##   createPlan wires the chosen cards into a DAG (planId + dependsOn), hands them the plan's
+// ##   SHARED integration branch, sets their autonomy from the plan mode, and enqueues them
+// ##   (WIP=1 + deps decide order). The goal is only context for the final PR.
+// ## @invariants
+// ## - Only Backlog / To do cards of the plan's project, not yet dispatched and not already in a
+// ##   plan, may be assembled — the run creates NO cards from scratch (v2 model).
+// ## - integrationBranch = autodev/plan-<id>; every stage commits there (base = its tip, §4).
+// ## - status is DERIVED from the stage columns — never a stale stored value.
+// ## - A single card (planId:null) is byte-for-byte untouched by any of this.
+// GREP_SUMMARY: Plan, plan run, assemble from cards, planId, integrationBranch, plan-rail, §1 §2
+const PLAN_ASSEMBLABLE = new Set(["backlog", "todo"]);
+const planById = (board, id) => (board.plans || []).find((p) => p.id === id) || null;
+// Derived status from the plan's stage columns (§2 lifecycle) — the cards are the truth.
+function planStatus(board, plan) {
+  const cards = (plan.cardIds || []).map((id) => board.cards.find((c) => c.id === id)).filter(Boolean);
+  if (!cards.length) return "empty";
+  if (cards.every((c) => c.column === TERMINAL)) return "done";
+  if (cards.some((c) => c.column === "blocked")) return "blocked";
+  if (cards.some((c) => c.dispatchedAt || c.queued)) return "running";
+  return "planning";
+}
+// Read projection for the rail: derived status + accumulated release manifest (§6.1).
+const planView = (board, plan) => ({ ...plan, status: planStatus(board, plan), result: { releaseManifest: planReleaseManifest(board, plan.id) } });
+// endregion FUNC_plans
+
 // ── dispatch: write a grace-feature-dev-compatible seed into the project ─────
 function dispatch(card) {
   const projectDir = resolveProjectDir(card.project);
@@ -526,6 +554,9 @@ function recordLaunch(card, launch, kind) {
 // ##   for a human even in AUTO; such a fork is tagged floor:true and left for the human.
 // ## @invariants ask (default) = byte-identical to today's behaviour — the block is empty.
 const effAutonomy = (card) => (card && AUTONOMIES.includes(card.autonomy)) ? card.autonomy : GLOBAL_AUTONOMY;
+// S4: the git branch a card commits to — a plan stage shares the plan's integration branch
+// (set at plan creation), a single card keeps its own autodev/<slug>.
+const branchFor = (card) => card.integrationBranch || ("autodev/" + card.slug);
 function autonomyBlock(card) {
   if (effAutonomy(card) !== "auto") return "";
   return [
@@ -630,6 +661,13 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
   const auto = autonomyBlock(card);
+  // S4: a plan stage commits to the plan's SHARED integration branch (base = its tip → sees
+  // predecessors' commits, §4); a single card keeps its own autodev/<slug>. branchFor() is the
+  // single source of the branch name across green-checkpoints, the final push, and resume.
+  const branch = branchFor(card);
+  const baseLine = card.integrationBranch
+    ? `ЭТАП ПРОГОНА: работай в ОБЩЕЙ интеграционной ветке "${branch}" (одна на весь прогон). Если её нет — создай от свежего main; иначе checkout и продолжай С ЕЁ TIP — ты ВИДИШЬ коммиты предыдущих этапов (§4). НЕ ответвляй заново от main на каждом этапе.`
+    : `работай в выделенной ветке "${branch}" — ответви её от свежего main в начале.`;
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
@@ -652,13 +690,13 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
     `renders this decomposition, so stale per-card columns make it lie. Update them at each card phase boundary.`,
     `GREEN-CHECKPOINT (LA4 «вечно зелёный билд» + точки отката): КАЖДЫЙ раз, когда декомпозированная карточка`,
     `проходит verify И review зелёными и ты переводишь её "cards[].column" в "done" — сделай на ветке`,
-    `"autodev/${card.slug}" микро-коммит: сначала "git add" СТРОГО по файлам из card.files[] ЭТОЙ карточки`,
+    `"${branch}" микро-коммит: сначала "git add" СТРОГО по файлам из card.files[] ЭТОЙ карточки`,
     `(НИКОГДА не "git add ." и не "-A" — чекпоинт атомарный, чужие изменения не тянем), затем`,
     `"git commit -m 'green(<cardId>): <краткий title карточки>'". Коммить ТОЛЬКО на зелёной карточке. Провал`,
     `verify/review (карточка вернулась в implementing или ушла в blocked по Anti-Loop) → НЕ коммить; последний`,
     `зелёный чекпоинт оставляем нетронутым, человек продолжит от него. Эти green-коммиты — атомарные точки`,
     `отката ("git restore --source=<sha> -- <файл>"); финальный push перед "ready" (см. BRANCH & HANDOFF) идёт`,
-    `в ту же ветку "autodev/${card.slug}" и эти коммиты НЕ заменяет.`,
+    `в ту же ветку "${branch}" и эти коммиты НЕ заменяет.`,
     `DEFINITION OF DONE (гейт перед "ready" — НЕ помечай карточку/слайс done, пока не выполнено):`,
     `карточка НЕ уходит в done/ready, если в её файлах остались TODO/FIXME/HACK/XXX/NotImplementedError/`,
     `заглушки (placeholder-возвраты, выброшенные значения), КРОМЕ случая, когда строка покрыта проходящим`,
@@ -678,11 +716,11 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
     `порядке прогона; manualChecks — что прокликать руками после раскатки. ВСЕ 5 ключей ОБЯЗАТЕЛЬНЫ: пустой`,
     `массив [] = «проверял, пусто», ОТСУТСТВИЕ ключа = «забыл» → карточка НЕ done. Одиночное поле "migration"`,
     `продолжай писать для совместимости, но тот же путь ОБЯЗАН быть и в "deploy".migrations.`,
-    `BRANCH & HANDOFF (ОБЯЗАТЕЛЬНО, не коммить в main напрямую): работай в выделенной ветке`,
-    `"autodev/${card.slug}" — ответви её от свежего main в начале. Когда все гейты зелёные и до того как ставишь`,
-    `"column":"ready": закоммить, "git push -u origin autodev/${card.slug}", и запиши в board.json top-level`,
+    `BRANCH & HANDOFF (ОБЯЗАТЕЛЬНО, не коммить в main напрямую): ${baseLine} Когда все гейты зелёные и до того`,
+    `как ставишь "column":"ready": закоммить, "git push -u origin ${branch}", и запиши в board.json top-level`,
     `"branchLink" — URL ветки/compare на GitHub (origin remote), который человек должен проревьюить и подлить в main.`,
     `Если push невозможен (нет remote/доступа) — оставь имя ветки в "branchLink" и опиши это в "finishNote".`,
+    card.integrationBranch ? `main САМ НЕ мержь — финальный PR прогона в main утверждает человек (git-пол, §4/§5.3).` : ``,
     `ИТОГИ КАРТОЧКИ: всегда заполняй top-level "finishNote" коротким резюме сделанного. ОТЛОЖЕННОЕ указывай ЯВНО`,
     `и СТРУКТУРНО: top-level "deferred" — массив объектов {"title":"кратко что не сделано","reason":"почему/куда`,
     `вынесено"}. Эти пункты доска автоматически заведёт карточками в backlog. Продублируй их разделом "Отложенное:"`,
@@ -925,7 +963,7 @@ function syncFromPipeline() {
             tail || "(лог пуст/недоступен)",
             `----- /log tail -----`,
             `Диагностируй причину по этому хвосту САМ (отдельный вызов модели не нужен) и продолжи с самого`,
-            `дальнего ЗЕЛЁНОГО чекпоинта: "git log --oneline" в ветке "autodev/${card.slug}" → коммиты`,
+            `дальнего ЗЕЛЁНОГО чекпоинта: "git log --oneline" в ветке "${branchFor(card)}" → коммиты`,
             `"green(<cardId>): …"; при необходимости "git restore --source=<sha> -- <файл>". Фичу заново НЕ начинай.`,
           ].join("\n");
           const rigor = (card.rigor && card.rigor !== "auto") ? card.rigor : "off";
@@ -1022,6 +1060,72 @@ async function handleApi(req, res, urlPath) {
   const mpm = urlPath.match(/^\/api\/plans\/([^/]+)\/manifest$/);
   if (mpm && req.method === "GET") {
     return sendJSON(res, 200, planReleaseManifest(readBoard(), decodeURIComponent(mpm[1])));
+  }
+
+  // GET /api/plans -> all plans as rail projections (derived status + manifest)
+  if (req.method === "GET" && urlPath === "/api/plans") {
+    const board = readBoard();
+    return sendJSON(res, 200, { plans: (board.plans || []).map((p) => planView(board, p)) });
+  }
+  // GET /api/plans/:id -> one plan projection
+  const mpone = urlPath.match(/^\/api\/plans\/([^/]+)$/);
+  if (mpone && req.method === "GET") {
+    const board = readBoard();
+    const plan = planById(board, decodeURIComponent(mpone[1]));
+    return plan ? sendJSON(res, 200, { plan: planView(board, plan) }) : sendJSON(res, 404, { error: "plan not found" });
+  }
+
+  // POST /api/plans -> ASSEMBLE a run from existing board cards (v2). Body:
+  //   { project, goal?, mode:"ask"|"auto", stages:[ { cardId, dependsOn:[cardId,...] } ] }
+  // Wires planId + integration branch + dependsOn onto the chosen cards and enqueues them.
+  if (req.method === "POST" && urlPath === "/api/plans") {
+    const b = await readBody(req);
+    const project = String(b.project || "").trim();
+    if (!project) return sendJSON(res, 400, { error: "project is required" });
+    if (!isInsideRoot(resolveProjectDir(project))) return sendJSON(res, 400, { error: `project must resolve inside ${PROJECTS_ROOT}` });
+    const stages = Array.isArray(b.stages) ? b.stages.filter((s) => s && typeof s.cardId === "string") : [];
+    if (!stages.length) return sendJSON(res, 400, { error: "select at least one card" });
+    const board = readBoard();
+    board.plans = board.plans || [];
+    const ids = stages.map((s) => s.cardId);
+    if (new Set(ids).size !== ids.length) return sendJSON(res, 400, { error: "duplicate card in stages" });
+    const cards = ids.map((id) => board.cards.find((c) => c.id === id));
+    if (cards.some((c) => !c)) return sendJSON(res, 400, { error: "unknown card in stages" });
+    if (cards.some((c) => c.project !== project)) return sendJSON(res, 400, { error: "a card does not belong to the project" });
+    if (cards.some((c) => !PLAN_ASSEMBLABLE.has(c.column) || c.dispatchedAt)) return sendJSON(res, 400, { error: "only undispatched Backlog/To do cards can be assembled" });
+    if (cards.some((c) => c.planId)) return sendJSON(res, 400, { error: "a card is already part of a plan" });
+
+    const id = crypto.randomUUID().slice(0, 8);
+    const integrationBranch = `autodev/plan-${id}`;
+    const mode = AUTONOMIES.includes(b.mode) ? b.mode : "ask";
+    const idset = new Set(ids);
+    const plan = {
+      id, project, goal: String(b.goal || "").trim().slice(0, MAX_DESC) || null,
+      integrationBranch, mode, cardIds: ids, status: "running",
+      createdAt: new Date().toISOString(), result: null,
+    };
+    board.plans.push(plan);
+    // Wire every stage, then enqueue it exactly like the launch lever (§5.1): dispatch if the
+    // project slot is free AND deps are ready, else queue. WIP=1 + dependsOn serialize the rest.
+    for (const s of stages) {
+      const card = board.cards.find((c) => c.id === s.cardId);
+      card.planId = id;
+      card.integrationBranch = integrationBranch;
+      card.autonomy = mode;
+      card.dependsOn = Array.isArray(s.dependsOn) ? s.dependsOn.filter((x) => idset.has(x) && x !== s.cardId) : [];
+      card.column = "todo";
+      if (canDispatchNow(board, card)) {
+        dispatchNow(board, card, "plan-launch");
+      } else {
+        card.queued = true;
+        card.queuedAt = new Date().toISOString();
+        card.lastColumnChangeAt = card.queuedAt;
+        card.history.push({ column: "todo", ts: card.queuedAt, via: "plan-queued" });
+      }
+    }
+    writeBoard(board);
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: plan.createdAt, event: "plan-create", planId: id, project, stages: ids.length, mode, branch: integrationBranch }) + "\n"); } catch {}
+    return sendJSON(res, 201, { plan: planView(board, plan) });
   }
 
   // POST /api/tasks  -> create in backlog
