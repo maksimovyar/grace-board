@@ -49,6 +49,9 @@ function stripHTML() {
 
 function cardTags(card) {
   const t = [];
+  // Queue / dependency state (§5.1/§5.2) — most salient, shown first. The "🔒 waiting"
+  // dependency variant is filled in by S1; here a queued card means its project is busy.
+  if (card.queued) t.push(`<span class="tag tag--queue">⏳ в очереди · проект занят</span>`);
   const dl = card.designLink ? safeUrl(card.designLink) : null;
   if (dl) t.push(`<a class="tag" href="${esc(dl)}" target="_blank" rel="noopener" data-stop>⧉ макеты</a>`);
   const rl = card.requirementsLink ? safeUrl(card.requirementsLink) : null;

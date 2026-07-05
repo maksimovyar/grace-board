@@ -69,6 +69,12 @@ const LIVENESS_GRACE_MS = 15 * 1000;       // don't judge a run dead in its firs
 // Work-in-flight stations the supervisor watches. `asking` is excluded — there the
 // run has exited by design and we wait on the human, so a dead pid is expected.
 const ACTIVE_COLUMNS = new Set(["todo", "implementing", "verifying", "reviewing"]);
+// A card "occupies" its project's single work slot from dispatch until it reaches a
+// terminal/blocked state — this is what serializes the shared project cwd (WIP=1 per
+// project, roadmap §5.1). `asking` IS occupying (the run owns the branch mid-clarify),
+// unlike ACTIVE_COLUMNS above which is only about liveness supervision. A `queued` card
+// is NOT occupying — it hasn't spawned a run (dispatchedAt is null).
+const OCCUPYING_COLUMNS = new Set(["todo", "asking", "implementing", "verifying", "reviewing"]);
 
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.join(__dirname, "data");
@@ -210,6 +216,64 @@ function serveAttachment(res, card, attId) {
 function purgeUploads(cardId) {
   try { fs.rmSync(path.join(UPLOADS_DIR, cardId), { recursive: true, force: true }); } catch {}
 }
+
+// region FUNC_scheduleQueued — per-project WIP=1 serialization (roadmap §5.1/§5.2)
+// ## @purpose Close the shared-cwd git race (server.js spawns every run in the SAME
+// ##   projectDir): only ONE card per project may hold a live run at a time. A card
+// ##   leaving Backlog while its project is busy is QUEUED (a flag, not a run) and the
+// ##   tick dispatches it once the slot frees — so two cards never checkout/commit in
+// ##   one working dir concurrently, and there is no intra-project git conflict to solve.
+// ## @io (board) -> mutates board (dispatches ≤1 queued card per free project)
+// ## @invariants
+// ## - Single-card / free-project path dispatches IMMEDIATELY — one-off tasks are untouched.
+// ## - A queued card never spawns a run until canDispatchNow() is true (slot free; S1: deps ready).
+// ## - queued cards carry dispatchedAt=null, so they never count as "active" themselves.
+// ## @rationale Q: new station column vs a flag? A: a `queued` flag keeps the card in
+// ##   `todo` — zero column-model migration across UI/legacy maps, and the flag is only
+// ##   ever set when the project is busy, so the existing single-card flow is byte-identical.
+// ## @modulemap
+// ## FUNC 3[guard]   => hasActiveForProject   — is the project's slot taken?
+// ## FUNC 3[guard]   => canDispatchNow        — S0: slot free (S1 extends: + deps + files)
+// ## FUNC 6[persist] => dispatchNow           — mark live + seed + spawn (shared by PATCH & tick)
+// ## FUNC 5[persist] => scheduleQueued        — tick pass: feed each free project its next card
+// GREP_SUMMARY: queue, WIP1, per-project serialization, shared cwd race, dispatchNow, scheduleQueued
+// STRUCTURE: ▶ hasActiveForProject → ⊕ canDispatchNow → ⚡ dispatchNow → ⎋ scheduleQueued(tick)
+
+// Does another card already hold this project's work slot? Queued cards don't count
+// (dispatchedAt is null); the card itself is excluded via exceptId.
+function hasActiveForProject(board, project, exceptId) {
+  return board.cards.some((c) =>
+    c.id !== exceptId && c.project === project && c.dispatchedAt && !c.queued && OCCUPYING_COLUMNS.has(c.column));
+}
+// May this card start its run right now? S0: only the per-project slot gate.
+// (S1 extends this with dependsOn readiness + files[] conflict — see FUNC_dagGates.)
+function canDispatchNow(board, card) {
+  return !hasActiveForProject(board, card.project, card.id);
+}
+// Actually start the card's run: clear the queued flag, stamp it live, seed + spawn.
+// Shared by the PATCH (lever) path and the tick scheduler so both dispatch identically.
+function dispatchNow(board, card, via) {
+  card.queued = false;
+  card.dispatchedAt = new Date().toISOString();
+  card.dispatch = dispatch(card);
+  card.lastColumnChangeAt = card.dispatchedAt;
+  card.history.push({ column: card.column, ts: card.dispatchedAt, via: via || "dispatch" });
+}
+// Tick pass: give each free project its next eligible queued card. Dispatching one flips
+// hasActiveForProject() true for that project, so the next same-project queued card waits
+// this pass — natural WIP=1 without a lock. FIFO by board array order (= creation order).
+function scheduleQueued(board) {
+  let changed = false;
+  for (const card of board.cards) {
+    if (!card.queued) continue;
+    if (!canDispatchNow(board, card)) continue;
+    dispatchNow(board, card, "queue-dispatch");
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.dispatchedAt, event: "queue-dispatch", cardId: card.id, project: card.project }) + "\n"); } catch {}
+    changed = true;
+  }
+  return changed;
+}
+// endregion FUNC_scheduleQueued
 
 // ── dispatch: write a grace-feature-dev-compatible seed into the project ─────
 function dispatch(card) {
@@ -617,6 +681,10 @@ function syncFromPipeline() {
       }
     }
   }
+  // WIP=1 scheduler (§5.1/§5.2): after mirroring, feed each now-free project its next
+  // queued card. Runs last so it sees this pass's ready/blocked transitions (a card that
+  // just reached `ready` frees the slot for its successor in the same tick).
+  if (scheduleQueued(board)) changed = true;
   if (changed) writeBoard(board);
 }
 
@@ -689,6 +757,10 @@ async function handleApi(req, res, urlPath) {
       requirements: String(b.requirements || "").trim() || null,
       attachments: [],
       rigor: RIGORS.includes(b.rigor) ? b.rigor : "off",
+      // Plan Run scaffold (additive; null = single card = today's behaviour, §1).
+      // The integration branch / final-PR mechanics land with the Plan entity (S4);
+      // here the field is just carried so a card can belong to a plan.
+      planId: (typeof b.planId === "string" && b.planId.trim()) ? b.planId.trim() : null,
       column: "backlog",
       createdAt: new Date().toISOString(),
       dispatchedAt: null,
@@ -863,12 +935,28 @@ async function handleApi(req, res, urlPath) {
       const column = String(b.column || "");
       if (!COLUMNS.includes(column)) return sendJSON(res, 400, { error: "unknown column" });
       const from = card.column;
-      let dispatched = false;
+      let dispatched = false, queued = false;
       if (from === "backlog" && column !== "backlog" && !card.dispatchedAt) {
-        card.dispatchedAt = new Date().toISOString();
-        card.dispatch = dispatch(card);
-        dispatched = true;
+        // Leaving Backlog = request to run. Serialize per project (§5.1): dispatch now
+        // only if the project's work slot is free; else QUEUE it (no spawn → the shared
+        // project cwd is never touched by two runs at once). A fresh card always enters
+        // at `todo`, whether it dispatches live or waits.
+        card.column = "todo";
+        if (canDispatchNow(board, card)) {
+          dispatchNow(board, card, "lever");
+          dispatched = true;
+        } else {
+          card.queued = true;
+          card.queuedAt = new Date().toISOString();
+          card.lastColumnChangeAt = card.queuedAt;
+          card.history.push({ column: "todo", ts: card.queuedAt, via: "queued" });
+          try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.queuedAt, event: "queued", cardId: card.id, project: card.project }) + "\n"); } catch {}
+          queued = true;
+        }
+        writeBoard(board);
+        return sendJSON(res, 200, { card, dispatched, queued });
       }
+      // any other move (manual station change on an already-dispatched card, etc.)
       card.column = column;
       card.lastColumnChangeAt = new Date().toISOString();
       card.history.push({ column, ts: card.lastColumnChangeAt });
