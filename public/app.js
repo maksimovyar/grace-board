@@ -68,6 +68,12 @@ function cardTags(card) {
   // SR: release-manifest chip — the card carries a non-empty deploy{} run-book (§6.1).
   if (manifestHasItems(card.deploy))
     t.push(`<span class="tag tag--rel" title="манифест релиза — открой карточку">⛁ релиз</span>`);
+  // S3 · AUTO trail (§5.3): forks resolved without a human · hard-floor held for a human.
+  const autoN = (card.result && card.result.autoDecisions || []).length;
+  if (autoN) t.push(`<span class="tag tag--auto" title="авто-решений без человека">🤖 ${autoN}</span>`);
+  if ((card.autoFloorHeld || []).length) t.push(`<span class="tag tag--floor" title="AUTO остановлен полом — решает человек">⚠ пол · ждёт</span>`);
+  const floorN = (card.result && card.result.floor || []).length;
+  if (floorN) t.push(`<span class="tag tag--floor" title="жёсткий пол — нужна подпись человека на PR">⚠ пол: ${floorN}</span>`);
   const dl = card.designLink ? safeUrl(card.designLink) : null;
   if (dl) t.push(`<a class="tag" href="${esc(dl)}" target="_blank" rel="noopener" data-stop>⧉ макеты</a>`);
   const rl = card.requirementsLink ? safeUrl(card.requirementsLink) : null;
@@ -100,6 +106,7 @@ function resultHTML(card) {
   if (r.finishNote) rows.push(`<div class="res__row"><span class="res__k">итог</span><span class="res__v">${esc(r.finishNote)}</span></div>`);
   if ((r.autoDecisions || []).length) rows.push(`<div class="res__row"><span class="res__k">🤖 авто</span><span class="res__v">${r.autoDecisions.map((d) => esc(d.chosenTitle || d.q || "решение")).join(" · ")}</span></div>`);
   if (r.blockReason) rows.push(`<div class="res__row res__row--block"><span class="res__k">⚠ причина</span><span class="res__v">${esc(r.blockReason)}</span></div>`);
+  if ((r.floor || []).length) rows.push(`<div class="res__row res__row--block"><span class="res__k">⚠ пол</span><span class="res__v">${r.floor.map((f) => esc(`${f.class}: ${f.detail}`)).join("<br>")}<div class="res__floornote">жёсткий пол §5.3 — требует подписи человека на финальном PR</div></span></div>`);
   let manifest = "";
   if (m) {
     manifest = `<div class="manifest">` + MANIFEST_SECTIONS.map(([k, label]) => {
@@ -181,7 +188,37 @@ function stationHTML(col) {
     </section>`;
 }
 
+// ── S3: global autonomy toggle (Ask/Auto), injected into the header (§5.3) ──────
+// index.html markup is S4's territory; S3 builds the control in JS so its files[] stay
+// server.js + app.js + styles.css. board.autonomy is the global default (card override wins).
+let autoSegEl = null;
+function ensureAutonomyToggle() {
+  if (autoSegEl) return;
+  const consoleEl = document.querySelector(".console");
+  const openC = document.getElementById("openComposer");
+  if (!consoleEl || !openC) return;
+  autoSegEl = document.createElement("div");
+  autoSegEl.className = "auto-seg";
+  autoSegEl.title = "глобальный режим автономии (оверрайд на карточке)";
+  autoSegEl.innerHTML = `<span class="auto-seg__label">Режим</span><div class="seg" id="autoSeg"><button type="button" class="seg__opt" data-auto="ask">Ask</button><button type="button" class="seg__opt" data-auto="auto">Auto</button></div>`;
+  consoleEl.insertBefore(autoSegEl, openC);
+  autoSegEl.querySelectorAll(".seg__opt").forEach((o) => o.addEventListener("click", () => setAutonomy(o.dataset.auto)));
+}
+function paintAutonomy() {
+  if (!autoSegEl) return;
+  const v = state.autonomy === "auto" ? "auto" : "ask";
+  autoSegEl.querySelectorAll(".seg__opt").forEach((o) => o.classList.toggle("is-on", o.dataset.auto === v));
+}
+async function setAutonomy(v) {
+  try {
+    const r = await api("/api/settings", { method: "PATCH", body: JSON.stringify({ autonomy: v }) });
+    state.autonomy = r.autonomy; paintAutonomy();
+    toast(`Режим по умолчанию: <strong>${v === "auto" ? "Auto" : "Ask"}</strong>`);
+  } catch (err) { toast("Не удалось: " + err.message); }
+}
+
 function render() {
+  ensureAutonomyToggle(); paintAutonomy();
   stripEl.innerHTML = stripHTML();
   const parts = [stationHTML("backlog")];
   parts.push(`<div class="lever" data-drop="todo" id="lever" title="перетащи карточку через рычаг — команда возьмёт задачу"><span class="lever__knob"></span><span class="lever__label">launch</span></div>`);
