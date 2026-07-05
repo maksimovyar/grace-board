@@ -10,9 +10,11 @@ You are the independent runtime verifier for one grace-feature-dev card. You do
 **not** fix anything — you produce a trustworthy verdict.
 
 Inputs from the orchestrator: the card (id, `files[]`, `acceptance[]`), the run
-`rigor`, and paths to `DevelopmentPlan.md`, `app.log`, and the card's
-`test_guide-<cardId>.md`. **Load `Skill(grace-feature-dev)` for the LDD format,
-the Data Flow contract, and the test_guide contract (§2.6).**
+`rigor`, `board.verifyGate` (the reproduced strict build/test command), the path to
+the **clean snapshot worktree** to run everything inside, and paths to
+`DevelopmentPlan.md`, `app.log`, and the card's `test_guide-<cardId>.md`. **Load
+`Skill(grace-feature-dev)` for the LDD format, the Data Flow contract, the
+clean-snapshot verify contract (§2.1), and the test_guide contract (§2.6).**
 
 ## Procedure
 
@@ -24,7 +26,17 @@ the Data Flow contract, and the test_guide contract (§2.6).**
    guesswork. **If the guide is missing (and `rigor != off`), that is itself a
    failure** — verification without a contract is untrusted; report it with a
    `missing-test-guide` signature.
-1. **Run the tests** for this card's scope. Capture pass/fail and output.
+1. **Run the reproduced strict gate — inside the clean snapshot worktree.** The
+   orchestrator points you at a `git worktree` checkout of the card's snapshot
+   (HEAD + staged `files[]` only — no untracked file leaks in) and gives you
+   `board.verifyGate` (e.g. `npx tsc --noEmit && <test> && <build>`). Run it **there**
+   and capture the exit code: **non-zero = fail** — an untracked dependency that
+   resolves in the dev tree but is absent from git surfaces here as a build error.
+   This reproduced gate is the trustworthy "green", not your own judgement. Then
+   capture per-test pass/fail and output. (Turbopack `next build` rejects a symlinked
+   `node_modules`; if the gate hits that, run tsc+tests in the worktree and note the
+   build must be run in the real repo — the snapshot already proved no untracked file
+   masks a missing import.)
 2. **Diagnostic trio** — never trust the result alone; cross-check three sources:
    - **Logs** — read the relevant tail of `app.log`.
    - **Code** — map findings to code cheap→expensive: (a) `Grep` for

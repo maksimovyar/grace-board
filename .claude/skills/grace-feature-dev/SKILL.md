@@ -68,6 +68,7 @@ TodoWrite — it is read from / written to this file. Anything else describing
   "column": "implementing",               // current kanban column — the dispatch board mirrors THIS (§2.4)
   "rigor": "grace",                       // grace | light | off  (§3)
   "mode": "inline",                       // inline | hybrid | fanout  (§ command)
+  "verifyGate": "npx tsc --noEmit && npm test && npm run build",  // reproduced strict gate run in the clean snapshot (§2.1, §6); resolved per stack at Decompose
   "gates": { "clarify": "approved", "architecture": "approved" },
   "antiLoop": { "max": 3 },               // §4
 
@@ -125,20 +126,47 @@ backlog → todo → clarifying → implementing → verifying → reviewing →
   once unblocked.
 - A `done` card is **never** re-run.
 
-**Green-checkpoint on `done` (LA4 "вечно зелёный билд" + rollback points):** the moment
-a card's gates go green and it moves to `done`, the orchestrator makes a micro-commit on
-the feature branch `autodev/<slug>`:
+**Clean-snapshot verify + green-checkpoint (the "что уйдёт в git — то и проверяем" invariant):**
+Verify and Review must run against **exactly what will be committed**, not the dirty working
+tree. An untracked file on disk resolves locally but is absent from git, so a build in the
+working tree passes while a clean checkout / CI breaks (this is the whole class of "на диске
+собирается, в git сломано" defects). So before Verify the orchestrator stages the card's
+`files[]` and materializes a **clean snapshot** of exactly that state — nothing untracked
+can leak in — and runs the gates in a detached worktree of it:
 
 ```
-git add <only this card's files[]>      # NEVER `git add .` / `-A` — keep the checkpoint atomic
-git commit -m "green(<cardId>): <short title>"
+git add -- <only this card's files[]>              # stage EXACTLY files[] — never `git add .` / `-A`
+TREE=$(git write-tree)                              # tree = HEAD + staged files[] only
+SNAP=$(git commit-tree "$TREE" -p HEAD -m "verify-snapshot <cardId>")   # detached commit, no branch ref
+git worktree add --detach <wt> "$SNAP"              # checkout: ONLY tracked + staged files exist
+ln -s <repo>/node_modules <wt>/node_modules         # deps (tsc/tests accept the symlink)
+# → Verify (§6) + Review run inside <wt>. An untracked dependency CANNOT mask a missing
+#   import: it isn't in SNAP, so the build fails here exactly as it would in git/CI.
 ```
 
-Rules: commit **only** on a green card — a failed Verify/Review (card back to
-`implementing`, or `blocked` on Anti-Loop) does **not** commit, and the last green
-checkpoint is left untouched so a human can continue from it. These commits are atomic
-rollback points (`git restore --source=<sha> -- <file>`); the single final `push` before
-the feature reaches `ready` goes to the **same** branch and does not replace them.
+Then, **and only then**:
+- **Both green →** the staged index already *is* `files[]`, so commit it to the feature
+  branch `autodev/<slug>` as the atomic checkpoint, and drop the worktree:
+  ```
+  git commit -m "green(<cardId>): <short title>"
+  git worktree remove <wt> --force
+  ```
+- **Any failure →** `git worktree remove <wt> --force` + `git reset -- <files[]>`
+  (unstage; the edits stay in the working tree), card → `implementing`, Anti-Loop++.
+  **Nothing is committed on a red card** — the last green checkpoint is left untouched.
+
+The commit is the **last** step, after Verify+Review — the snapshot is only a *preview*
+of it, materialized so the gates see git-truth instead of the working tree. (A side benefit:
+edits the coder made outside `files[]` are never staged, so contamination can't be committed —
+it just stays as junk in the working tree.) These commits are atomic rollback points
+(`git restore --source=<sha> -- <file>`); the single final `push` before the feature reaches
+`ready` goes to the **same** branch and does not replace them.
+
+> **`next build` / Turbopack gotcha:** Turbopack rejects a symlinked `node_modules`
+> ("symlink points out of filesystem root"). Run `tsc --noEmit` + tests in the worktree
+> (they accept the symlink); if the gate includes a Turbopack build, run that build step in
+> the real repo *after* the snapshot's tsc/tests pass — the snapshot has already proven no
+> untracked file is masking a missing import.
 
 **Who writes transitions:**
 - The **orchestrator is the only writer** during the autonomous loop. It moves
@@ -318,10 +346,15 @@ journal tail to confirm the last in-flight action.
 These govern how the orchestrator spawns the Review/Verify phases — they are part
 of the contract, not left to per-run judgement.
 
-- **Verify** (gfd-verifier, once per card): consumes the card's
-  `test_guide-<cardId>.md` (§2.6), runs the Diagnostic Trio (Logs/Code/Data),
-  performs Semantic Trace Verification, then a Chain-of-Verification self-check
-  before emitting the verdict.
+- **Verify** (gfd-verifier, once per card): runs against the **clean snapshot
+  worktree** (§2.1), never the dirty working tree. Its first gate is the run's
+  **`board.verifyGate`** — a reproduced strict build/test command (e.g.
+  `npx tsc --noEmit && <test-runner> && <build>`), resolved per project stack at
+  Decompose. A **non-zero exit = Verify failure** (card → `implementing`, not
+  `done`): "green" is a reproduced gate, never the agent's self-attestation. Only
+  after the gate passes does it consume the card's `test_guide-<cardId>.md` (§2.6),
+  run the Diagnostic Trio (Logs/Code/Data), perform Semantic Trace Verification, then
+  a Chain-of-Verification self-check before emitting the verdict.
 - **Review** (gfd-reviewer, 1–3 in parallel per card, after tests are green):
   - When `rigor != off` AND `mode != inline`, **one reviewer is always assigned the
     Conventions / GRACE-markup focus** — it is not optional in the focus lottery.

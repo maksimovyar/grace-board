@@ -84,6 +84,10 @@ Skill schema:
 - One **card per slice**: `files[]`, `deps`, `acceptance[]`, `wave`, `rationale`.
 - Enforce the file-disjoint invariant; emit a first `contract-types` card for
   shared types when needed.
+- **Resolve `board.verifyGate`** — the reproduced strict build/test command for this
+  project's stack (inspect `package.json` scripts / build tooling). E.g. Next.js/TS:
+  `npx tsc --noEmit && <test> && next build`. This is what Verify runs in the clean
+  snapshot (Skill §2.1/§6); a non-zero exit fails the card. Store it on `board.json`.
 - All cards start `column: backlog`; set ready cards (deps met) to `todo`.
 - Set `board.phase = "build"`. Append a `decompose` event to `progress.ndjson`.
 - Show the user the initial board (a compact kanban view, see "Board rendering").
@@ -102,27 +106,31 @@ Loop until no card is `todo`/`backlog`-ready or a card is `blocked`:
    - Unless `rigor: off`, write the card's **`test_guide-<cardId>.md`** (Skill §2.6:
      input data · verification queries · expected `[IMP:9-10]` markers) and add it
      to `card.artifacts[]` — it is the coder→verifier contract.
-3. **verifying** — move to `verifying`. Spawn **`gfd-verifier`** (read-only): it
-   loads the card's `test_guide-<cardId>.md` first, then runs tests + Diagnostic
-   Trio + Semantic Trace Verification (LDD trace matches the Data Flow; `[IMP:9]`
-   present when `rigor != off`; else verify behavior/ACs) + a Chain-of-Verification
-   self-check. A missing test_guide when `rigor != off` is itself a failure.
+3. **verifying (against the clean snapshot, not the working tree)** — move to
+   `verifying`. First materialize the snapshot (Skill §2.1): `git add -- <files[]>`,
+   `git write-tree` → `git commit-tree` → `git worktree add --detach <wt> <snap>`,
+   symlink `node_modules`. Spawn **`gfd-verifier`** (read-only) pointed at `<wt>`: it
+   runs `board.verifyGate` first (**non-zero exit = fail** — this is where an untracked
+   dependency that resolves on disk but is absent from git surfaces), then loads the
+   card's `test_guide-<cardId>.md`, runs the Diagnostic Trio + Semantic Trace
+   Verification (`[IMP:9]` when `rigor != off`; else behavior/ACs) + Chain-of-
+   Verification. A missing test_guide when `rigor != off` is itself a failure.
    Returns a Bug Report.
 4. **reviewing** — move to `reviewing`. Spawn **`gfd-reviewer`** ×(1-3 by card
    weight) in parallel (simplicity/DRY · bugs/correctness · conventions). When
    `rigor != off` (and not pure `inline`), **always allocate one reviewer to the
    conventions/GRACE-markup focus** (Skill §6) — markup violations are Critical.
    Only confidence ≥ 80 findings count.
-5. **Resolve**:
-   - Verify+Review green → move card to `done`, record `verdict`, journal it, then
-     **green-checkpoint commit** (LA4 «вечно зелёный билд» + точка отката): on branch
-     `autodev/<slug>`, `git add` **only** the card's `files[]` (never `git add .`/`-A`),
-     then `git commit -m "green(<cardId>): <short title>"`. Commit **only** on a green
-     card; a failed verify/review does **not** commit. See Skill §2.1 for the format.
-   - Failures → move card back to `implementing` and fix. Update the **Anti-Loop**
-     counter by failure **signature** (Skill §4). At `attempts ≥ antiLoop.max`,
-     set card `blocked`, stop the loop, and escalate to the human (the only return
-     to chat during build).
+5. **Resolve** (the commit is the LAST step — only on green, never before Verify):
+   - Verify+Review green → the snapshot index already *is* `files[]`, so commit it to
+     `autodev/<slug>` as the green-checkpoint: `git commit -m "green(<cardId>): <short
+     title>"`, then `git worktree remove <wt> --force`. Move card to `done`, record
+     `verdict`, journal it. See Skill §2.1.
+   - Any failure → `git worktree remove <wt> --force` + `git reset -- <files[]>`
+     (unstage, keep the edits), move card back to `implementing` and fix. **Nothing is
+     committed on a red card.** Update the **Anti-Loop** counter by failure
+     **signature** (Skill §4). At `attempts ≥ antiLoop.max`, set card `blocked`, stop
+     the loop, and escalate to the human (the only return to chat during build).
 6. Re-evaluate `backlog` cards: any whose deps just became `done` → `todo`.
 7. Persist `board.json` after **every** transition; the board is the only state.
    **Board sync (this is what makes the kanban move on its own):** the per-task
