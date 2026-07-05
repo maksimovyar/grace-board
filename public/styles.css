@@ -293,6 +293,9 @@ body{
   border:1px solid var(--line-2);border-radius:9px;padding:7px 11px;cursor:pointer}
 .rail__filter:hover,.rail__filter.is-on{border-color:var(--ink-soft);color:var(--ink)}
 .rail__filter.is-on{background:var(--surface-2)}
+.rail__close{font-family:var(--mono);font-size:12px;color:var(--ink-faint);background:none;border:1px solid var(--line-2);
+  border-radius:9px;width:30px;height:30px;cursor:pointer;flex:none}
+.rail__close:hover{color:var(--s-blocked);border-color:var(--s-blocked);background:rgba(211,63,53,.06)}
 .dag{display:flex;align-items:center;gap:0;flex-wrap:wrap;margin-top:13px;padding-top:12px;border-top:1px dashed var(--line)}
 .dag__node{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;color:var(--ink-soft);
   background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:4px 11px 4px 5px}
