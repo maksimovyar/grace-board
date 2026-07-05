@@ -245,10 +245,13 @@ function hasActiveForProject(board, project, exceptId) {
   return board.cards.some((c) =>
     c.id !== exceptId && c.project === project && c.dispatchedAt && !c.queued && OCCUPYING_COLUMNS.has(c.column));
 }
-// May this card start its run right now? S0: only the per-project slot gate.
-// (S1 extends this with dependsOn readiness + files[] conflict — see FUNC_dagGates.)
+// May this card start its run right now? Three gates (all must pass):
+//   1) the per-project WIP=1 slot is free (S0), 2) every dependsOn card is `ready` (S1),
+//   3) no files[] conflict with an active sibling (S1 — subsumed by WIP=1, forward-compat).
 function canDispatchNow(board, card) {
-  return !hasActiveForProject(board, card.project, card.id);
+  return !hasActiveForProject(board, card.project, card.id)
+    && depsSatisfied(board, card)
+    && !filesConflict(board, card);
 }
 // Actually start the card's run: clear the queued flag, stamp it live, seed + spawn.
 // Shared by the PATCH (lever) path and the tick scheduler so both dispatch identically.
@@ -274,6 +277,41 @@ function scheduleQueued(board) {
   return changed;
 }
 // endregion FUNC_scheduleQueued
+
+// region FUNC_dagGates — dependsOn[] DAG readiness + files[] disjointness (roadmap §5.2)
+// ## @purpose Order stages of a plan by dependency, not just by project slot. A card
+// ##   with dependsOn[] stays queued until EVERY dep card is `ready`; files[] keeps
+// ##   file-overlapping stages strictly one-after-another (already true under WIP=1, so
+// ##   this is a forward-compat guard for a future parallel/fanout mode, never the
+// ##   deciding gate today — logged as such, no silent cap).
+// ## @invariants
+// ## - No dependsOn (single card, planId:null) → depsSatisfied is TRUE → immediate (backward-compat).
+// ## - A missing/deleted dep id is treated as UNSATISFIED (safe: the card waits, the chip shows it),
+// ##   never silently skipped — a broken DAG edge must be visible, not auto-passed.
+// GREP_SUMMARY: dependsOn, DAG, files disjoint, depsSatisfied, filesConflict, wave ordering
+
+// Every dependsOn card must be `ready` (TERMINAL). Empty deps → trivially satisfied.
+function depsSatisfied(board, card) {
+  const deps = Array.isArray(card.dependsOn) ? card.dependsOn : [];
+  if (!deps.length) return true;
+  return deps.every((depId) => {
+    const dep = board.cards.find((c) => c.id === depId);
+    return dep && dep.column === TERMINAL;
+  });
+}
+// Does this card share a file with an active sibling of the SAME project? Under WIP=1
+// there is at most one active card per project, so canDispatchNow's slot gate already
+// blocks any overlap — this can only fire in a future >1-per-project mode. Kept explicit
+// so the files[] contract is enforced by code, not by assumption.
+function filesConflict(board, card) {
+  const files = Array.isArray(card.files) ? card.files : [];
+  if (!files.length) return false;
+  const mine = new Set(files);
+  return board.cards.some((c) =>
+    c.id !== card.id && c.project === card.project && c.dispatchedAt && !c.queued &&
+    OCCUPYING_COLUMNS.has(c.column) && Array.isArray(c.files) && c.files.some((f) => mine.has(f)));
+}
+// endregion FUNC_dagGates
 
 // ── dispatch: write a grace-feature-dev-compatible seed into the project ─────
 function dispatch(card) {
@@ -757,10 +795,13 @@ async function handleApi(req, res, urlPath) {
       requirements: String(b.requirements || "").trim() || null,
       attachments: [],
       rigor: RIGORS.includes(b.rigor) ? b.rigor : "off",
-      // Plan Run scaffold (additive; null = single card = today's behaviour, §1).
+      // Plan Run scaffold (additive; null/[] = single card = today's behaviour, §1).
       // The integration branch / final-PR mechanics land with the Plan entity (S4);
-      // here the field is just carried so a card can belong to a plan.
+      // here the fields are just carried so a card can belong to a plan and declare its
+      // dependency edges + write-footprint. Empty → no DAG gating → immediate dispatch.
       planId: (typeof b.planId === "string" && b.planId.trim()) ? b.planId.trim() : null,
+      dependsOn: Array.isArray(b.dependsOn) ? b.dependsOn.filter((x) => typeof x === "string") : [],
+      files: Array.isArray(b.files) ? b.files.filter((x) => typeof x === "string") : [],
       column: "backlog",
       createdAt: new Date().toISOString(),
       dispatchedAt: null,
