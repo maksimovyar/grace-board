@@ -101,6 +101,8 @@ body{
 .tag:hover{border-color:var(--ink-soft);color:var(--ink)}
 /* queue / dependency chips (Plan Run §5.1/§5.2) — reuse .tag, distinct tone */
 .tag--queue{border-color:rgba(47,115,194,.4);background:rgba(47,115,194,.08);color:#255a97}
+.tag--wait{border-color:rgba(201,138,18,.45);background:rgba(201,138,18,.10);color:#8a5e08}
+.tag--files{border-color:var(--line-2)}
 .card__ask{display:flex;align-items:center;gap:8px;margin-top:9px;font-family:var(--mono);font-size:11.5px;color:#3a2706;font-weight:700;
   background:var(--amber);border-radius:var(--radius-sm);padding:8px 11px;cursor:pointer}
 .card__ask .dot{width:7px;height:7px;border-radius:50%;background:#3a2706;animation:blip 1.3s ease-in-out infinite}
