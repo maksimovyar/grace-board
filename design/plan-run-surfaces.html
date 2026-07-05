@@ -19,6 +19,23 @@
     .mock-row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
     .mock-col{flex:0 0 300px}
 
+    /* кнопка запуска ПРОГОНА в шапке — точка входа Plan Run (S4), тон плана (verifying) */
+    .btn--run{color:#fff;background:var(--s-verifying);display:inline-flex;align-items:center;gap:7px}
+    .btn--run:hover{filter:brightness(1.07);transform:translateY(-1px)}
+
+    /* поток «цель → этапы → To do» (S4) */
+    .flow{display:flex;gap:14px;flex-wrap:wrap;align-items:stretch;margin-top:6px}
+    .flow-step{flex:1 1 320px;min-width:300px;display:flex;flex-direction:column;gap:8px}
+    .flow-step__cap{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-faint)}
+    .flow-step__n{width:20px;height:20px;border-radius:50%;display:grid;place-items:center;font-weight:700;color:#fff;background:var(--s-verifying);flex:none}
+    .flow-arrow{align-self:center;color:var(--line-2);font-size:20px;flex:none}
+    .runform{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:14px 15px;display:flex;flex-direction:column;gap:11px;flex:1}
+    .runform__k{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-soft)}
+    .runform__in{font-family:var(--sans);font-size:13.5px;color:var(--ink);background:var(--surface-2);border:1px solid var(--line-2);border-radius:9px;padding:9px 11px;width:100%;resize:vertical}
+    .tolist{display:flex;flex-direction:column;gap:8px}
+    .tolist__col{background:var(--well);border:1px solid var(--line);border-radius:var(--radius);padding:8px;flex:1}
+    .tolist__head{display:flex;align-items:center;gap:8px;font-family:var(--display);font-weight:600;font-size:13px;padding:2px 4px 8px}
+
     /* AUTO-тумблер в шапке (реюз .seg) — глоб. дефолт autonomy (S3) */
     .auto-seg{display:inline-flex;align-items:center;gap:9px}
     .auto-seg__label{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-soft)}
@@ -94,6 +111,7 @@
       <button type="button" class="seg__opt" data-auto="auto">Auto</button>
     </div>
   </div>
+  <button class="btn btn--run" type="button">⚡ Прогон</button>
   <button class="btn btn--solid" type="button">+ Новая задача</button>
 </header>
 
@@ -182,18 +200,72 @@
     </div>
   </section>
 
-  <!-- ── 3. черновик плана (редактируемый) ── -->
+  <!-- ── 3. ПРОГОН: от кнопки в шапке к этапам в To do ── -->
   <section class="mock-sec">
-    <h2 class="mock-sec__h">3 · Черновик плана<span class="mock-sec__tag">S4</span></h2>
-    <p class="mock-sec__note">Декомпозиция одной цели в этапы. Человек правит порядок/зависимости до утверждения.</p>
-    <div class="plandraft mock-col" style="flex-basis:520px">
-      <div class="result__k" style="margin-bottom:6px">Цель: движок Plan Run (оба режима)</div>
-      <div class="stagerow"><span class="stagerow__grip">⣿</span><span class="stagerow__id">SD</span><span class="stagerow__t">Дизайн новых поверхностей</span><span class="stagerow__dep">deps: —</span><button class="stagerow__x">✕</button></div>
-      <div class="stagerow"><span class="stagerow__grip">⣿</span><span class="stagerow__id">S0</span><span class="stagerow__t">Очередь WIP=1 + фикс cwd</span><span class="stagerow__dep">deps: SA</span><button class="stagerow__x">✕</button></div>
-      <div class="stagerow"><span class="stagerow__grip">⣿</span><span class="stagerow__id">S1</span><span class="stagerow__t">dependsOn + DAG-шедулер</span><span class="stagerow__dep">deps: S0</span><button class="stagerow__x">✕</button></div>
-      <div class="stagerow"><span class="stagerow__grip">⣿</span><span class="stagerow__id">SR</span><span class="stagerow__t">Результат + манифест релиза</span><span class="stagerow__dep">deps: S1</span><button class="stagerow__x">✕</button></div>
-      <button class="plandraft__add">+ добавить этап</button>
-      <div class="plandraft__foot"><button class="btn btn--ghost" type="button">Пересобрать</button><button class="btn btn--solid" type="button">Утвердить план →</button></div>
+    <h2 class="mock-sec__h">3 · Прогон — от цели к этапам<span class="mock-sec__tag">S4</span></h2>
+    <p class="mock-sec__note">
+      Точка входа — кнопка <b>«⚡ Прогон»</b> в шапке (рядом с «+ Новая задача»). Это НЕ одиночная
+      задача: одна цель → декомпозиция в список этапов → человек правит порядок/зависимости →
+      карточки этапов уезжают в To do и едут по DAG (§5.2). Три шага:
+    </p>
+    <div class="flow">
+      <!-- шаг 1 — композер прогона (одна цель) -->
+      <div class="flow-step">
+        <div class="flow-step__cap"><span class="flow-step__n">1</span>Новый прогон · одна цель</div>
+        <div class="runform">
+          <div class="runform__k">Проект</div>
+          <input class="runform__in" value="grace-board" readonly />
+          <div class="runform__k">Цель прогона</div>
+          <textarea class="runform__in" rows="3" readonly>Движок Plan Run: очередь, зависимости, манифест релиза, AUTO с полом — в обоих режимах (одиночная карточка + прогон).</textarea>
+          <div class="runform__k">Режим</div>
+          <div class="seg"><button type="button" class="seg__opt is-on" data-auto="ask">Ask</button><button type="button" class="seg__opt" data-auto="auto">Auto</button></div>
+          <button class="btn btn--run" type="button" style="justify-content:center;margin-top:2px">Разложить на этапы →</button>
+        </div>
+      </div>
+
+      <div class="flow-arrow">→</div>
+
+      <!-- шаг 2 — черновик списка этапов (редактируемый) -->
+      <div class="flow-step">
+        <div class="flow-step__cap"><span class="flow-step__n">2</span>Черновик · правь до утверждения</div>
+        <div class="plandraft" style="flex:1">
+          <div class="result__k" style="margin-bottom:6px">Предложено агентом · 6 этапов</div>
+          <div class="stagerow"><span class="stagerow__grip">⣿</span><span class="stagerow__id">SD</span><span class="stagerow__t">Дизайн новых поверхностей</span><span class="stagerow__dep">deps: —</span><button class="stagerow__x">✕</button></div>
+          <div class="stagerow"><span class="stagerow__grip">⣿</span><span class="stagerow__id">S0</span><span class="stagerow__t">Очередь WIP=1 + фикс cwd</span><span class="stagerow__dep">deps: SD</span><button class="stagerow__x">✕</button></div>
+          <div class="stagerow"><span class="stagerow__grip">⣿</span><span class="stagerow__id">S1</span><span class="stagerow__t">dependsOn + DAG-шедулер</span><span class="stagerow__dep">deps: S0</span><button class="stagerow__x">✕</button></div>
+          <div class="stagerow"><span class="stagerow__grip">⣿</span><span class="stagerow__id">SR</span><span class="stagerow__t">Результат + манифест релиза</span><span class="stagerow__dep">deps: S1</span><button class="stagerow__x">✕</button></div>
+          <div class="stagerow"><span class="stagerow__grip">⣿</span><span class="stagerow__id">S3</span><span class="stagerow__t">Режим AUTO + жёсткий пол</span><span class="stagerow__dep">deps: SR</span><button class="stagerow__x">✕</button></div>
+          <button class="plandraft__add">+ добавить этап</button>
+          <div class="plandraft__foot"><button class="btn btn--ghost" type="button">Пересобрать</button><button class="btn btn--run" type="button">Утвердить и запустить →</button></div>
+        </div>
+      </div>
+
+      <div class="flow-arrow">→</div>
+
+      <!-- шаг 3 — этапы уехали в To do, поехали по DAG -->
+      <div class="flow-step">
+        <div class="flow-step__cap"><span class="flow-step__n">3</span>Карточки едут в To do</div>
+        <div class="tolist">
+          <div class="tolist__col">
+            <div class="tolist__head"><span class="station__lamp" style="color:var(--s-todo)"></span>To do</div>
+            <article class="card" data-col="todo" style="margin-bottom:8px">
+              <div class="card__body">
+                <div class="card__meta"><span class="card__lamp" style="color:var(--s-todo)"></span><span class="card__project">grace-board</span><span class="card__crew">в очереди</span></div>
+                <h3 class="card__theme">S0 · Очередь WIP=1</h3>
+                <div class="card__tags"><span class="tag tag--wait">🔒 ждёт: SD · дизайн</span><span class="tag tag--files">⎘ 3</span></div>
+              </div>
+            </article>
+            <article class="card" data-col="todo" style="margin-bottom:0">
+              <div class="card__body">
+                <div class="card__meta"><span class="card__lamp" style="color:var(--s-todo)"></span><span class="card__project">grace-board</span><span class="card__crew">в очереди</span></div>
+                <h3 class="card__theme">S1 · dependsOn + шедулер</h3>
+                <div class="card__tags"><span class="tag tag--wait">🔒 ждёт: S0</span><span class="tag tag--files">⎘ 3</span></div>
+              </div>
+            </article>
+          </div>
+          <p class="mock-sec__note" style="margin:2px 0 0">SD пойдёт первым (deps: —), остальные ждут по цепочке. Один прогон = одна интеграционная ветка <code>autodev/plan-run</code> → один PR.</p>
+        </div>
+      </div>
     </div>
   </section>
 
