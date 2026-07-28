@@ -48,8 +48,17 @@ function stripHTML() {
   return FLOW.map((col) => `<span class="strip__cell"><span class="strip__lamp" style="color:${lampColor(col)}"></span>${esc(STATIONS[col].name)} <span class="strip__n">${count(col)}</span></span>`).join("");
 }
 
+// S3 §4.2: who wrote this card decides how strictly the board checks it. `human` is the
+// default and needs no badge — it is the normal case on a live board.
+const ORIGIN_BADGE = { skill: ["◇ скилл", "заведена скиллом graceboard-plan — доска требует полную постановку"],
+  agent: ["◆ агент", "заведена агентом — доска требует полную постановку"],
+  deferred: ["↳ хвост", "отложено из другой карточки — поля унаследованы"] };
 function cardTags(card) {
   const t = [];
+  // S3: draft (an unreviewed tail) never dispatches — say so where the card is, not in a 409.
+  if (card.draft) t.push(`<span class="tag tag--draft" title="черновик: не уедет в работу, пока человек не снимет пометку">✎ черновик</span>`);
+  const ob = ORIGIN_BADGE[card.origin];
+  if (ob) t.push(`<span class="tag tag--origin" title="${esc(ob[1])}">${esc(ob[0])}</span>`);
   // S4: plan stage badge «этап N/M» — most salient for a plan card, shown first.
   const plan = planOfCard(card);
   if (plan) { const s = stageOf(card, plan); t.push(`<span class="tag tag--stage" title="этап прогона">этап ${s.n}/${s.m}</span>`); }
@@ -370,6 +379,25 @@ function linksHTML(card) {
   const rl = card.requirementsLink && safeUrl(card.requirementsLink); if (rl) l.push(`<a class="tag" href="${esc(rl)}" target="_blank" rel="noopener">▤ требования</a>`);
   return l.length ? `<div class="dt__links">${l.join("")}</div>` : "";
 }
+// S3 §4.1 — the statement of work, as the run receives it. Rendered in the same order as the
+// prompt block so «что видит человек» and «что видит агент» stay the same document.
+function briefHTML(card) {
+  const rows = [];
+  const list = (v) => `<ul class="brief__items">${v.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`;
+  if (card.outOfScope) rows.push(`<div class="brief__sec"><div class="brief__label">Не входит в объём</div><div class="brief__body">${esc(card.outOfScope)}</div></div>`);
+  if ((card.acceptance || []).length) rows.push(`<div class="brief__sec"><div class="brief__label">Приёмка</div>${list(card.acceptance)}</div>`);
+  if (card.contract) {
+    const tbd = /^tbd$/i.test(card.contract.trim());
+    const done = card.result && card.result.contract;
+    rows.push(`<div class="brief__sec"><div class="brief__label">Контракт данных</div><div class="brief__body">${
+      tbd ? `<span class="brief__tbd">TBD — проектируется в этой карточке</span>` + (done ? `<div class="brief__done">спроектирован:</div><div>${esc(done)}</div>` : "") : esc(card.contract)}</div></div>`);
+  }
+  if ((card.sources || []).length) rows.push(`<div class="brief__sec"><div class="brief__label">Источники</div>${list(card.sources)}</div>`);
+  if ((card.inheritedContracts || []).length) rows.push(`<div class="brief__sec"><div class="brief__label">Контракт от предыдущих этапов</div>${
+    card.inheritedContracts.map((x) => `<div class="brief__body"><b>${esc(x.theme || x.from)}</b><div>${esc(x.contract)}</div></div>`).join("")}</div>`);
+  if (!rows.length) return "";
+  return `<div><div class="dt__label">Постановка</div><div class="brief">${rows.join("")}</div></div>`;
+}
 function attViewHTML(card) {
   if (!(card.attachments || []).length) return "";
   const items = card.attachments.map((a) => {
@@ -386,13 +414,21 @@ function openDetail(id) {
   closeAll(); openDetailId = id;
   const editable = card.column === "backlog" && !card.dispatchedAt;
   const note = editable ? `<div class="dt__note">Вопросы появятся, когда задача дойдёт до <b>Asking</b> — сначала по функционалу, затем по архитектуре.</div>` : "";
+  // S3 §4.2: an unreviewed tail is held here, with the one action that releases it.
+  const draftNote = card.draft
+    ? `<div class="dt__draft">✎ <b>Черновик.</b> Заведена автоматически как отложенное из другой карточки: поля унаследованы, объём не проверен.
+         В работу не уедет, пока ты не снимешь пометку.<button class="btn btn--ghost" type="button" data-undraft>Снять черновик</button></div>`
+    : "";
+  const ob = ORIGIN_BADGE[card.origin];
   document.getElementById("detailPanel").innerHTML = `
     <div class="sheet__head">
-      <div class="dt__badges">${badge(card.column)}<span class="badge">${esc(card.project)}</span></div>
+      <div class="dt__badges">${badge(card.column)}<span class="badge">${esc(card.project)}</span>${ob ? `<span class="badge" title="${esc(ob[1])}">${esc(ob[0])}</span>` : ""}</div>
       <button class="sheet__close" type="button" data-close aria-label="Закрыть">✕</button>
     </div>
     <h2 class="dt__theme">${esc(card.theme || "—")}</h2>
+    ${draftNote}
     <div><div class="dt__label">Описание</div><p class="dt__desc">${esc(card.description || "Описание не задано.")}</p></div>
+    ${briefHTML(card)}
     ${linksHTML(card)}
     ${attViewHTML(card)}
     ${card.column === "blocked" && card.blockReason ? `<div class="card__blocked">⚠ ${esc(card.blockReason)}</div>` : ""}
@@ -406,6 +442,15 @@ function openDetail(id) {
   panel.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", closeAll));
   panel.querySelector("[data-del-detail]").addEventListener("click", () => { if (confirm("Удалить задачу?")) api(`/api/tasks/${id}`, { method: "DELETE" }).then(() => { state.cards = state.cards.filter((c) => c.id !== id); closeAll(); render(); }); });
   const edit = panel.querySelector("[data-edit]"); if (edit) edit.addEventListener("click", () => openComposer(card));
+  const undraft = panel.querySelector("[data-undraft]");
+  if (undraft) undraft.addEventListener("click", async () => {
+    try {
+      const r = await api(`/api/tasks/${id}`, { method: "PATCH", body: JSON.stringify({ draft: false }) });
+      Object.assign(cardById(id) || {}, r.card);
+      toast(r.blocked ? `Черновик снят, но ${esc(r.blocked.error)}` : "Черновик снят — карточку можно запускать");
+      openDetail(id); render();
+    } catch (err) { toast("Не удалось: " + err.message); }
+  });
   sheets.detail.hidden = false;
 }
 
@@ -525,6 +570,11 @@ function openComposer(card) {
   form.description.value = card ? (card.description || "") : "";
   form.designLink.value = card ? (card.designLink || "") : "";
   form.requirementsLink.value = card ? (card.requirementsLink || "") : "";
+  // S3 §4.1 — statement of work. Lists are edited as one-per-line text.
+  form.outOfScope.value = card ? (card.outOfScope || "") : "";
+  form.contract.value = card ? (card.contract || "") : "";
+  form.acceptance.value = card ? (card.acceptance || []).join("\n") : "";
+  form.sources.value = card ? (card.sources || []).join("\n") : "";
   document.getElementById("cnt").textContent = form.description.value.length;
   rigorVal = card ? (card.rigor === "grace" ? "grace" : "off") : "grace";
   setRigor(rigorVal);
@@ -578,7 +628,9 @@ async function removeAtt(ref) {
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const payload = { project: form.project.value.trim(), theme: form.theme.value.trim(), description: form.description.value.trim(), designLink: form.designLink.value.trim(), requirementsLink: form.requirementsLink.value.trim(), rigor: rigorVal };
+  const payload = { project: form.project.value.trim(), theme: form.theme.value.trim(), description: form.description.value.trim(), designLink: form.designLink.value.trim(), requirementsLink: form.requirementsLink.value.trim(), rigor: rigorVal,
+    outOfScope: form.outOfScope.value.trim(), contract: form.contract.value.trim(),
+    acceptance: form.acceptance.value, sources: form.sources.value };
   const btn = document.getElementById("composerSubmit"); btn.disabled = true;
   try {
     if (editId) {
