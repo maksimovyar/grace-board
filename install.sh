@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 #
-# Install the bundled extensions (the /grace-feature-dev command, the gfd-* agents,
-# and the grace-feature-dev skill) into your user-level Claude Code config so the
-# board's headless runs can find them.
+# Install the bundled extensions into your user-level Claude Code config so the
+# board's headless runs — and your own sessions — can find them:
+#   commands/  /grace-feature-dev
+#   agents/    the gfd-* build agents + board-warden (the board's warden, README)
+#   skills/    grace-feature-dev · graceboard-plan / -card / -run (compose tasks and runs)
+#   bin/       gb.mjs — the helper CLI those three skills call
 #
 # WHY this is needed: grace-board launches `claude -p "/grace-feature-dev …"` inside
 # the *target project's* directory, not inside grace-board — so Claude Code resolves
@@ -30,7 +33,7 @@ link() {
 }
 
 echo "Installing GRACE extensions into: $DEST"
-for kind in commands agents skills; do
+for kind in commands agents skills bin; do
   [ -d "$SRC/$kind" ] || continue
   for item in "$SRC/$kind"/*; do
     [ -e "$item" ] || continue
