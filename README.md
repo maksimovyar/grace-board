@@ -266,6 +266,35 @@ is missing the composed PR body stays on disk and its path is reported, never sw
 All board state lives in `data/board.json` (single source of truth, git-ignored).
 Deleting it resets the board.
 
+## Upgrading — wipe the old tasks first
+
+This version added a **statement of work per card** (`origin`, `outOfScope`,
+`acceptance`, `contract`, `sources`) and an **automatic closing phase per run**
+(acceptance → PR → policy). Data written by an older version predates both: its cards
+carry no `origin`, its runs carry no `policy`.
+
+Nothing breaks if you keep it — an old card reads as `origin: human` (no checks at all)
+and an old run is deliberately skipped by the closing phase. But the new automation is
+meant to start on a clean board, so **before working with this version, wipe the old
+tasks and runs — including the finished ones**:
+
+```bash
+pkill -f "node server.js"                       # stop the board first
+cp data/board.json data/board.json.bak.pre-wipe # backups are the only undo
+mv data/dispatch-log.ndjson data/dispatch-log.ndjson.bak.pre-wipe
+node -e 'const f="data/board.json",fs=require("fs"),b=JSON.parse(fs.readFileSync(f,"utf8"));
+         b.cards=[];b.plans=[];fs.writeFileSync(f,JSON.stringify(b,null,2))'
+rm -rf data/uploads/*
+npm start
+```
+
+Board-level settings (`autonomy`, the warden hook) survive the snippet above — only tasks
+and runs are removed. The run artefacts inside your projects (`<project>/.grace-feature-dev/`)
+are **not** touched: they are the trail of past runs, delete them yourself if you want to.
+
+On the first boot after the upgrade the server prints exactly this reminder if it finds
+old data, and stops mentioning it once the board is clean.
+
 ## License
 
 [MIT](LICENSE) © maksimovyar

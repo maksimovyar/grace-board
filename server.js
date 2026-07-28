@@ -2513,9 +2513,43 @@ const server = http.createServer((req, res) => {
   return serveStatic(res, urlPath);
 });
 
+// region FUNC_legacyNotice — say it AT UPGRADE TIME, not in a README nobody re-reads
+// ## @purpose This version added a statement of work per card (§4) and an automatic closing
+// ##   phase per run (§5). Data written by an older version predates both: cards carry no
+// ##   `origin`, runs carry no `policy`. Nothing breaks — an old card reads as `origin: human`
+// ##   (no checks at all) and an old run is skipped by the closing phase on purpose — but a
+// ##   board still holding dozens of finished cards and runs starts the new automation on top
+// ##   of a history that was never meant for it. Cheapest honest fix: the server SAYS SO on the
+// ##   first boot after the upgrade, with the exact commands, and never nags again once clean.
+// ## @invariants Read-only: it looks at board.json and prints. It never deletes anything —
+// ##   wiping a board is the human's decision, and it is irreversible without the backup.
+function legacyDataNotice() {
+  let b;
+  try { b = JSON.parse(fs.readFileSync(BOARD_FILE, "utf8")); } catch { return; }
+  const cards = (b.cards || []).filter((c) => !c.origin);
+  const plans = (b.plans || []).filter((p) => !p.policy);
+  if (!cards.length && !plans.length) return;
+  const done = cards.filter((c) => c.column === TERMINAL).length;
+  console.log("");
+  console.log("⚠  На доске есть данные, созданные ПРЕДЫДУЩЕЙ версией:");
+  console.log(`   карточек без постановки (origin): ${cards.length}${done ? ` (из них выполненных: ${done})` : ""}`);
+  console.log(`   прогонов без политики релиза: ${plans.length}`);
+  console.log("   Работать они будут: старая карточка читается как origin=human (проверок нет),");
+  console.log("   старый прогон фаза закрытия НЕ трогает. Но новая автоматика — постановка,");
+  console.log("   страж, авто-закрытие — рассчитана на чистую доску.");
+  console.log("   РЕКОМЕНДУЕТСЯ очистить доску перед работой (сначала бэкап!):");
+  console.log("     cp data/board.json data/board.json.bak.pre-wipe");
+  console.log("     node -e 'const f=\"data/board.json\",fs=require(\"fs\"),b=JSON.parse(fs.readFileSync(f,\"utf8\"));" +
+              "b.cards=[];b.plans=[];fs.writeFileSync(f,JSON.stringify(b,null,2))'");
+  console.log("   Подробнее: README → «Upgrading».");
+  console.log("");
+}
+// endregion FUNC_legacyNotice
+
 ensureData();
 server.listen(PORT, HOST, () => {
   console.log(`grace-board → http://${HOST}:${PORT}`);
   console.log(`projects root: ${PROJECTS_ROOT}  (override with GRACE_PROJECTS_ROOT)`);
+  legacyDataNotice();
   setInterval(syncFromPipeline, 2000); // mirror pipeline phase onto the board
 });
