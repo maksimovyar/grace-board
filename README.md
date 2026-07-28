@@ -17,12 +17,19 @@ Zero dependencies, no build step — plain Node ≥ 18, bound to `127.0.0.1` (lo
 | `.claude/commands/grace-feature-dev.md` | the `/grace-feature-dev` slash command |
 | `.claude/agents/gfd-*.md` | the pipeline's sub-agents (architect, coder, explorer, reviewer, verifier) |
 | `.claude/skills/grace-feature-dev` | the pipeline skill — board lifecycle, build phases, GRACE markup, anti-loop |
-| `install.sh` | links the command/agents/skill into your `~/.claude` |
+| `.claude/skills/graceboard-plan` | turns worked-out requirements into a run: stages, cards, source conflicts, the approval gate |
+| `.claude/skills/graceboard-card` \| `-run` | the mechanics — compose one card · assemble a run (DAG, branch, policy) |
+| `.claude/agents/board-warden.md` | the warden the board calls when a card stops (classifier + allowed actions) |
+| `.claude/bin/gb.mjs` | the helper CLI those three skills talk to the board through |
+| `install.sh` | links the commands/agents/skills/bin into your `~/.claude` |
 
 > The board is a **dispatcher**: it spawns `claude -p "/grace-feature-dev …"` runs
 > inside your *target* project. Those runs resolve the command, agents and skills from
 > your **user-level** Claude config (`~/.claude`) — not from this repo. That's why the
 > extensions are bundled here **and** installed into `~/.claude` by `install.sh`.
+> `install.sh` **symlinks**, so this repo stays the single source: edit a skill here (or
+> `git pull`) and your `~/.claude` has it. A pre-existing regular file is never clobbered —
+> it is reported as skipped, and you move it aside yourself if you want the bundled copy.
 
 ## Why GRACE — the method behind the board
 
