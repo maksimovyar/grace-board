@@ -124,6 +124,7 @@ over it. See [`.env.example`](.env.example).
 | `GRACE_WARDEN_TIMEOUT_MIN` | `10` | how long a deferred block waits for the warden's answer |
 | `GRACE_WARDEN_BUDGET` | `5` | warden interventions per card per 24 h |
 | `GRACE_WARDEN_CMD` | — | zero-config warden hook (same as registering `{kind:"command"}`) |
+| `GRACE_GH_BIN` | `gh` | GitHub CLI used to open/merge the final PR of a run |
 
 ## Stations (= the grace-feature-dev build phases)
 
@@ -226,6 +227,39 @@ blocks exactly as it did before.
 > **every dispatch runs unattended code**. The server only accepts mutating requests
 > from its own loopback origin (CSRF guard) and confines every task's project to
 > `GRACE_PROJECTS_ROOT`. Disable auto-launch with `GRACE_AUTORUN=0` to launch by hand.
+
+### Closing a run — manifest → acceptance → PR → policy
+
+Six plans out of six once ended with `status: "running"`, `result: null`, four archived
+by hand: the result of a run evaporated. Closing is now an **automatic phase** that
+starts by itself when every stage reaches `ready`:
+
+1. `plan.status: running → verifying`;
+2. the stages' `deploy{}` blocks are merged into `plan.result.releaseManifest`
+   (per-section rules, migration order preserved);
+3. **acceptance** — one run on a *clean worktree* of the integration branch: the
+   deterministic part (`typecheck`/`test`/`build` from `.grace/project.md`), then the
+   functional scenarios assembled from the `acceptance` of **every** stage plus the
+   manifest's `manualChecks`, with evidence. A malformed or missing report is a **red**
+   acceptance — "passed" is earned, never defaulted;
+4. **a PR, always** — body assembled by the board: goal · stages · release manifest ·
+   acceptance with evidence · decisions taken without a human · **the list of tails** ·
+   open risks. It is the single human-readable trace of a run;
+5. branching by policy, set at the run's input (`gb run --pr … --merge … --deploy …`,
+   defaults from `.grace/project.md → deploy_policy`, then `always/manual/off`):
+
+| acceptance | `merge` | `deploy` | what happens |
+|---|---|---|---|
+| red | any | any | PR → draft, `failed`, one notice. **No deploy, ever** |
+| green | `manual` | — | "ready to merge" + the PR link. **Your one button** |
+| green | `auto` | `off` | merged, no deploy |
+| green | `auto` | `after-merge` | merged → deploy (`stand.deploy_cmd` from `.grace/local.md`) |
+| green | `auto` | `ask` | merged, the deploy waits for you |
+
+`stand.is_production: true` demotes any deploy policy to "waits for a human",
+**regardless of autonomy** — the mechanical floor sits before the policy, not after it.
+`gh` and the deploy command run as plain child processes (no model, no tokens); if `gh`
+is missing the composed PR body stays on disk and its path is reported, never swallowed.
 
 ## Storage
 

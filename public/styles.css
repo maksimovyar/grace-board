@@ -309,6 +309,21 @@ body{
   border:1px solid var(--line);border-radius:6px;padding:3px 9px;display:inline-flex;align-items:center;gap:5px;text-decoration:none}
 .rail__chip--branch{color:var(--s-todo);border-color:rgba(47,115,194,.35);background:rgba(47,115,194,.06)}
 .rail__chip--auto{color:#6a3fc0;border-color:rgba(139,83,224,.4);background:rgba(139,83,224,.08)}
+/* S5 · closing phase on the rail (§5.2–5.5): acceptance verdict · PR · deploy · tails */
+.close{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px dashed var(--line-2)}
+.close__state{font-family:var(--display);font-weight:700;font-size:12px;padding:3px 10px;border-radius:7px}
+.close__state--verifying{color:#6a3fc0;background:rgba(139,83,224,.10)}
+.close__state--done{color:#1f7a42;background:rgba(46,158,80,.10)}
+.close__state--failed{color:#a8362e;background:rgba(211,63,53,.10)}
+.close__step{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+.close__chip{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
+  border:1px solid var(--line);border-radius:6px;padding:3px 9px;text-decoration:none}
+.close__chip--ok{color:#1f7a42;border-color:rgba(46,158,80,.4);background:rgba(46,158,80,.07)}
+.close__chip--bad{color:#a8362e;border-color:rgba(211,63,53,.45);background:rgba(211,63,53,.07)}
+.close__note{flex-basis:100%;font-size:12.5px;line-height:1.5;color:var(--ink-soft)}
+.close__note--error{color:#a8362e}
+.close__note--warn{color:#8a5e08}
+.close__note--ok{color:#1f7a42}
 .rail__actions{display:flex;align-items:center;gap:8px;margin-top:2px}
 .rail__pr{font-family:var(--display);font-weight:600;font-size:12.5px;color:#fff;background:var(--s-verifying);
   border:none;border-radius:9px;padding:8px 13px;cursor:pointer;white-space:nowrap}

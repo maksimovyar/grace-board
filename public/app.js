@@ -265,6 +265,7 @@ function railHTML(plan) {
     return `${i ? '<span class="dag__arrow">→</span>' : ""}<span class="dag__node dag__node--${cls}" title="${esc(c.theme || "")}"><span class="dag__dot">${dot}</span>S${i + 1}</span>`;
   }).join("");
   const filterOn = planFilter === plan.id;
+  const pol = plan.policy || {};
   return `<section class="rail" data-plan-rail="${esc(plan.id)}">
     <div class="rail__top">
       <span class="rail__badge">⚡ прогон</span>
@@ -275,6 +276,7 @@ function railHTML(plan) {
           <span class="rail__chip rail__chip--auto">режим: ${plan.mode === "auto" ? "Auto" : "Ask"}</span>
           <span class="rail__chip">🧩 ${total} этап.</span>
           <span class="rail__chip">🤖 авто-решений: ${autoN}</span>
+          ${pol.pr ? `<span class="rail__chip" title="политика релиза (§5.1)">pr:${esc(pol.pr)} · merge:${esc(pol.merge)} · deploy:${esc(pol.deploy)}</span>` : ""}
         </div>
       </div>
       <div class="rail__actions">
@@ -284,7 +286,26 @@ function railHTML(plan) {
       </div>
     </div>
     <div class="dag">${nodes}<span class="dag__count">${done} / ${total} · строго последовательно (WIP=1)</span></div>
+    ${closeHTML(plan)}
   </section>`;
+}
+// S5 §5.2–5.5: the closing phase, in the human's words. Before it starts this is empty and the
+// rail looks exactly as it did in S4.
+const CLOSE_STEP_RU = { acceptance: "идёт приёмка прогона", pr: "собираю PR", "pr-wait": "создаю PR",
+  "post-pr": "разбираю результат", "merge-wait": "мержу", deploy: "деплой", "deploy-wait": "деплой идёт",
+  "awaiting-merge": "ждёт твоей кнопки «мерж»", "awaiting-deploy": "деплой ждёт человека", closed: "закрыт" };
+function closeHTML(plan) {
+  if (!plan.closeStatus) return "";
+  const r = plan.result || {}, a = r.acceptance, pr = r.pr, note = r.notice;
+  const bits = [];
+  bits.push(`<span class="close__state close__state--${esc(plan.closeStatus)}">${plan.closeStatus === "verifying" ? "⏳ закрытие" : plan.closeStatus === "done" ? "✓ закрыт" : "✕ провален"}</span>`);
+  bits.push(`<span class="close__step">${esc(CLOSE_STEP_RU[plan.closeStep] || plan.closeStep || "")}</span>`);
+  if (a) bits.push(`<span class="close__chip close__chip--${a.passed ? "ok" : "bad"}" title="${esc((a.checks || []).map((c) => `${c.status}: ${c.title}`).join("\n"))}">приёмка: ${a.passed ? "зелёная" : "красная"} · ${(a.checks || []).filter((c) => c.status === "pass").length}/${(a.checks || []).length}</span>`);
+  if (pr && pr.url) bits.push(`<a class="close__chip" href="${esc(safeUrl(pr.url) || "#")}" target="_blank" rel="noopener">PR${pr.draft ? " (draft)" : ""} →</a>`);
+  else if (pr && pr.error) bits.push(`<span class="close__chip close__chip--bad" title="${esc(pr.error)}">PR не создан</span>`);
+  if (r.deploy) bits.push(`<span class="close__chip${r.deploy.status === "failed" ? " close__chip--bad" : ""}" title="${esc(r.deploy.reason || r.deploy.cmd || "")}">деплой: ${esc(r.deploy.status)}</span>`);
+  if ((r.tails || []).length) bits.push(`<span class="close__chip" title="${esc(r.tails.map((t) => t.theme).join("\n"))}">хвостов: ${r.tails.length}</span>`);
+  return `<div class="close">${bits.join("")}${note ? `<div class="close__note close__note--${esc(note.level)}">${esc(note.text)}</div>` : ""}</div>`;
 }
 function renderRails() {
   const host = document.getElementById("railHost");
