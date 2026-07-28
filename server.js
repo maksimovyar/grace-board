@@ -60,6 +60,11 @@ const BIN_PATH_HINT = process.env.GRACE_BIN_PATH || [
 // We run on a Claude subscription: no per-$ billing, so no budget cap. Models are
 // pinned per-agent in the gfd-* files; the orchestrator uses the session default.
 const RIGORS = ["grace", "off"];          // GRACE semantic markup on/off
+const AUTONOMIES = ["ask", "auto"];       // Plan Run §5.3: ask = human picks forks · auto = agent picks, hard-floor still stops
+// Global autonomy default (board.autonomy), overridable per card (card.autonomy). Cached in a
+// module var so the prompt builders resolve effAutonomy() without threading `board` everywhere;
+// readBoard() refreshes it from disk on every read, PATCH /api/settings persists it.
+let GLOBAL_AUTONOMY = "ask";
 
 // ── run supervision: a launched run is watched, not fire-and-forget (issue #1) ─
 // A run that dies WITHOUT reaching `ready`, or stalls in one phase past this
@@ -69,6 +74,12 @@ const LIVENESS_GRACE_MS = 15 * 1000;       // don't judge a run dead in its firs
 // Work-in-flight stations the supervisor watches. `asking` is excluded — there the
 // run has exited by design and we wait on the human, so a dead pid is expected.
 const ACTIVE_COLUMNS = new Set(["todo", "implementing", "verifying", "reviewing"]);
+// A card "occupies" its project's single work slot from dispatch until it reaches a
+// terminal/blocked state — this is what serializes the shared project cwd (WIP=1 per
+// project, roadmap §5.1). `asking` IS occupying (the run owns the branch mid-clarify),
+// unlike ACTIVE_COLUMNS above which is only about liveness supervision. A `queued` card
+// is NOT occupying — it hasn't spawned a run (dispatchedAt is null).
+const OCCUPYING_COLUMNS = new Set(["todo", "asking", "implementing", "verifying", "reviewing"]);
 
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.join(__dirname, "data");
@@ -83,7 +94,10 @@ const TERMINAL = "ready";
 const LEGACY_COLUMN = { clarifying: "asking", done: "ready", "ready-for-deploy": "ready" };
 const normalizeColumn = (col) => LEGACY_COLUMN[col] || col;
 
-const MAX_DESC = 2000;                 // task description hard cap (chars)
+const MAX_DESC = 50000;                // task description hard cap (chars). Was 2000 — too tight for a full
+                                       // task brief, and the excess was sliced off silently. A card in a column
+                                       // clamps the text to 2 lines (CSS), the drawer renders it in full, so a
+                                       // long description costs nothing visually.
 const MAX_UPLOAD = 8 * 1024 * 1024;    // 8 MB per attachment
 const MAX_BODY = 16 * 1024 * 1024;     // request-body hard cap (covers a base64 upload)
 
@@ -98,6 +112,7 @@ function readBoard() {
   try {
     const b = JSON.parse(fs.readFileSync(BOARD_FILE, "utf8"));
     for (const c of b.cards || []) if (c.column) c.column = normalizeColumn(c.column);
+    if (AUTONOMIES.includes(b.autonomy)) GLOBAL_AUTONOMY = b.autonomy; // refresh the cached global default
     return b;
   } catch { return { updatedAt: null, cards: [] }; }
 }
@@ -121,6 +136,187 @@ function isInsideRoot(dir) {
   return dir === PROJECTS_ROOT_ABS || dir.startsWith(PROJECTS_ROOT_ABS + path.sep);
 }
 
+// region FUNC_projectConfig — .grace/project.md (+ local.md) merged into every run (design §3)
+// ## @purpose A run starts headless in the target project and knows nothing about its
+// ##   environment constants (vault path, digest time, role/category enums, stand, release
+// ##   policy) — so it ASKS, and the card stalls waiting for a human. The project now carries
+// ##   that answer in-repo: `.grace/project.md` (committed: safe to publish) + `.grace/local.md`
+// ##   (gitignored: stand URLs, deploy commands, chat ids, absolute paths). Both are read here
+// ##   and injected into every phase prompt as CONSTANTS — "don't re-ask, don't invent".
+// ## @io (projectDir) -> { cfg, text, files[] } | null   ·  (card) -> prompt block | ""
+// ## @invariants
+// ## - NO config (no .grace/, unreadable, empty) → returns null → compiledRequirements is
+// ##   byte-identical to before. Every existing card of every existing project is untouched.
+// ## - local.md OVERRIDES same-named keys of project.md — front-matter deep-merged key by key,
+// ##   body merged by "## heading" (local's section replaces project's of the same title).
+// ##   A missing local.md is NOT an error (design §3): the run proceeds, deploy data is absent.
+// ## - Truncation is never silent (the MAX_DESC lesson): an over-long merge is cut with a
+// ##   visible marker naming the dropped char count.
+// ## @rationale Q: a real YAML parser? A: zero-dependency is a project invariant, and the
+// ##   config schema (§3.2/§3.3) is a small subset — scalars, one nesting level, inline flow
+// ##   maps, "- " lists. Parsing that subset is ~40 lines; anything richer is out of contract
+// ##   and lands in the body as prose, which is where an LLM reads it just as well.
+// ## @modulemap
+// ## FUNC 3[calc]  => parseYamlish       — front-matter subset → object
+// ## FUNC 3[calc]  => renderYamlish      — object → deterministic yaml-ish text
+// ## FUNC 4[calc]  => mergeBodySections  — "## heading" merge, local wins
+// ## FUNC 5[io]    => readProjectConfig  — read + merge both files
+// ## FUNC 3[calc]  => projectConfigBlock — the prompt block glued into compiledRequirements
+// GREP_SUMMARY: .grace/project.md, .grace/local.md, project config, constants, deploy_policy, plan_approval
+// STRUCTURE: ▶ parseYamlish → ⊕ deepMerge → ⚡ readProjectConfig(projectDir) → ⎋ projectConfigBlock(card)
+
+const GRACE_CFG_DIR = ".grace";
+const MAX_PROJECT_CFG = 8000;          // merged config hard cap (chars) — see the truncation invariant
+
+// Strip a trailing `# comment` outside quotes ("http://h:1#x" and "a: 'b # c'" survive).
+function stripYamlComment(line) {
+  let q = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (q) { if (ch === q) q = null; continue; }
+    if (ch === '"' || ch === "'") { q = ch; continue; }
+    if (ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+  }
+  return line;
+}
+const unquote = (s) => String(s).trim().replace(/^["']|["']$/g, "");
+// `{ a: b, c: d }` → { a: "b", c: "d" } (flat flow map only — the schema has no nested flow).
+function parseFlowMap(s) {
+  const out = {};
+  for (const pair of s.slice(1, -1).split(",")) {
+    const i = pair.indexOf(":");
+    if (i === -1) continue;
+    out[pair.slice(0, i).trim()] = unquote(pair.slice(i + 1));
+  }
+  return out;
+}
+// Front-matter subset → object: `key: scalar`, `key: { flow map }`, `key:` + indented block,
+// `- item` lists. Anything else is ignored (it belongs in the markdown body, not the schema).
+function parseYamlish(text) {
+  const root = {};
+  const stack = [{ indent: -1, obj: root }];
+  let listKey = null, listOwner = null;
+  for (const raw of String(text).split("\n")) {
+    const line = stripYamlComment(raw).replace(/\s+$/, "");
+    if (!line.trim()) continue;
+    const indent = line.length - line.trimStart().length;
+    const t = line.trim();
+    if (t.startsWith("- ")) {                       // list item under the last seen key
+      if (listOwner && listKey) (listOwner[listKey] = listOwner[listKey] || []).push(unquote(t.slice(2)));
+      continue;
+    }
+    const m = t.match(/^([A-Za-z_][\w.-]*)\s*:\s*(.*)$/);
+    if (!m) continue;
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
+    const parent = stack[stack.length - 1].obj;
+    const [, key, rest] = m;
+    const val = rest.trim();
+    if (!val) {                                     // `key:` → nested block OR a list
+      parent[key] = {};
+      stack.push({ indent, obj: parent[key] });
+      listOwner = parent; listKey = key;
+    } else if (val.startsWith("{") && val.endsWith("}")) {
+      parent[key] = parseFlowMap(val);
+      listOwner = null; listKey = null;
+    } else {
+      parent[key] = unquote(val);
+      listOwner = null; listKey = null;
+    }
+  }
+  // `key:` that never got children and never got list items is an empty value, not an empty map
+  // — "checked, nothing here" (§3.1 rule 7). Collapse it so the render shows `key:`.
+  const collapse = (o) => { for (const k of Object.keys(o)) {
+    const v = o[k];
+    if (v && typeof v === "object" && !Array.isArray(v)) { Object.keys(v).length ? collapse(v) : (o[k] = ""); }
+  } };
+  collapse(root);
+  return root;
+}
+// local.md wins key by key; a nested map merges, a scalar/list replaces wholesale.
+function deepMerge(base, over) {
+  const out = { ...base };
+  for (const k of Object.keys(over || {})) {
+    const a = out[k], b = over[k];
+    out[k] = (a && b && typeof a === "object" && typeof b === "object" && !Array.isArray(a) && !Array.isArray(b))
+      ? deepMerge(a, b) : b;
+  }
+  return out;
+}
+function renderYamlish(obj, indent) {
+  const pad = " ".repeat(indent || 0);
+  return Object.keys(obj).map((k) => {
+    const v = obj[k];
+    if (Array.isArray(v)) return `${pad}${k}:\n` + v.map((x) => `${pad}  - ${x}`).join("\n");
+    if (v && typeof v === "object") return `${pad}${k}:\n` + renderYamlish(v, (indent || 0) + 2);
+    return `${pad}${k}: ${v}`;
+  }).join("\n");
+}
+// Split a markdown body into a preamble + ordered "## heading" sections.
+function splitSections(body) {
+  const pre = [], sections = new Map();
+  let cur = null;
+  for (const line of String(body || "").split("\n")) {
+    const h = line.match(/^##\s+(.+?)\s*$/);
+    if (h) { cur = h[1]; sections.set(cur, sections.get(cur) || []); continue; }
+    (cur ? sections.get(cur) : pre).push(line);
+  }
+  return { pre: pre.join("\n").trim(), sections };
+}
+// Merge two bodies by heading: local's section REPLACES the project's of the same title,
+// its extra sections are appended in order. Same rule as the front-matter merge, one level up.
+function mergeBodySections(bodyA, bodyB) {
+  const A = splitSections(bodyA), B = splitSections(bodyB);
+  const merged = new Map(A.sections);
+  for (const [h, lines] of B.sections) merged.set(h, lines);
+  const pre = [A.pre, B.pre].filter(Boolean).join("\n\n");
+  const out = [...merged].map(([h, lines]) => `## ${h}\n${lines.join("\n").trim()}`).join("\n\n");
+  return [pre, out].filter(Boolean).join("\n\n").trim();
+}
+// `---\n<front matter>\n---\n<body>` → { fm, body }. No front matter → all body.
+function splitFrontMatter(text) {
+  const m = String(text).match(/^﻿?---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  return m ? { fm: m[1], body: m[2] } : { fm: "", body: String(text) };
+}
+const readIfFile = (p) => { try { return fs.readFileSync(p, "utf8"); } catch { return null; } };
+
+// Read + merge the project's config pair. Returns null when the project carries no config
+// at all — the caller then behaves exactly as it did before this existed.
+function readProjectConfig(projectDir) {
+  if (!isInsideRoot(projectDir)) return null;
+  const files = [];
+  const pRaw = readIfFile(path.join(projectDir, GRACE_CFG_DIR, "project.md"));
+  const lRaw = readIfFile(path.join(projectDir, GRACE_CFG_DIR, "local.md"));   // absent is NOT an error (§3)
+  if (pRaw === null && lRaw === null) return null;
+  if (pRaw !== null) files.push(`${GRACE_CFG_DIR}/project.md`);
+  if (lRaw !== null) files.push(`${GRACE_CFG_DIR}/local.md`);
+  const P = splitFrontMatter(pRaw || ""), L = splitFrontMatter(lRaw || "");
+  const cfg = deepMerge(parseYamlish(P.fm), parseYamlish(L.fm));
+  const body = mergeBodySections(P.body, L.body);
+  const head = Object.keys(cfg).length ? renderYamlish(cfg, 0) : "";
+  let text = [head, body].filter(Boolean).join("\n\n").trim();
+  if (!text) return null;
+  if (text.length > MAX_PROJECT_CFG) {
+    const dropped = text.length - MAX_PROJECT_CFG;
+    text = text.slice(0, MAX_PROJECT_CFG) + `\n… (конфиг обрезан: отброшено ${dropped} симв.; лимит §3.1 — 4000 на файл)`;
+  }
+  return { cfg, text, files };
+}
+// The prompt block. Framed as CONSTANTS, because the whole point is that the run stops
+// asking about them (design §1.5 / §3): an answer that is a project constant lives here.
+function projectConfigBlock(card) {
+  const conf = readProjectConfig(resolveProjectDir(card.project));
+  if (!conf) return "";
+  return [
+    `КОНФИГ ПРОЕКТА (${conf.files.join(" + ")}) — КОНСТАНТЫ ОКРУЖЕНИЯ, заданные владельцем проекта.`,
+    `Считай их данностью: НЕ переспрашивай их у человека, НЕ выдумывай альтернативы, НЕ ищи их заново в коде.`,
+    `Если нужной константы здесь НЕТ — это пробел конфига: реши по коду и отметь в finishNote, что константа отсутствует.`,
+    `----- начало конфига -----`,
+    conf.text,
+    `----- конец конфига -----`,
+  ].join("\n");
+}
+// endregion FUNC_projectConfig
+
 // The headline the pipeline builds against = the task theme; the detail (long
 // description, links, attached files) is compiled into the requirements context.
 const featureLine = (card) => card.theme || card.description || "task";
@@ -132,8 +328,125 @@ function compiledRequirements(card) {
   if (card.designLink) parts.push("Макеты (ссылка): " + card.designLink);
   if (Array.isArray(card.attachments) && card.attachments.length)
     parts.push("Вложения с требованиями: " + card.attachments.map((a) => a.name).join(", "));
+  // S1 · project config (§3): environment constants of the TARGET project ride every prompt.
+  const cfg = projectConfigBlock(card);
+  if (cfg) parts.push(cfg);
   return parts.join("\n\n") || null;
 }
+
+// region FUNC_cardBrief — statement-of-work fields + strictness by author (design §4)
+// ## @purpose The two most expensive stalls of a run are «is X in scope?» (8 h idle on two
+// ##   such questions) and «which fields does entity Y have?». Both are answerable at
+// ##   composition time. So a card now carries the answers as first-class fields —
+// ##   outOfScope · acceptance · contract · sources — and STRICTNESS depends on WHO wrote it
+// ##   (`origin`), not on text length: an agent must fill them, a human owes nothing.
+// ## @io (card) -> prompt block · (card) -> dispatch veto · (board,card) -> inherited contracts
+// ## @invariants
+// ## - `origin` defaults to "human" for every card that lacks the field → ZERO requirements →
+// ##   every one of the 86 live cards keeps dispatching exactly as before. No migration needed.
+// ## - Only `skill`/`agent` are gated. `deferred` is gated by the draft flag instead (§4.2),
+// ##   because a tail inherits its parent's fields and is not a fresh statement of work.
+// ## - contract has THREE states: filled (follow verbatim) · "TBD" (design it here, publish it
+// ##   to result.contract) · empty (a defect only for skill/agent). Never invent a 4th.
+// ## - DAG inheritance is stamped AT DISPATCH (dispatchNow), not read live: the prompt builders
+// ##   stay pure over the card, and what the run was told stays visible on the card afterwards.
+// ## @rationale Q: why not "description must be ≥ N chars"? A: rejected in the design — a human
+// ##   writes short on purpose and drives the task home through the ask gate; that is his mode
+// ##   of work, not a defect. The agent has no such excuse.
+// ## @modulemap
+// ## FUNC 3[calc] => normalizeBrief     — request body → the 5 fields, coerced + capped
+// ## FUNC 2[guard]=> briefGaps          — which required fields are missing (strict origins only)
+// ## FUNC 2[guard]=> dispatchBlock      — the single dispatch veto (draft OR gaps)
+// ## FUNC 4[calc] => briefBlock         — the prompt block ("это решено, не спрашивай")
+// ## FUNC 3[calc] => inheritContracts   — pull dep cards' published contracts onto this card
+// GREP_SUMMARY: outOfScope, acceptance, contract, sources, origin, draft, deferred, strictness, §4
+// STRUCTURE: ▶ normalizeBrief → ⊕ briefGaps → ⚡ dispatchBlock(lever/tick) → ⎋ briefBlock(prompt)
+
+const ORIGINS = ["human", "skill", "agent", "deferred"];
+const STRICT_ORIGINS = new Set(["skill", "agent"]);       // §4.2 — the board demands a full brief
+const MAX_SOURCES = 20, MAX_SOURCE_LEN = 500;             // §4.3
+const MAX_ACCEPTANCE = 50, MAX_ACCEPTANCE_LEN = 2000;
+const cardOrigin = (card) => (card && ORIGINS.includes(card.origin)) ? card.origin : "human";
+
+// A list field accepts an array OR a newline/«- »-separated block (what a textarea and a CLI
+// heredoc both produce). Empty entries are dropped; the cap is applied, never silently — the
+// caller reports it back, same rule as MAX_DESC.
+function toLines(v, maxItems, maxLen) {
+  const arr = Array.isArray(v) ? v : (typeof v === "string" ? v.split("\n") : []);
+  return arr.map((x) => String(x).replace(/^\s*[-•*]\s*/, "").trim()).filter(Boolean)
+    .slice(0, maxItems).map((x) => x.slice(0, maxLen));
+}
+// Coerce the statement-of-work half of a create/edit body. `base` supplies the current values
+// so PATCH can send a subset. Returns only the keys present in the body (undefined = untouched).
+function normalizeBrief(b, base) {
+  const out = {};
+  if (b.outOfScope !== undefined) out.outOfScope = String(b.outOfScope).trim().slice(0, MAX_DESC) || null;
+  if (b.contract !== undefined) out.contract = String(b.contract).trim().slice(0, MAX_DESC) || null;
+  if (b.acceptance !== undefined) out.acceptance = toLines(b.acceptance, MAX_ACCEPTANCE, MAX_ACCEPTANCE_LEN);
+  if (b.sources !== undefined) out.sources = toLines(b.sources, MAX_SOURCES, MAX_SOURCE_LEN);
+  if (b.origin !== undefined) out.origin = ORIGINS.includes(b.origin) ? b.origin : (base ? cardOrigin(base) : "human");
+  if (b.draft !== undefined) out.draft = !!b.draft;
+  return out;
+}
+// Which required fields are missing? Empty for `human`/`deferred` — by design, not by omission.
+function briefGaps(card) {
+  if (!STRICT_ORIGINS.has(cardOrigin(card))) return [];
+  const gaps = [];
+  if (!String(card.outOfScope || "").trim()) gaps.push("outOfScope");
+  if (!(Array.isArray(card.acceptance) && card.acceptance.length)) gaps.push("acceptance");
+  if (!(Array.isArray(card.sources) && card.sources.length)) gaps.push("sources");
+  if (!String(card.contract || "").trim()) gaps.push("contract (текст или TBD)");
+  return gaps;
+}
+// The ONE dispatch veto, shared by the lever, the queue tick and plan assembly, so a card can
+// never start a run through one door that the other door would have refused.
+function dispatchBlock(card) {
+  if (card.draft) return { error: "черновик: проверь унаследованные поля и сними пометку черновика", draft: true, missing: [] };
+  const missing = briefGaps(card);
+  if (missing.length) return { error: `постановка неполна для origin=${cardOrigin(card)}: не заполнено — ${missing.join(", ")}`, missing };
+  return null;
+}
+// Contracts published by this card's dependencies (§4.1): stamped at dispatch so the run gets
+// them ready instead of asking the human what the previous stage decided.
+function inheritContracts(board, card) {
+  const deps = Array.isArray(card.dependsOn) ? card.dependsOn : [];
+  const got = [];
+  for (const id of deps) {
+    const dep = board.cards.find((c) => c.id === id);
+    const text = dep && ((dep.result && dep.result.contract) || dep.contractResult);
+    if (text) got.push({ from: dep.id, theme: dep.theme || null, contract: String(text).slice(0, MAX_DESC) });
+  }
+  card.inheritedContracts = got;
+}
+// The prompt block. Each field gets its own heading with an explicit instruction — a scope
+// boundary buried in prose is exactly how «is X in scope?» reached the human in the first place.
+function briefBlock(card) {
+  const out = [];
+  if (String(card.outOfScope || "").trim()) out.push(
+    `НЕ ВХОДИТ В ОБЪЁМ — ЭТО УЖЕ РЕШЕНО НА ЭТАПЕ ПОСТАНОВКИ. НЕ спрашивай про это, НЕ делай это,`,
+    `НЕ выноси это в deferred как «обнаруженное»:`, card.outOfScope, ``);
+  if (Array.isArray(card.acceptance) && card.acceptance.length) out.push(
+    `ПРИЁМКА (Definition of Done карточки — каждый пункт обязан иметь прогоняемую проверку;`,
+    `из этих же пунктов собирается приёмка всего прогона):`,
+    ...card.acceptance.map((a, i) => `${i + 1}) ${a}`), ``);
+  const contract = String(card.contract || "").trim();
+  if (contract && /^tbd$/i.test(contract)) out.push(
+    `КОНТРАКТ ДАННЫХ: TBD — его проектируешь ТЫ в этой карточке (это и есть часть задачи).`,
+    `Перед "ready" запиши получившийся контракт (модели, поля, эндпоинты — дословно) в top-level`,
+    `"contract" своего board.json: зависимые этапы получат его готовым и не будут переспрашивать.`, ``);
+  else if (contract) out.push(
+    `КОНТРАКТ ДАННЫХ — СЛЕДУЙ ДОСЛОВНО, не синтезируй свой и не переспрашивай:`, contract, ``);
+  if (Array.isArray(card.sources) && card.sources.length) out.push(
+    `ИСТОЧНИКИ ТРЕБОВАНИЙ (в порядке приоритета; помеченное как устаревшее — не использовать):`,
+    ...card.sources.map((s) => `• ${s}`), ``);
+  const inh = Array.isArray(card.inheritedContracts) ? card.inheritedContracts : [];
+  if (inh.length) out.push(
+    `КОНТРАКТ ОТ ПРЕДЫДУЩИХ ЭТАПОВ ПРОГОНА (уже спроектирован — бери как есть, НЕ переспрашивай`,
+    `и НЕ переопределяй; расхождение с ним — повод остановиться, а не «улучшить»):`,
+    ...inh.map((x) => `• этап «${x.theme || x.from}»:\n${x.contract}`), ``);
+  return out.length ? out.join("\n").trim() : "";
+}
+// endregion FUNC_cardBrief
 
 // region FUNC_detectDirectives — pull build-METHOD directives out of the task text
 // The task body mixes WHAT to build (functional) with HOW to build it (use skill X,
@@ -211,6 +524,713 @@ function purgeUploads(cardId) {
   try { fs.rmSync(path.join(UPLOADS_DIR, cardId), { recursive: true, force: true }); } catch {}
 }
 
+// region FUNC_scheduleQueued — per-project WIP=1 serialization (roadmap §5.1/§5.2)
+// ## @purpose Close the shared-cwd git race (server.js spawns every run in the SAME
+// ##   projectDir): only ONE card per project may hold a live run at a time. A card
+// ##   leaving Backlog while its project is busy is QUEUED (a flag, not a run) and the
+// ##   tick dispatches it once the slot frees — so two cards never checkout/commit in
+// ##   one working dir concurrently, and there is no intra-project git conflict to solve.
+// ## @io (board) -> mutates board (dispatches ≤1 queued card per free project)
+// ## @invariants
+// ## - Single-card / free-project path dispatches IMMEDIATELY — one-off tasks are untouched.
+// ## - A queued card never spawns a run until canDispatchNow() is true (slot free; S1: deps ready).
+// ## - queued cards carry dispatchedAt=null, so they never count as "active" themselves.
+// ## @rationale Q: new station column vs a flag? A: a `queued` flag keeps the card in
+// ##   `todo` — zero column-model migration across UI/legacy maps, and the flag is only
+// ##   ever set when the project is busy, so the existing single-card flow is byte-identical.
+// ## @modulemap
+// ## FUNC 3[guard]   => hasActiveForProject   — is the project's slot taken?
+// ## FUNC 3[guard]   => canDispatchNow        — S0: slot free (S1 extends: + deps + files)
+// ## FUNC 6[persist] => dispatchNow           — mark live + seed + spawn (shared by PATCH & tick)
+// ## FUNC 5[persist] => scheduleQueued        — tick pass: feed each free project its next card
+// GREP_SUMMARY: queue, WIP1, per-project serialization, shared cwd race, dispatchNow, scheduleQueued
+// STRUCTURE: ▶ hasActiveForProject → ⊕ canDispatchNow → ⚡ dispatchNow → ⎋ scheduleQueued(tick)
+
+// Does another card already hold this project's work slot? Queued cards don't count
+// (dispatchedAt is null); the card itself is excluded via exceptId.
+function hasActiveForProject(board, project, exceptId) {
+  return board.cards.some((c) =>
+    c.id !== exceptId && c.project === project && c.dispatchedAt && !c.queued && OCCUPYING_COLUMNS.has(c.column));
+}
+// May this card start its run right now? Three gates (all must pass):
+//   1) the per-project WIP=1 slot is free (S0), 2) every dependsOn card is `ready` (S1),
+//   3) no files[] conflict with an active sibling (S1 — subsumed by WIP=1, forward-compat).
+function canDispatchNow(board, card) {
+  return !card.paused                            // S4 §2.2: paused keeps its place in the queue
+    && dispatchBlock(card) === null              // S3 §4.2: draft / incomplete brief never starts
+    && !hasActiveForProject(board, card.project, card.id)
+    && depsSatisfied(board, card)
+    && !filesConflict(board, card);
+}
+// Actually start the card's run: clear the queued flag, stamp it live, seed + spawn.
+// Shared by the PATCH (lever) path and the tick scheduler so both dispatch identically.
+function dispatchNow(board, card, via) {
+  card.queued = false;
+  inheritContracts(board, card);   // S3 §4.1: dep contracts are frozen onto the card at dispatch
+  card.dispatchedAt = new Date().toISOString();
+  card.dispatch = dispatch(card);
+  card.lastColumnChangeAt = card.dispatchedAt;
+  card.history.push({ column: card.column, ts: card.dispatchedAt, via: via || "dispatch" });
+}
+// Tick pass: give each free project its next eligible queued card. Dispatching one flips
+// hasActiveForProject() true for that project, so the next same-project queued card waits
+// this pass — natural WIP=1 without a lock. FIFO by board array order (= creation order).
+function scheduleQueued(board) {
+  let changed = false;
+  for (const card of board.cards) {
+    if (!card.queued) continue;
+    if (!canDispatchNow(board, card)) continue;
+    dispatchNow(board, card, "queue-dispatch");
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.dispatchedAt, event: "queue-dispatch", cardId: card.id, project: card.project }) + "\n"); } catch {}
+    changed = true;
+  }
+  return changed;
+}
+// endregion FUNC_scheduleQueued
+
+// region FUNC_dagGates — dependsOn[] DAG readiness + files[] disjointness (roadmap §5.2)
+// ## @purpose Order stages of a plan by dependency, not just by project slot. A card
+// ##   with dependsOn[] stays queued until EVERY dep card is `ready`; files[] keeps
+// ##   file-overlapping stages strictly one-after-another (already true under WIP=1, so
+// ##   this is a forward-compat guard for a future parallel/fanout mode, never the
+// ##   deciding gate today — logged as such, no silent cap).
+// ## @invariants
+// ## - No dependsOn (single card, planId:null) → depsSatisfied is TRUE → immediate (backward-compat).
+// ## - A missing/deleted dep id is treated as UNSATISFIED (safe: the card waits, the chip shows it),
+// ##   never silently skipped — a broken DAG edge must be visible, not auto-passed.
+// GREP_SUMMARY: dependsOn, DAG, files disjoint, depsSatisfied, filesConflict, wave ordering
+
+// Every dependsOn card must be `ready` (TERMINAL). Empty deps → trivially satisfied.
+function depsSatisfied(board, card) {
+  const deps = Array.isArray(card.dependsOn) ? card.dependsOn : [];
+  if (!deps.length) return true;
+  return deps.every((depId) => {
+    const dep = board.cards.find((c) => c.id === depId);
+    return dep && dep.column === TERMINAL;
+  });
+}
+// Does this card share a file with an active sibling of the SAME project? Under WIP=1
+// there is at most one active card per project, so canDispatchNow's slot gate already
+// blocks any overlap — this can only fire in a future >1-per-project mode. Kept explicit
+// so the files[] contract is enforced by code, not by assumption.
+function filesConflict(board, card) {
+  const files = Array.isArray(card.files) ? card.files : [];
+  if (!files.length) return false;
+  const mine = new Set(files);
+  return board.cards.some((c) =>
+    c.id !== card.id && c.project === card.project && c.dispatchedAt && !c.queued &&
+    OCCUPYING_COLUMNS.has(c.column) && Array.isArray(c.files) && c.files.some((f) => mine.has(f)));
+}
+// endregion FUNC_dagGates
+
+// region FUNC_releaseManifest — «Результат» aggregate + 5-section release manifest (roadmap §6/§6.1)
+// ## @purpose Turn what a card ALREADY reports (branchLink, finishNote, blockReason,
+// ##   archDecisions, the deploy{} block the build writes at `ready`) into two derived
+// ##   artifacts: (a) card.result — the single "Результат" aggregate + git link, and
+// ##   (b) a 5-section RELEASE MANIFEST {migrations,env,services,seed,manualChecks}.
+// ##   A single card (planId:null) → its own manifest = task.result.releaseManifest,
+// ##   attached to its PR. A plan (planId set) → per-section accumulation of its stages'
+// ##   manifests (planReleaseManifest), attached to the final integration-branch PR.
+// ## @io (card | board,planId) -> result aggregate | plan-level accumulated manifest
+// ## @invariants
+// ## - ALL 5 keys are always present in a normalized manifest: [] = "checked, empty",
+// ##   a MISSING key = "forgot" → surfaced as manifestMissing (never silently defaulted away),
+// ##   so "correctly empty" is distinguishable from "omitted" (§6.1).
+// ## - Additive/forward-only: absent deploy{} → result carries no manifest, single-card
+// ##   path unchanged. No Plan entity is required here (it lands in S4) — accumulation is
+// ##   keyed by the planId field the card already carries since S0.
+// ## - Per-section merge (§6.1): env by variable NAME (value clash → warn); migrations/seed
+// ##   by path/id, EXACT-dup collapse only, DAG order preserved (order stages reached ready);
+// ##   services/manualChecks by identity, first-seen. NEVER content-dedup or re-sort migrations.
+// ## @modulemap
+// ## FUNC 3[calc] => normalizeManifest          — coerce deploy{} to 5 arrays + list missing keys
+// ## FUNC 4[calc] => buildResult                 — assemble card.result aggregate (git+forks+outcome+manifest)
+// ## FUNC 6[calc] => accumulateReleaseManifest   — per-section merge across ordered stages
+// ## FUNC 3[calc] => planReleaseManifest         — group a plan's cards (by planId), order, accumulate
+// GREP_SUMMARY: releaseManifest, deploy, result, manifest accumulation, migrations env services seed manualChecks, Plan Run §6.1
+// STRUCTURE: ▶ normalizeManifest → ⊕ buildResult(card) → ⚡ accumulateReleaseManifest(stages) → ⎋ planReleaseManifest(planId)
+
+const MANIFEST_SECTIONS = ["migrations", "env", "services", "seed", "manualChecks"];
+const hasDeploy = (deploy) => !!deploy && typeof deploy === "object" && MANIFEST_SECTIONS.some((s) => s in deploy);
+
+// Flatten one manifest item to a searchable string (for the mechanical floor / display).
+function itemStr(item) {
+  if (item && typeof item === "object") return [item.name, item.value, item.note, item.path, item.file, item.id, item.text, item.desc].filter(Boolean).join(" ");
+  return String(item);
+}
+// S3 · MECHANICAL FLOOR (roadmap §5.3, source 1 — deterministic, no agent). Reads ONLY the
+// deploy{} manifest a card already writes (SR) and flags objectively-visible irreversible
+// classes that ALWAYS stop for a human, even under autonomy=auto: destructive migration,
+// data deletion in a seed/backfill, a new secret env var. AUTO never merges main (git-floor),
+// so a flagged card's items just surface for human sign-off on the final PR — they don't auto-clear.
+const FLOOR_DESTRUCTIVE_RE = /\b(DROP\s+(TABLE|COLUMN|DATABASE|SCHEMA|INDEX|CONSTRAINT)|TRUNCATE|DELETE\s+FROM|ALTER\s+TABLE\b[\s\S]*\bDROP\b)/i;
+const FLOOR_SECRET_RE = /(^|_)(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE)\b/i;
+function mechanicalFloor(deploy) {
+  if (!hasDeploy(deploy)) return [];
+  const { manifest } = normalizeManifest(deploy);
+  const flags = [];
+  for (const m of manifest.migrations) { const s = itemStr(m); if (FLOOR_DESTRUCTIVE_RE.test(s)) flags.push({ class: "destructive-migration", detail: s }); }
+  for (const sd of manifest.seed) { const s = itemStr(sd); if (FLOOR_DESTRUCTIVE_RE.test(s)) flags.push({ class: "data-deletion", detail: s }); }
+  for (const e of manifest.env) { const name = manifestItemKey("env", e); if (FLOOR_SECRET_RE.test(name)) flags.push({ class: "new-secret", detail: name }); }
+  return flags;
+}
+
+// Coerce a raw deploy{} block into exactly the 5 array sections, and report which keys
+// were absent (missing ≠ empty: [] means "checked, nothing to do"; absent means "forgot").
+function normalizeManifest(deploy) {
+  const manifest = {}, missing = [];
+  const src = deploy && typeof deploy === "object" ? deploy : {};
+  for (const s of MANIFEST_SECTIONS) {
+    if (Array.isArray(src[s])) manifest[s] = src[s];
+    else { manifest[s] = []; if (!(s in src)) missing.push(s); }
+  }
+  return { manifest, missing };
+}
+
+// The "Результат" aggregate (§6): git link + AUTO-taken forks + outcome + block reason +
+// this unit's own release manifest. Pure over fields the card already holds — no new data.
+function buildResult(card) {
+  const auto = (Array.isArray(card.archDecisions) ? card.archDecisions : []).filter((d) => d && d.ownText);
+  const { manifest, missing } = normalizeManifest(card.deploy);
+  const present = hasDeploy(card.deploy);
+  return {
+    branchLink: card.branchLink || null,
+    finishNote: card.finishNote || null,
+    blockReason: card.column === "blocked" ? (card.blockReason || null) : null,
+    autoDecisions: auto,
+    // S3 §4.1: the contract this card DESIGNED (card.contract === "TBD" → the run publishes it
+    // as top-level "contract"). Dependents inherit it at dispatch — see inheritContracts().
+    contract: card.contractResult || null,
+    releaseManifest: present ? manifest : null,
+    manifestMissing: present ? missing : [],
+    floor: present ? mechanicalFloor(card.deploy) : [],   // S3: hard-floor flags (human sign-off), §5.3
+  };
+}
+
+// The § merge key for one manifest item (strings or {name/path/id} objects both tolerated).
+function manifestItemKey(section, item) {
+  if (item && typeof item === "object")
+    return section === "env"
+      ? String(item.name || item.key || JSON.stringify(item))
+      : String(item.path || item.file || item.id || item.name || JSON.stringify(item));
+  const s = String(item);
+  return section === "env" ? s.split("=")[0].trim() : s;
+}
+function envValue(item) {
+  if (item && typeof item === "object") return item.value != null ? String(item.value) : null;
+  const s = String(item), i = s.indexOf("=");
+  return i === -1 ? null : s.slice(i + 1).trim();
+}
+
+// Per-section accumulation across an ORDERED list of stage cards (§6.1). Order is the
+// caller's contract (= order stages reached `ready`) so migrations/seed stay topological.
+// Returns { manifest{5 keys}, warnings[] } — first-seen wins, only exact/same-name collapse.
+function accumulateReleaseManifest(orderedCards) {
+  const acc = {}, seen = {};
+  for (const s of MANIFEST_SECTIONS) { acc[s] = []; seen[s] = new Map(); }
+  const warnings = [];
+  for (const card of orderedCards) {
+    if (!hasDeploy(card.deploy)) continue;
+    const { manifest } = normalizeManifest(card.deploy);
+    for (const section of MANIFEST_SECTIONS) {
+      for (const item of manifest[section]) {
+        const key = manifestItemKey(section, item);
+        if (seen[section].has(key)) {
+          if (section === "env") {
+            const pv = envValue(seen[section].get(key)), nv = envValue(item);
+            if (pv != null && nv != null && pv !== nv)
+              warnings.push(`env ${key}: «${pv}» (ранее) ≠ «${nv}» (этап ${card.id})`);
+          }
+          continue; // same-name / exact-dup collapse; DAG order preserved by push-once
+        }
+        seen[section].set(key, item);
+        acc[section].push(item);
+      }
+    }
+  }
+  return { manifest: acc, warnings };
+}
+
+// The ts a card reached `ready` — for topological ordering of a plan's manifests. Falls
+// back to lastColumnChangeAt, then creation, so the ordering is always total & stable.
+function readyAt(card) {
+  const h = (card.history || []).find((e) => e.column === TERMINAL);
+  return Date.parse((h && h.ts) || card.lastColumnChangeAt || card.createdAt || "") || 0;
+}
+// plan.result.releaseManifest (§6.1): accumulate a plan's cards (by planId), ordered by
+// when they reached `ready`. Computed on demand from cards the plan already owns — no Plan
+// entity needed until S4, which will render the plan-rail on top of this shape.
+function planReleaseManifest(board, planId) {
+  const cards = board.cards
+    .filter((c) => c.planId === planId)
+    .sort((a, b) => readyAt(a) - readyAt(b));
+  const { manifest, warnings } = accumulateReleaseManifest(cards);
+  const floor = cards.flatMap((c) => mechanicalFloor(c.deploy).map((f) => ({ ...f, stage: c.id })));
+  return {
+    planId,
+    stageCount: cards.length,
+    releaseManifest: manifest,
+    warnings,
+    floor, // S3 §5.3: mechanical hard-floor flags across the plan → human sign-off on the final PR
+    stages: cards.map((c) => ({ id: c.id, theme: c.theme, column: c.column, manifestMissing: buildResult(c).manifestMissing })),
+  };
+}
+// endregion FUNC_releaseManifest
+
+// region FUNC_plans — Plan entity: assemble a run from EXISTING board cards (roadmap §1/§2, v2)
+// ## @purpose A Plan is NOT generated from a goal by LLM decomposition — it is ASSEMBLED from
+// ##   unfinished cards the user already has on the board (Backlog + To do of one project).
+// ##   createPlan wires the chosen cards into a DAG (planId + dependsOn), hands them the plan's
+// ##   SHARED integration branch, sets their autonomy from the plan mode, and enqueues them
+// ##   (WIP=1 + deps decide order). The goal is only context for the final PR.
+// ## @invariants
+// ## - Only Backlog / To do cards of the plan's project, not yet dispatched and not already in a
+// ##   plan, may be assembled — the run creates NO cards from scratch (v2 model).
+// ## - integrationBranch = autodev/plan-<id>; every stage commits there (base = its tip, §4).
+// ## - status is DERIVED from the stage columns — never a stale stored value.
+// ## - A single card (planId:null) is byte-for-byte untouched by any of this.
+// GREP_SUMMARY: Plan, plan run, assemble from cards, planId, integrationBranch, plan-rail, §1 §2
+const PLAN_ASSEMBLABLE = new Set(["backlog", "todo"]);
+const planById = (board, id) => (board.plans || []).find((p) => p.id === id) || null;
+// A cyclic dependsOn graph would queue every stage forever (depsSatisfied never true) with no
+// dispatch and no error — a silent deadlock. Reject it at assembly. DFS over deps restricted to
+// the plan's own stages (self-edges ignored, matching how they're wired below).
+function stagesHaveCycle(stages) {
+  const inSet = new Set(stages.map((s) => s.cardId));
+  const dep = new Map(stages.map((s) => [s.cardId, (Array.isArray(s.dependsOn) ? s.dependsOn : []).filter((d) => d !== s.cardId && inSet.has(d))]));
+  const state = new Map(); // 0/undefined = unseen · 1 = on stack · 2 = done
+  const dfs = (id) => {
+    state.set(id, 1);
+    for (const d of dep.get(id) || []) {
+      const st = state.get(d) || 0;
+      if (st === 1) return true;                 // back-edge → cycle
+      if (st === 0 && dfs(d)) return true;
+    }
+    state.set(id, 2);
+    return false;
+  };
+  for (const s of stages) if ((state.get(s.cardId) || 0) === 0 && dfs(s.cardId)) return true;
+  return false;
+}
+// Derived status from the plan's stage columns (§2 lifecycle) — the cards are the truth.
+function planStatus(board, plan) {
+  // S5 §5.6: once the closing phase starts it OWNS the status — running → verifying → done|failed.
+  // Before that the stage columns are still the truth.
+  if (plan.closeStatus) return plan.closeStatus;
+  const cards = (plan.cardIds || []).map((id) => board.cards.find((c) => c.id === id)).filter(Boolean);
+  if (!cards.length) return "empty";
+  if (cards.every((c) => c.column === TERMINAL)) return "done";
+  if (cards.some((c) => c.column === "blocked")) return "blocked";
+  if (cards.some((c) => c.dispatchedAt || c.queued)) return "running";
+  return "planning";
+}
+// Read projection for the rail: derived status + accumulated release manifest (§6.1).
+// The stored result (frozen at close: acceptance, PR, merge, deploy) rides on top of the live
+// manifest — before closing there is no stored half, so this is the S4 projection unchanged.
+const planView = (board, plan) => ({ ...plan, status: planStatus(board, plan),
+  result: { releaseManifest: planReleaseManifest(board, plan.id), ...(plan.result || {}) } });
+
+// S5 · SUMMARY GATE preflight (roadmap §2 Фаза 1). Surfaces PLAN-LEVEL items the human
+// resolves ONCE before launch — deduped across stages — so individual stages don't re-ask:
+//   • blockers: objectively detectable pre-run gaps (today: the project's design source, §3.1);
+//   • floor: the mechanical hard-floor over any manifests already present (§5.3);
+//   • forks: plan-level architecture forks are surfaced by the stages' arch runs at runtime
+//     (LLM), not fabricated here — pre-run this is []. The human's answers ride each stage seed.
+function preflightPlan(board, project, cardIds) {
+  const blockers = [];
+  // §3.1 — the project must declare its design source; if CLAUDE.md doesn't, block once.
+  let hasDesign = false;
+  try { hasDesign = /(^|\n)\s*##\s+(Дизайн|Design)/i.test(fs.readFileSync(path.join(resolveProjectDir(project), "CLAUDE.md"), "utf8")); } catch {}
+  if (!hasDesign) blockers.push({
+    id: "design-source", type: "blocker",
+    q: "Источник дизайна проекта не задан (§3.1). Как объявить?",
+    options: [
+      { id: "html", title: "html · public/ (self-heal)", recommended: true },
+      { id: "figma", title: "figma · указать ссылку" },
+      { id: "none", title: "none · дизайн не нужен" },
+    ],
+  });
+  const cards = (cardIds || []).map((id) => board.cards.find((c) => c.id === id)).filter(Boolean);
+  const floor = cards.flatMap((c) => mechanicalFloor(c.deploy).map((f) => ({ ...f, stage: c.id })));
+  return { blockers, floor, forks: [] };
+}
+// endregion FUNC_plans
+
+// region FUNC_planClose — closing a run: manifest → acceptance → PR → policy (design §5)
+// ## @purpose 6 plans out of 6 ended with `status: "running"`, `result: null`, four archived by
+// ##   hand — the result of a run simply evaporated. Closing is now an AUTOMATIC phase that
+// ##   starts itself when every stage reaches `ready`, and it ends with the one artefact a human
+// ##   can actually read: a PR carrying the release manifest, the acceptance evidence, the auto
+// ##   decisions and the list of tails. This CHANGES roadmap §4 («мерж делает человек»): the PR
+// ##   is always opened, the merge follows the policy, the deploy stays behind a floor.
+// ## @io (board) -> plan.closeStatus/closeStep transitions + up to one spawned child per tick
+// ## @invariants
+// ## - A single card (planId:null) never enters here. Closing is a PLAN-level phase.
+// ## - RED ACCEPTANCE → NO DEPLOY, under any policy, ever. The PR goes to draft, plan → failed.
+// ## - stand.is_production:true → the deploy needs a human REGARDLESS of autonomy (§5.1, the
+// ##   mechanical floor): policy `after-merge` is demoted to `ask`, never executed silently.
+// ## - Every external step (gh, deploy) is a PLAIN child process, not a model call: deterministic,
+// ##   free, and its stdout is the evidence. Only the acceptance itself needs judgement.
+// ## - Each step writes ONE file and the next tick reads it — the tick never blocks on a child.
+// ## - No `gh`/no remote is NOT a silent failure: the composed PR body stays on disk and its path
+// ##   is reported in plan.result.pr.error, so a human can open the PR by hand.
+// ## @modulemap
+// ## FUNC 3[calc]    => policyFor            — plan.policy → .grace/project.md → always/manual/off
+// ## FUNC 4[calc]    => acceptanceScenarios  — every stage's acceptance[] + manifest manualChecks
+// ## FUNC 5[io]      => launchPlanAcceptance — the ONE model run of the closing phase (§5.3)
+// ## FUNC 6[calc]    => prBody               — the 7-section PR body (§5.4)
+// ## FUNC 8[persist] => planCloseTick        — the state machine + the §5.5 branching table
+// GREP_SUMMARY: plan close, acceptance, release manifest, PR, merge, deploy policy, §5, gh
+// STRUCTURE: ▶ all stages ready → ⊕ acceptance run → ⚡ PR (draft if red) → ⎋ merge/deploy by policy
+
+const DEPLOY_POLICY_DEFAULT = { pr: "always", merge: "manual", deploy: "off" };
+const PR_MODES = ["always", "never"], MERGE_MODES = ["manual", "auto"], DEPLOY_MODES = ["off", "after-merge", "ask"];
+const GH_BIN = process.env.GRACE_GH_BIN || "gh";
+const ACCEPT_GRACE_MS = 60 * 1000;   // don't judge the acceptance run dead in its first minute
+
+// Release policy of a run: what was passed at assembly wins, then the project's
+// `deploy_policy`, then the built-in default (§5.1).
+function policyFor(board, plan) {
+  const cfg = readProjectConfig(resolveProjectDir(plan.project));
+  const fromCfg = (cfg && cfg.cfg && cfg.cfg.deploy_policy) || {};
+  const p = plan.policy || {};
+  const pick = (k, allowed) => [p[k], fromCfg[k], DEPLOY_POLICY_DEFAULT[k]].find((v) => allowed.includes(v));
+  return { pr: pick("pr", PR_MODES), merge: pick("merge", MERGE_MODES), deploy: pick("deploy", DEPLOY_MODES) };
+}
+const planDir = (plan) => path.join(resolveProjectDir(plan.project), ".grace-feature-dev", "plan-" + plan.id);
+const planCards = (board, plan) => (plan.cardIds || []).map((id) => board.cards.find((c) => c.id === id)).filter(Boolean);
+// Tails a run left behind (§5.4): deferred cards spawned by its stages. Presented as a package,
+// which is the point — 30 tails discovered one by one is what made a run look endless.
+const planTails = (board, plan) => {
+  const ids = new Set(plan.cardIds || []);
+  return board.cards.filter((c) => ids.has(c.spawnedFrom)).map((c) => ({ id: c.id, theme: c.theme, draft: !!c.draft, from: c.spawnedFrom }));
+};
+// What the acceptance actually checks: every stage's acceptance[] + the manifest's manualChecks.
+// This is why acceptance is mandatory for an agent-authored card (§4.1) — without it there is
+// nothing to verify and the run would close «на слово».
+function acceptanceScenarios(board, plan) {
+  const out = [];
+  for (const c of planCards(board, plan))
+    for (const a of (c.acceptance || [])) out.push({ from: c.theme || c.id, kind: "функционал", text: a });
+  const man = planReleaseManifest(board, plan.id).releaseManifest || {};
+  for (const m of (man.manualChecks || [])) out.push({ from: "манифест релиза", kind: "ручная проверка", text: itemStr(m) });
+  return out;
+}
+// The one model run of the closing phase (§5.3): a CLEAN checkout, the deterministic commands
+// from the project config, then the functional scenarios. Not a code review — «работает ли оно».
+function launchPlanAcceptance(board, plan) {
+  const projectDir = resolveProjectDir(plan.project);
+  const runDir = planDir(plan);
+  try { fs.mkdirSync(runDir, { recursive: true }); } catch {}
+  const cfg = readProjectConfig(projectDir);
+  const cmds = (cfg && cfg.cfg && cfg.cfg.commands) || {};
+  const scen = acceptanceScenarios(board, plan);
+  const cmdLine = (k, label) => cmds[k] ? `• ${label}: ${cmds[k]}` : `• ${label}: не задана в .grace/project.md → пропусти, отметь check со status:"skip"`;
+  const prompt = [
+    `ПРИЁМКА ПРОГОНА «${plan.goal || plan.id}» — проверь, что оно РАБОТАЕТ. Это НЕ код-ревью: код уже прошёл`,
+    `verify и review на каждом этапе. Твоя задача — предъявить работающий результат целиком.`, ``,
+    `1) ЧИСТЫЙ ЧЕКАУТ. Не трогай рабочий каталог проекта (в нём могут идти другие карточки):`,
+    `   git worktree add "${path.join(runDir, "wt")}" "${plan.integrationBranch}"`,
+    `   Дальше работай ТОЛЬКО в этом каталоге. В конце убери за собой: git worktree remove --force.`, ``,
+    `2) ДЕТЕРМИНИРОВАННАЯ ЧАСТЬ (без интерпретаций — только код возврата):`,
+    cmdLine("typecheck", "typecheck"), cmdLine("test", "test"), cmdLine("build", "build"), ``,
+    `3) ФУНКЦИОНАЛЬНАЯ ЧАСТЬ. Подними приложение${cmds.dev ? ` командой: ${cmds.dev}` : " (команда dev не задана — подними как принято в проекте)"}`,
+    `   и пройди сценарии ниже браузером/curl. Для КАЖДОГО собери доказательство: код ответа, кусок вывода,`,
+    `   путь к скриншоту. «Похоже, работает» без доказательства = status:"fail".`,
+    scen.length ? scen.map((s, i) => `   ${i + 1}) [${s.kind}] ${s.text}   ← из «${s.from}»`).join("\n")
+      : `   (сценариев нет — ни у одного этапа не заполнено acceptance. Отметь это отдельным check со status:"fail":`
+        + `\n    прогон нельзя принять «на слово».)`, ``,
+    `4) РЕЗУЛЬТАТ — строго в ${path.join(runDir, "acceptance.json")}, СТРОГО в этом формате:`,
+    `   {"checks":[{"id":"c1","title":"…","kind":"deterministic|functional","status":"pass|fail|skip",`,
+    `   "output":"хвост вывода/код ответа","evidence":"путь к скриншоту или пусто"}],`,
+    `   "passed":true|false,"failed":["id",…],"notes":"кратко о рисках"}`,
+    `   passed:true ТОЛЬКО если ни одного "fail". Пиши файл ДАЖЕ если всё упало — молчание = провал приёмки.`, ``,
+    `ЗАПРЕТЫ: не мержь, не деплой, не правь код и не коммить в интеграционную ветку. Приёмка только читает.`,
+  ].join("\n");
+  return spawnRun(projectDir, runDir, prompt, "plan-acceptance.log");
+}
+// A plain child process for the deterministic steps (gh / deploy): stdout+stderr into one file the
+// next tick reads. No model, no tokens, and the output IS the evidence.
+function spawnStep(cwd, cmd, outFile) {
+  try {
+    const out = fs.openSync(outFile, "w");
+    const env = { ...process.env, PATH: `${BIN_PATH_HINT}:${process.env.PATH || ""}` };
+    const child = spawn("/bin/sh", ["-lc", `${cmd}; echo "__EXIT__:$?"`], { cwd, env, detached: true, stdio: ["ignore", out, out] });
+    child.unref();
+    return { started: true, pid: child.pid };
+  } catch (e) { return { started: false, error: String(e.message || e) }; }
+}
+// Read a step's output file once the child has written its exit marker.
+function readStep(outFile) {
+  let text = "";
+  try { text = fs.readFileSync(outFile, "utf8"); } catch { return null; }
+  const m = text.match(/__EXIT__:(\d+)\s*$/);
+  if (!m) return null;                       // still running
+  return { code: Number(m[1]), text: text.replace(/__EXIT__:\d+\s*$/, "").trim() };
+}
+
+// The PR body (§5.4). Assembled from what the board already knows — this is the single
+// human-readable trace of a run, and it is written whether the merge is manual or auto.
+function prBody(board, plan, pol) {
+  const cards = planCards(board, plan);
+  const rm = planReleaseManifest(board, plan.id);
+  const acc = (plan.result && plan.result.acceptance) || null;
+  const tails = planTails(board, plan);
+  const L = [];
+  L.push(`## Цель прогона`, plan.goal || `Прогон ${plan.id}`, ``);
+  L.push(`Ветка: \`${plan.integrationBranch}\` · режим: ${plan.mode} · политика: pr=${pol.pr} merge=${pol.merge} deploy=${pol.deploy}`, ``);
+  L.push(`## Этапы (${cards.length})`);
+  for (const c of cards) L.push(`- **${c.theme || c.id}** — ${c.column}${c.branchLink ? ` · [ветка](${c.branchLink})` : ""}${c.finishNote ? `\n  ${String(c.finishNote).split("\n")[0]}` : ""}`);
+  L.push(``, `## Манифест релиза`);
+  for (const s of MANIFEST_SECTIONS) {
+    const items = (rm.releaseManifest && rm.releaseManifest[s]) || [];
+    L.push(`**${s}** — ${items.length ? "" : "_проверял, пусто_"}`);
+    for (const it of items) L.push(`- ${itemStr(it)}`);
+  }
+  const miss = rm.stages.filter((s) => (s.manifestMissing || []).length);
+  if (miss.length) L.push(``, `> ⚠ этапы с ПРОПУЩЕННЫМИ ключами манифеста (не «пусто», а «забыл»): ` + miss.map((s) => `${s.theme || s.id}: ${s.manifestMissing.join(", ")}`).join(" · "));
+  if ((rm.warnings || []).length) L.push(``, `> ⚠ конфликты слияния манифеста: ` + rm.warnings.join(" · "));
+  L.push(``, `## Приёмка`);
+  if (!acc) L.push(`_не проводилась_`);
+  else {
+    L.push(acc.passed ? `✅ **зелёная** — все проверки прошли` : `❌ **красная** — провалено: ${(acc.failed || []).join(", ") || "см. ниже"}`);
+    for (const c of (acc.checks || [])) L.push(`- ${c.status === "pass" ? "✅" : c.status === "skip" ? "⏭" : "❌"} [${c.kind || "?"}] ${c.title || c.id}${c.output ? ` — \`${String(c.output).slice(0, 200).replace(/\n/g, " ")}\`` : ""}${c.evidence ? ` · доказательство: ${c.evidence}` : ""}`);
+    if (acc.notes) L.push(``, `Риски по итогам приёмки: ${acc.notes}`);
+  }
+  const auto = cards.flatMap((c) => ((c.result && c.result.autoDecisions) || []).map((d) => ({ c, d })));
+  L.push(``, `## Решения, принятые без человека (AUTO)`);
+  if (!auto.length) L.push(`_нет — все развилки прошли через человека_`);
+  for (const { c, d } of auto) L.push(`- **${d.chosenTitle || d.choice}** — ${d.q}${d.ownText ? ` · _${d.ownText}_` : ""} (этап «${c.theme || c.id}»)`);
+  L.push(``, `## Хвосты (${tails.length})`);
+  if (!tails.length) L.push(`_нет_`);
+  for (const t of tails) L.push(`- ${t.theme}${t.draft ? " _(черновик — ждёт проверки человеком)_" : ""}`);
+  const floor = rm.floor || [];
+  L.push(``, `## Открытые риски`);
+  if (floor.length) for (const f of floor) L.push(`- ⚠ жёсткий пол: **${f.class}** — ${f.detail} (этап ${f.stage})`);
+  const blocked = cards.filter((c) => c.column === "blocked");
+  for (const c of blocked) L.push(`- ⚠ этап «${c.theme}» остался заблокированным: ${c.blockReason || ""}`);
+  if (!floor.length && !blocked.length) L.push(`_не обнаружены_`);
+  L.push(``, `---`, `_собрано доской автоматически при закрытии прогона \`${plan.id}\`_`);
+  return L.join("\n");
+}
+
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+function planNotice(plan, text, level) {
+  plan.result = plan.result || {};
+  plan.result.notice = { ts: new Date().toISOString(), level: level || "info", text };
+  try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: plan.result.notice.ts, event: "plan-notice", planId: plan.id, level: plan.result.notice.level, text }) + "\n"); } catch {}
+}
+function logPlan(plan, event, extra) {
+  try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event, planId: plan.id, ...extra }) + "\n"); } catch {}
+}
+// Coerce whatever the acceptance run wrote into the §5.3 shape. A malformed file is a FAILED
+// acceptance, never an assumed-green one — «passed» must be earned, not defaulted.
+function normalizeAcceptance(raw) {
+  const checks = Array.isArray(raw && raw.checks) ? raw.checks.map((c, i) => ({
+    id: String((c && c.id) || "c" + (i + 1)), title: String((c && c.title) || "проверка"),
+    kind: (c && c.kind) === "deterministic" ? "deterministic" : (c && c.kind) === "functional" ? "functional" : "functional",
+    status: ["pass", "fail", "skip"].includes(c && c.status) ? c.status : "fail",
+    output: c && c.output ? String(c.output).slice(0, 4000) : null,
+    evidence: c && c.evidence ? String(c.evidence).slice(0, 500) : null,
+  })) : [];
+  const failed = checks.filter((c) => c.status === "fail").map((c) => c.id);
+  return { ranAt: new Date().toISOString(), checks, failed,
+    passed: checks.length > 0 && failed.length === 0 && raw.passed !== false,
+    notes: raw && raw.notes ? String(raw.notes).slice(0, 2000) : null,
+    evidence: checks.filter((c) => c.evidence).map((c) => c.evidence) };
+}
+
+// The closing state machine. ONE step per plan per tick: every step either spawns a child and
+// parks, or reads that child's output file. The tick itself never waits on anything.
+function planCloseTick(board) {
+  let changed = false;
+  for (const plan of (board.plans || [])) {
+    if (plan.closeStep === "closed") continue;
+    const cards = planCards(board, plan);
+    if (!cards.length) continue;
+    const pol = policyFor(board, plan);
+    const dir = planDir(plan), projectDir = resolveProjectDir(plan.project);
+    const acc = () => (plan.result && plan.result.acceptance) || null;
+
+    // ── start: every stage reached `ready` → the closing phase begins by itself (§5.2) ──
+    if (!plan.closeStatus) {
+      if (plan.archived) continue;                       // a run dismissed by hand is not closed
+      // A run assembled BEFORE this feature existed carries no `policy` — and its stages have
+      // long been `ready`. Closing it now would spawn an acceptance run over finished work in a
+      // live project (it did, on two runs, during this very step). The closing phase applies to
+      // runs launched with a policy, i.e. from this version on; older runs stay as they are.
+      if (!plan.policy) continue;
+      if (!cards.every((c) => c.column === TERMINAL)) continue;
+      plan.closeStatus = "verifying";
+      plan.closeStep = "acceptance";
+      plan.policy = pol;
+      plan.result = { ...(plan.result || {}), releaseManifest: planReleaseManifest(board, plan.id),
+        tails: planTails(board, plan), closingStartedAt: new Date().toISOString() };
+      const launch = launchPlanAcceptance(board, plan);
+      plan.acceptanceRun = { pid: launch.pid || null, log: launch.log || null, launched: !!launch.launched,
+        error: launch.error || null, startedAt: new Date().toISOString() };
+      logPlan(plan, "plan-closing", { stages: cards.length, policy: pol, launched: !!launch.launched });
+      changed = true;
+      continue;
+    }
+    // Terminal statuses stop the machine — but `awaiting-merge` / `awaiting-deploy` are exactly
+    // the states that tell the human WHAT IS LEFT FOR HIM, so they are never collapsed to "closed".
+    if (plan.closeStatus === "done" || plan.closeStatus === "failed") {
+      if (plan.closeStep !== "closed" && !String(plan.closeStep || "").startsWith("awaiting")) { plan.closeStep = "closed"; changed = true; }
+      continue;
+    }
+
+    // ── acceptance (§5.3): wait for acceptance.json; a silent/dead run is a RED acceptance ──
+    if (plan.closeStep === "acceptance") {
+      let raw = null;
+      try { raw = JSON.parse(fs.readFileSync(path.join(dir, "acceptance.json"), "utf8")); } catch {}
+      if (raw && typeof raw === "object") {
+        plan.result.acceptance = normalizeAcceptance(raw);
+        plan.closeStep = "pr";
+        logPlan(plan, "plan-acceptance", { passed: plan.result.acceptance.passed, failed: plan.result.acceptance.failed.length });
+        changed = true;
+      } else {
+        const started = Date.parse((plan.acceptanceRun || {}).startedAt || "") || 0;
+        const dead = !plan.acceptanceRun || !plan.acceptanceRun.launched
+          || (!isAlive(plan.acceptanceRun.pid) && Date.now() - started > ACCEPT_GRACE_MS);
+        const tooLong = Date.now() - started > STALL_MS;
+        if (dead || tooLong) {
+          plan.result.acceptance = normalizeAcceptance({ passed: false, checks: [{ id: "run", title: "Ран приёмки не отчитался", kind: "deterministic", status: "fail",
+            output: tailLog((plan.acceptanceRun || {}).log || "", 40) || ((plan.acceptanceRun || {}).error || "") }],
+            notes: dead ? "процесс приёмки умер, не записав acceptance.json" : "приёмка превысила бюджет времени" });
+          plan.closeStep = "pr";
+          logPlan(plan, "plan-acceptance", { passed: false, reason: dead ? "dead" : "timeout" });
+          changed = true;
+        }
+      }
+      continue;
+    }
+
+    // ── PR — ВСЕГДА (§5.4). Red acceptance opens it as a draft: a run that did not pass must
+    //    still leave its trace, just not look mergeable.
+    if (plan.closeStep === "pr") {
+      try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+      const bodyFile = path.join(dir, "pr-body.md");
+      try { fs.writeFileSync(bodyFile, prBody(board, plan, pol)); } catch {}
+      plan.result.prBodyFile = bodyFile;
+      if (pol.pr === "never") {
+        plan.result.pr = { url: null, draft: false, ok: false, skipped: true, error: `pr=never — PR не создавался; тело собрано в ${bodyFile}` };
+        plan.closeStep = "post-pr"; changed = true; continue;
+      }
+      const draft = !(acc() && acc().passed);
+      const title = (plan.goal || `Прогон ${plan.id}`).slice(0, 160);
+      const cmd = `${GH_BIN} pr create --base main --head ${shq(plan.integrationBranch)} --title ${shq(title)} --body-file ${shq(bodyFile)}${draft ? " --draft" : ""}`;
+      const st = spawnStep(projectDir, cmd, path.join(dir, "pr.out"));
+      plan.prRun = { ...st, draft, startedAt: new Date().toISOString() };
+      plan.closeStep = "pr-wait"; changed = true;
+      logPlan(plan, "plan-pr", { draft, started: st.started });
+      continue;
+    }
+    if (plan.closeStep === "pr-wait") {
+      const r = readStep(path.join(dir, "pr.out"));
+      const started = Date.parse((plan.prRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.prRun || {}).started) continue;
+      const draft = !!(plan.prRun || {}).draft;
+      const url = r ? (r.text.match(/https?:\/\/\S+/) || [])[0] || null : null;
+      plan.result.pr = { url, draft, ok: !!(r && r.code === 0),
+        error: r && r.code === 0 ? null : `PR не создан (${r ? "gh код " + r.code : "gh не ответил"}): ${r ? r.text.slice(-400) : (plan.prRun || {}).error || ""} · тело PR лежит в ${plan.result.prBodyFile}` };
+      plan.closeStep = "post-pr"; changed = true;
+      logPlan(plan, "plan-pr-done", { ok: plan.result.pr.ok, draft, url });
+      continue;
+    }
+
+    // ── §5.5 branching table ────────────────────────────────────────────────────────────
+    if (plan.closeStep === "post-pr") {
+      const a = acc();
+      if (!a || !a.passed) {                       // красная приёмка · любой merge · любой deploy
+        plan.closeStatus = "failed"; plan.closeStep = "closed";
+        planNotice(plan, `Приёмка красная — PR оставлен черновиком, деплоя не было. Провалено: ${(a && a.failed || []).join(", ") || "см. PR"}`, "error");
+        logPlan(plan, "plan-failed", { failed: (a && a.failed) || [] });
+        changed = true; continue;
+      }
+      if (pol.merge === "manual") {                // зелёная · manual → единственная кнопка человека
+        plan.closeStatus = "done"; plan.closeStep = "awaiting-merge";
+        planNotice(plan, `Приёмка зелёная — готово к мержу.${plan.result.pr && plan.result.pr.url ? " PR: " + plan.result.pr.url : ""}`, "ok");
+        logPlan(plan, "plan-awaiting-merge", {});
+        changed = true; continue;
+      }
+      if (!(plan.result.pr && plan.result.pr.ok && plan.result.pr.url)) {
+        // merge:auto без PR мержить нечем — и мержить в обход PR нельзя: PR это единственный след
+        plan.closeStatus = "done"; plan.closeStep = "awaiting-merge";
+        planNotice(plan, `Приёмка зелёная, но PR не создан — автомерж невозможен, мерж за человеком. ${plan.result.pr ? plan.result.pr.error : ""}`, "warn");
+        changed = true; continue;
+      }
+      const st = spawnStep(projectDir, `${GH_BIN} pr merge ${shq(plan.result.pr.url)} --merge --delete-branch=false`, path.join(dir, "merge.out"));
+      plan.mergeRun = { ...st, startedAt: new Date().toISOString() };
+      plan.closeStep = "merge-wait"; changed = true;
+      logPlan(plan, "plan-merge", { started: st.started });
+      continue;
+    }
+    if (plan.closeStep === "merge-wait") {
+      const r = readStep(path.join(dir, "merge.out"));
+      const started = Date.parse((plan.mergeRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 5 * 60 * 1000 && (plan.mergeRun || {}).started) continue;
+      plan.result.merge = { ok: !!(r && r.code === 0), output: r ? r.text.slice(-600) : null,
+        error: r && r.code === 0 ? null : `мерж не прошёл (${r ? "код " + r.code : "gh не ответил"})` };
+      if (!plan.result.merge.ok) {
+        plan.closeStatus = "done"; plan.closeStep = "awaiting-merge";
+        planNotice(plan, `Автомерж не прошёл — мерж за человеком. ${plan.result.merge.error}`, "warn");
+        changed = true; continue;
+      }
+      plan.closeStep = "deploy"; changed = true;
+      logPlan(plan, "plan-merged", {});
+      continue;
+    }
+
+    // ── deploy: the mechanical floor sits BEFORE the policy, not after it ──────────────
+    if (plan.closeStep === "deploy") {
+      const cfg = readProjectConfig(projectDir);
+      const stand = (cfg && cfg.cfg && cfg.cfg.stand) || {};
+      const isProd = String(stand.is_production) === "true";
+      const deployCmd = stand.deploy_cmd || null;    // lives in .grace/local.md (not in git)
+      const finish = (text, level) => { plan.closeStatus = "done"; plan.closeStep = "closed"; planNotice(plan, text, level || "ok"); plan.archived = true; changed = true; };
+      if (pol.deploy === "off") { finish(`Прогон закрыт: смержено, деплой выключен политикой.`); continue; }
+      if (pol.deploy === "ask" || isProd) {
+        plan.closeStatus = "done"; plan.closeStep = "awaiting-deploy";
+        plan.result.deploy = { status: "awaiting-human", reason: isProd && pol.deploy !== "ask"
+          ? "stand.is_production: true — деплой требует человека независимо от autonomy (жёсткий пол §5.1)"
+          : "политика deploy=ask" };
+        planNotice(plan, `Смержено. Деплой ждёт человека: ${plan.result.deploy.reason}`, "warn");
+        logPlan(plan, "plan-deploy-hold", { reason: plan.result.deploy.reason });
+        changed = true; continue;
+      }
+      if (!deployCmd) {
+        plan.result.deploy = { status: "no-command", reason: "stand.deploy_cmd не задан в .grace/local.md" };
+        finish(`Смержено. Деплой не выполнен: команда выкатки не задана (.grace/local.md → stand.deploy_cmd).`, "warn");
+        continue;
+      }
+      const st = spawnStep(projectDir, deployCmd, path.join(dir, "deploy.out"));
+      plan.deployRun = { ...st, startedAt: new Date().toISOString() };
+      plan.result.deploy = { status: "running", cmd: deployCmd };
+      plan.closeStep = "deploy-wait"; changed = true;
+      logPlan(plan, "plan-deploy", { started: st.started });
+      continue;
+    }
+    if (plan.closeStep === "deploy-wait") {
+      const r = readStep(path.join(dir, "deploy.out"));
+      const started = Date.parse((plan.deployRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < STALL_MS && (plan.deployRun || {}).started) continue;
+      const ok = !!(r && r.code === 0);
+      plan.result.deploy = { status: ok ? "done" : "failed", output: r ? r.text.slice(-600) : null,
+        cmd: (plan.result.deploy || {}).cmd || null };
+      plan.closeStatus = "done"; plan.closeStep = "closed";
+      plan.archived = ok;
+      planNotice(plan, ok ? `Прогон закрыт: смержено и раскатано.`
+        : `Смержено, НО деплой упал — нужен человек (пост-деплой smoke и автооткат — отдельная карточка бэклога).`, ok ? "ok" : "error");
+      logPlan(plan, "plan-deployed", { ok });
+      changed = true;
+      continue;
+    }
+  }
+  return changed;
+}
+// endregion FUNC_planClose
+
 // ── dispatch: write a grace-feature-dev-compatible seed into the project ─────
 function dispatch(card) {
   const projectDir = resolveProjectDir(card.project);
@@ -259,6 +1279,41 @@ function recordLaunch(card, launch, kind) {
   }
 }
 
+// region FUNC_autonomy — effective autonomy + the AUTO escalation-threshold override (§5.3)
+// ## @purpose Resolve a card's effective autonomy (own override → global default) and, when
+// ##   it's `auto`, emit the prompt block that FLIPS the ask-gate escalation threshold: don't
+// ##   escalate reversible forks — pick the strongest option, justify it, continue. The HARD
+// ##   FLOOR (irreversibility, cost, legal, provider, contract-shaping data model) still stops
+// ##   for a human even in AUTO; such a fork is tagged floor:true and left for the human.
+// ## @invariants ask (default) = byte-identical to today's behaviour — the block is empty.
+const effAutonomy = (card) => (card && AUTONOMIES.includes(card.autonomy)) ? card.autonomy : GLOBAL_AUTONOMY;
+// S4: the git branch a card commits to — a plan stage shares the plan's integration branch
+// (set at plan creation), a single card keeps its own autodev/<slug>.
+const branchFor = (card) => card.integrationBranch || ("autodev/" + card.slug);
+function autonomyBlock(card) {
+  if (effAutonomy(card) !== "auto") return "";
+  return [
+    `РЕЖИМ AUTO (autonomy=auto) — НЕ эскалируй ОБРАТИМЫЕ решения человеку: по каждой развилке ВЫБЕРИ`,
+    `сильнейший вариант, зафиксируй краткое обоснование в "ownText" и ПРОДОЛЖАЙ без остановки.`,
+    `ЖЁСТКИЙ ПОЛ (стоп к человеку ДАЖЕ в AUTO — не выбирай сам): необратимость (деструктивная миграция,`,
+    `удаление данных), стоимость, юридика/резидентность/выбор провайдера, форма модели данных, влияющая`,
+    `на контракт. Развилку из пола помечай "floor":true в её объекте archQuestions и оставляй человеку.`,
+    `Мержить в main САМ НЕ имеешь права (git-пол) — доводи до "ready" в ветку, финальный PR утверждает человек.`,
+  ].join("\n");
+}
+// S5: plan-level decisions taken ONCE at the summary gate ride every stage seed so a stage
+// never re-asks what the plan already settled (roadmap §2 Фаза 1). Empty for single cards.
+function planDecisionsBlock(card) {
+  const d = Array.isArray(card.planDecisions) ? card.planDecisions.filter((x) => x && x.q) : [];
+  if (!d.length) return "";
+  return [
+    `ПЛАН-УРОВНЕВЫЕ РЕШЕНИЯ (приняты человеком на сводном гейте прогона — СОБЛЮДАЙ, НЕ переспрашивай):`,
+    ...d.map((x) => `• ${x.q} → ${x.chosenTitle || x.a || x.choice || "(решено)"}${x.ownText ? " — " + x.ownText : ""}`),
+    `Эти решения уже сделаны на уровне прогона: не выноси их снова в questions/archQuestions.`,
+  ].join("\n");
+}
+// endregion FUNC_autonomy
+
 // region FUNC_spawnRun — detached headless Claude run (dir-scoped, logged)
 function spawnRun(projectDir, runDir, prompt, logName) {
   if (!AUTORUN) return { launched: false, reason: "GRACE_AUTORUN=0" };
@@ -279,10 +1334,16 @@ function spawnRun(projectDir, runDir, prompt, logName) {
 function launchAskFunctional(card, projectDir, runDir) {
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
+  const auto = autonomyBlock(card);
+  const planDec = planDecisionsBlock(card);
+  const brief = briefBlock(card);
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
+    brief ? `${brief}\n` : ``,
     dirs ? `${dirs}\n` : ``,
+    auto ? `${auto}\n` : ``,
+    planDec ? `${planDec}\n` : ``,
     `AUTONOMOUS HEADLESS — ЭТАП ASKING, БЛОК 1 (ФУНКЦИОНАЛ). Сделай discovery + краткую разведку, затем ОСТАНОВИСЬ.`,
     `ПОРОГ ЭСКАЛАЦИИ — спрашивать человека МОЖНО ТОЛЬКО если решение: (а) меняет ПОВЕДЕНИЕ продукта или объём`,
     `(что система делает/не делает для пользователя), ЛИБО (б) это настоящая развилка с внешними последствиями`,
@@ -312,11 +1373,17 @@ function launchAskArchitecture(card, projectDir, runDir, funcQA, rigor) {
   const qa = (funcQA || []).map((p) => `Q: ${p.q}\nA: ${p.a || "(нет ответа)"}`).join("\n");
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
+  const auto = autonomyBlock(card);
+  const planDec = planDecisionsBlock(card);
+  const brief = briefBlock(card);
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
+    brief ? `${brief}\n` : ``,
     `Ответы по функционалу (блок 1):\n${qa}\n`,
     dirs ? `${dirs}\n` : ``,
+    auto ? `${auto}\n` : ``,
+    planDec ? `${planDec}\n` : ``,
     `AUTONOMOUS HEADLESS — ЭТАП ASKING, БЛОК 2 (АРХИТЕКТУРА). На основе функциональных ответов реши, нужны ли`,
     `АРХИТЕКТУРНЫЕ развилки. ТОЛЬКО классифицируй и выйди — НЕ пиши код и НЕ строй build здесь (его запустит диспетчер).`,
     `ПОРОГ ЭСКАЛАЦИИ — развилка идёт человеку ТОЛЬКО если это настоящий выбор с внешними последствиями (стоимость,`,
@@ -345,12 +1412,25 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
   const rigorLine = `Rigor: ${rigor || "off"}. Apply markup per grace-feature-dev SKILL §3 — grace = full semantic exoskeleton (MODULE/FUNCTION_CONTRACT) + LDD [IMP:N] logs; off = the repo's own idiom, no GRACE markers.`;
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
+  const auto = autonomyBlock(card);
+  const planDec = planDecisionsBlock(card);
+  const brief = briefBlock(card);
+  // S4: a plan stage commits to the plan's SHARED integration branch (base = its tip → sees
+  // predecessors' commits, §4); a single card keeps its own autodev/<slug>. branchFor() is the
+  // single source of the branch name across green-checkpoints, the final push, and resume.
+  const branch = branchFor(card);
+  const baseLine = card.integrationBranch
+    ? `ЭТАП ПРОГОНА: работай в ОБЩЕЙ интеграционной ветке "${branch}" (одна на весь прогон). Если её нет — создай от свежего main; иначе checkout и продолжай С ЕЁ TIP — ты ВИДИШЬ коммиты предыдущих этапов (§4). НЕ ответвляй заново от main на каждом этапе.`
+    : `работай в выделенной ветке "${branch}" — ответви её от свежего main в начале.`;
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
+    brief ? `${brief}\n` : ``,
     fq ? `Ответы по функционалу:\n${fq}\n` : ``,
     ad ? `Принятые архитектурные решения (человек выбрал — СОБЛЮДАЙ их):\n${ad}\n` : ``,
     dirs ? `${dirs}\n` : ``,
+    auto ? `${auto}\n` : ``,
+    planDec ? `${planDec}\n` : ``,
     rigorLine,
     recovery ? `${recovery}\n` : ``,
     `AUTONOMOUS HEADLESS BUILD. Resume from board.json. Запусти полный процесс: architecture (СОБЛЮДАЯ выбранные`,
@@ -366,13 +1446,13 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
     `renders this decomposition, so stale per-card columns make it lie. Update them at each card phase boundary.`,
     `GREEN-CHECKPOINT (LA4 «вечно зелёный билд» + точки отката): КАЖДЫЙ раз, когда декомпозированная карточка`,
     `проходит verify И review зелёными и ты переводишь её "cards[].column" в "done" — сделай на ветке`,
-    `"autodev/${card.slug}" микро-коммит: сначала "git add" СТРОГО по файлам из card.files[] ЭТОЙ карточки`,
+    `"${branch}" микро-коммит: сначала "git add" СТРОГО по файлам из card.files[] ЭТОЙ карточки`,
     `(НИКОГДА не "git add ." и не "-A" — чекпоинт атомарный, чужие изменения не тянем), затем`,
     `"git commit -m 'green(<cardId>): <краткий title карточки>'". Коммить ТОЛЬКО на зелёной карточке. Провал`,
     `verify/review (карточка вернулась в implementing или ушла в blocked по Anti-Loop) → НЕ коммить; последний`,
     `зелёный чекпоинт оставляем нетронутым, человек продолжит от него. Эти green-коммиты — атомарные точки`,
     `отката ("git restore --source=<sha> -- <файл>"); финальный push перед "ready" (см. BRANCH & HANDOFF) идёт`,
-    `в ту же ветку "autodev/${card.slug}" и эти коммиты НЕ заменяет.`,
+    `в ту же ветку "${branch}" и эти коммиты НЕ заменяет.`,
     `DEFINITION OF DONE (гейт перед "ready" — НЕ помечай карточку/слайс done, пока не выполнено):`,
     `карточка НЕ уходит в done/ready, если в её файлах остались TODO/FIXME/HACK/XXX/NotImplementedError/`,
     `заглушки (placeholder-возвраты, выброшенные значения), КРОМЕ случая, когда строка покрыта проходящим`,
@@ -384,11 +1464,19 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
     `НИКОГДА не "db push"/ручной DDL на прод-пути. Миграция forward-only и backward-compatible (аддитивная;`,
     `без деструктивных DROP без two-step). Запиши путь файла в top-level "migration" и в "finishNote".`,
     `Только db push без файла миграции = НЕ done.`,
-    `BRANCH & HANDOFF (ОБЯЗАТЕЛЬНО, не коммить в main напрямую): работай в выделенной ветке`,
-    `"autodev/${card.slug}" — ответви её от свежего main в начале. Когда все гейты зелёные и до того как ставишь`,
-    `"column":"ready": закоммить, "git push -u origin autodev/${card.slug}", и запиши в board.json top-level`,
+    `МАНИФЕСТ РЕЛИЗА (§6.1, ОБЯЗАТЕЛЬНО перед "ready"): запиши top-level "deploy" — объект РОВНО с 5`,
+    `ключами-массивами {"migrations":[],"env":[],"services":[],"seed":[],"manualChecks":[]}. Это ран-бук`,
+    `раскатки ЭТОЙ единицы: migrations — новые файлы миграций (forward-only) в порядке применения;`,
+    `env — новые/изменённые переменные окружения (строка "KEY=зачем" или {"name","value","note"}); services —`,
+    `новые/изменённые сервисы/воркеры/systemd-юниты/cron-таймеры; seed — сиды и разовые backfill-скрипты в`,
+    `порядке прогона; manualChecks — что прокликать руками после раскатки. ВСЕ 5 ключей ОБЯЗАТЕЛЬНЫ: пустой`,
+    `массив [] = «проверял, пусто», ОТСУТСТВИЕ ключа = «забыл» → карточка НЕ done. Одиночное поле "migration"`,
+    `продолжай писать для совместимости, но тот же путь ОБЯЗАН быть и в "deploy".migrations.`,
+    `BRANCH & HANDOFF (ОБЯЗАТЕЛЬНО, не коммить в main напрямую): ${baseLine} Когда все гейты зелёные и до того`,
+    `как ставишь "column":"ready": закоммить, "git push -u origin ${branch}", и запиши в board.json top-level`,
     `"branchLink" — URL ветки/compare на GitHub (origin remote), который человек должен проревьюить и подлить в main.`,
     `Если push невозможен (нет remote/доступа) — оставь имя ветки в "branchLink" и опиши это в "finishNote".`,
+    card.integrationBranch ? `main САМ НЕ мержь — финальный PR прогона в main утверждает человек (git-пол, §4/§5.3).` : ``,
     `ИТОГИ КАРТОЧКИ: всегда заполняй top-level "finishNote" коротким резюме сделанного. ОТЛОЖЕННОЕ указывай ЯВНО`,
     `и СТРУКТУРНО: top-level "deferred" — массив объектов {"title":"кратко что не сделано","reason":"почему/куда`,
     `вынесено"}. Эти пункты доска автоматически заведёт карточками в backlog. Продублируй их разделом "Отложенное:"`,
@@ -409,9 +1497,173 @@ function blockCard(card, reason) {
   card.column = "blocked";
   card.blockReason = reason;
   card.lastColumnChangeAt = new Date().toISOString();
+  card.result = buildResult(card); // SR: freeze the block reason into «Результат» (this card is skipped by the next sync pass)
   card.history.push({ column: "blocked", ts: card.lastColumnChangeAt, via: "supervisor", reason });
   try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "blocked", cardId: card.id, reason }) + "\n"); } catch {}
 }
+
+// region FUNC_warden — the board CALLS the agent; the agent never polls the board (design §2)
+// ## @purpose 3.6 h of a single run were lost to token-limit deaths: autoheal fires its one
+// ##   retry, the global limit kills that too, the card lands in `blocked` and waits for a
+// ##   human to relaunch it by hand. A stuck card needs a JUDGEMENT (temporary limit? crashed
+// ##   before writing its questions? environment broken?) and that judgement needs a model —
+// ##   but a model called every 30 s is pure waste. So: the supervisor stays a free timer, and
+// ##   the model is invoked ONLY on an event — «about to block», «asking too long», «stalled».
+// ## @io (board,card,meta) -> spawn/POST one warden run + card.wardenPending
+// ##     HTTP: GET /api/health · POST /api/tasks/:id/pause|resume|note · POST /api/hooks/warden
+// ## @invariants
+// ## - NO hook registered → escalate() === blockCard(), i.e. today's behaviour byte for byte.
+// ##   The warden is an addition, never a dependency: a broken/absent agent must not strand a card.
+// ## - Deferred block: when a hook IS registered the supervisor does NOT block immediately — it
+// ##   hands the card to the warden and blocks only if no answer comes within WARDEN_TIMEOUT_MS.
+// ##   That is what lets a quota death end in `paused` instead of `blocked`.
+// ## - `asking` events NEVER auto-block: there the human is legitimately being waited on.
+// ## - The agent touches state through HTTP only (no board.json write), so local and VPS run the
+// ##   SAME contract — only BOARD_URL and the notify channel differ (§2.5).
+// ## - Budget: WARDEN_BUDGET state-changing actions per card per rolling 24 h (§2.4). Notes are
+// ##   NOT counted — they are diagnosis, and the budget exists to stop ACTION loops.
+// ## @rationale Q: why does the board not classify quota itself? A: §2.3 gives the classifier to
+// ##   the agent. The board only supplies DETERMINISTIC signals (pid alive, questions empty, log
+// ##   tail, how many runs died in the last 60 s) — cheap, honest, and no model call.
+// ## @modulemap
+// ## FUNC 2[calc]   => wardenHook        — registered handler (board.json → env fallback)
+// ## FUNC 3[calc]   => wardenBudget      — interventions used / left in the rolling day
+// ## FUNC 4[calc]   => cardSignals       — deterministic evidence for the classifier
+// ## FUNC 6[io]     => fireWardenEvent   — spawn a command / POST a webhook, once per card
+// ## FUNC 4[persist]=> escalate          — the ONE «something is wrong» exit of the supervisor
+// ## FUNC 3[calc]   => healthReport      — GET /api/health projection
+// GREP_SUMMARY: warden, board-warden, health, pause, resume, note, hooks, quota, crash-before-write, §2
+// STRUCTURE: ▶ supervisor → ⊕ escalate → ⚡ fireWardenEvent(hook) → ⎋ agent → HTTP pause/relaunch/note
+
+const ASK_STALL_MS = Number(process.env.GRACE_ASK_STALL_MIN || 30) * 60 * 1000;
+const WARDEN_TIMEOUT_MS = Number(process.env.GRACE_WARDEN_TIMEOUT_MIN || 10) * 60 * 1000;
+const WARDEN_BUDGET = Number(process.env.GRACE_WARDEN_BUDGET || 5);   // state-changing actions / card / 24 h
+const WARDEN_ACTIONS = new Set(["pause", "resume", "relaunch"]);      // what the budget counts
+const DEATH_WINDOW_MS = 60 * 1000;                                    // §2.3 «несколько ранов умерли в окне < 60 с»
+const WARDEN_LOG_DIR = path.join(DATA_DIR, "warden");
+
+// The registered handler. board.wardenHook wins; GRACE_WARDEN_CMD is the zero-config fallback
+// (a fresh VPS install can arm the warden without an API call).
+function wardenHook(board) {
+  const h = board && board.wardenHook;
+  if (h && h.kind === "command" && h.cmd) return h;
+  if (h && h.kind === "http" && h.url) return h;
+  if (h && h.kind === "off") return null;
+  return process.env.GRACE_WARDEN_CMD ? { kind: "command", cmd: process.env.GRACE_WARDEN_CMD, notify: "desktop" } : null;
+}
+function wardenBudget(card) {
+  const since = Date.now() - 24 * 60 * 60 * 1000;
+  const acts = (card.wardenActions || []).filter((a) => Date.parse(a.ts || "") > since);
+  return { used: acts.length, left: Math.max(0, WARDEN_BUDGET - acts.length), window: "24h" };
+}
+function recordWardenAction(card, action) {
+  const since = Date.now() - 24 * 60 * 60 * 1000;
+  card.wardenActions = (card.wardenActions || []).filter((a) => Date.parse(a.ts || "") > since);
+  card.wardenActions.push({ ts: new Date().toISOString(), action });
+}
+// Deterministic evidence the classifier runs on — no model, no guessing. `deathsInWindow` is the
+// §2.3 «global event» signal: several runs dying inside a minute is a limit, not N card bugs.
+function cardSignals(board, card) {
+  const runDir = path.join(resolveProjectDir(card.project), ".grace-feature-dev", card.slug);
+  const now = Date.now();
+  const deaths = (board.recentDeaths || []).filter((d) => now - (Date.parse(d.ts || "") || 0) < DEATH_WINDOW_MS);
+  const logFile = card.runLog || path.join(runDir, "build.log");
+  return {
+    pidAlive: isAlive(card.runPid),
+    runPid: card.runPid || null,
+    runKind: card.runKind || null,
+    askStage: card.askStage || null,
+    questions: (card.questions || []).length,
+    archQuestions: (card.archQuestions || []).length,
+    minutesInColumn: Math.round((now - (Date.parse(card.lastColumnChangeAt || card.createdAt || "") || now)) / 60000),
+    autoHealCount: card.autoHealCount || 0,
+    deathsInWindow: deaths.length,
+    runDir, logFile,
+    logTail: tailLog(logFile, 60),
+    budget: wardenBudget(card),
+  };
+}
+// Hand ONE event to the warden. Fire-and-forget by design: the supervisor tick must never wait
+// on a model. `blockOnTimeout` decides what happens if the agent stays silent.
+//
+// The event is QUEUED here and dispatched by flushWardenQueue() only AFTER the tick has written
+// board.json. Otherwise the agent (which answers over HTTP within milliseconds) would write the
+// card while this tick still holds an older in-memory copy, and the tick's trailing write would
+// silently erase the pause it just asked for.
+const WARDEN_QUEUE = [];
+function fireWardenEvent(board, card, meta) {
+  const hook = wardenHook(board);
+  if (!hook) return false;
+  const event = {
+    ts: new Date().toISOString(),
+    kind: meta.kind,                       // about-to-block | asking-stalled | crash-before-write
+    hint: meta.hint || null,               // the board's non-binding guess; the agent decides
+    reason: meta.reason || null,
+    boardUrl: `http://${HOST}:${PORT}`,
+    notify: hook.notify || "desktop",
+    card: { id: card.id, theme: card.theme, project: card.project, slug: card.slug, column: card.column,
+            planId: card.planId || null, paused: !!card.paused },
+    signals: cardSignals(board, card),
+  };
+  card.wardenPending = { ts: event.ts, kind: meta.kind, reason: meta.reason || null, blockOnTimeout: !!meta.blockOnTimeout };
+  WARDEN_QUEUE.push({ hook, event, projectDir: resolveProjectDir(card.project) });
+  return true;
+}
+// Deliver every queued event: spawn the command (local) or POST the webhook (VPS). Same JSON body
+// either way — that is what makes «один контракт, различаются BOARD_URL и канал» true (§2.5).
+function flushWardenQueue() {
+  while (WARDEN_QUEUE.length) {
+    const { hook, event, projectDir } = WARDEN_QUEUE.shift();
+    const json = JSON.stringify(event);
+    try {
+      if (hook.kind === "command") {
+        fs.mkdirSync(WARDEN_LOG_DIR, { recursive: true });
+        const out = fs.openSync(path.join(WARDEN_LOG_DIR, `${event.card.id}.log`), "a");
+        const env = { ...process.env, PATH: `${BIN_PATH_HINT}:${process.env.PATH || ""}`,
+          GRACE_WARDEN_EVENT: json, GRACE_BOARD_URL: event.boardUrl, GRACE_CARD_ID: event.card.id };
+        const child = spawn("/bin/sh", ["-lc", hook.cmd], { cwd: projectDir, env, detached: true, stdio: ["ignore", out, out] });
+        child.unref();
+      } else {
+        const u = new URL(hook.url);
+        const req = http.request({ hostname: u.hostname, port: u.port || 80, path: u.pathname + u.search, method: "POST",
+          headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(json) } }, (r) => r.resume());
+        req.on("error", () => {});
+        req.setTimeout(5000, () => req.destroy());
+        req.end(json);
+      }
+      fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: event.ts, event: "warden-call", cardId: event.card.id, kind: event.kind, hint: event.hint, via: hook.kind }) + "\n");
+    } catch (e) {
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "warden-call-failed", cardId: event.card.id, error: String(e.message || e) }) + "\n"); } catch {}
+    }
+  }
+}
+// The single «something is wrong» exit of the supervisor. With a warden armed the block is
+// DEFERRED — that is the whole mechanism behind «quota ends in paused, not blocked».
+function escalate(board, card, reason, meta) {
+  const budget = wardenBudget(card);
+  if (!card.wardenPending && budget.left > 0 && fireWardenEvent(board, card, { ...meta, reason, blockOnTimeout: true })) return;
+  const exhausted = budget.left <= 0 ? " Бюджет стража на сутки исчерпан — решает человек." : "";
+  blockCard(card, reason + exhausted);
+}
+// GET /api/health — every card standing longer than `minutes`, with the evidence a classifier
+// needs. Read-only: the warden looks here first, then acts through the write endpoints.
+function healthReport(board, minutes) {
+  const now = Date.now(), cutMs = minutes * 60 * 1000;
+  const cards = board.cards.filter((c) => {
+    if (c.column === TERMINAL || c.column === "backlog") return false;
+    if (!c.dispatchedAt && !c.queued) return false;
+    return now - (Date.parse(c.lastColumnChangeAt || c.dispatchedAt || "") || now) >= cutMs;
+  }).map((c) => ({
+    id: c.id, theme: c.theme, project: c.project, column: c.column, planId: c.planId || null,
+    queued: !!c.queued, paused: !!c.paused, pausedReason: c.pausedReason || null, pausedUntil: c.pausedUntil || null,
+    blockReason: c.blockReason || null, since: c.lastColumnChangeAt || c.dispatchedAt || null,
+    wardenPending: c.wardenPending || null, lastNote: (c.notes || []).slice(-1)[0] || null,
+    signals: cardSignals(board, c),
+  }));
+  return { ts: new Date().toISOString(), minutes, stallMinutes: Math.round(STALL_MS / 60000),
+    askStallMinutes: Math.round(ASK_STALL_MS / 60000), hook: wardenHook(board) ? "armed" : "none", cards };
+}
+// endregion FUNC_warden
 
 // Read the last `maxLines` lines of a log file (last 64 KB only, so a huge log is cheap).
 function tailLog(file, maxLines) {
@@ -470,6 +1722,10 @@ function syncFromPipeline() {
   const now = Date.now();
   for (const card of board.cards) {
     if (!card.dispatchedAt || card.column === TERMINAL || card.column === "blocked") continue;
+    // S4 §2.2: a paused card is NOT broken — it is waiting out an external limit. Keep its
+    // station and its place in the queue, and take the supervisor's hands off it entirely,
+    // otherwise the liveness watchdog would «heal» it straight back into the dead limit.
+    if (card.paused) continue;
     const projectDir = resolveProjectDir(card.project);
     const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);
     const pipFile = path.join(runDir, "board.json");
@@ -497,6 +1753,18 @@ function syncFromPipeline() {
         if (pip.branchLink && pip.branchLink !== card.branchLink) { card.branchLink = String(pip.branchLink); changed = true; }
         if (pip.finishNote && pip.finishNote !== card.finishNote) { card.finishNote = String(pip.finishNote); changed = true; }
         if (pip.migration && JSON.stringify(pip.migration) !== JSON.stringify(card.migration)) { card.migration = pip.migration; changed = true; }
+        // S3 §4.1: a `contract: TBD` card publishes the contract it designed as top-level
+        // "contract" — mirror it so buildResult exposes it and dependents inherit it.
+        if (typeof pip.contract === "string" && pip.contract.trim() && pip.contract !== card.contractResult) {
+          card.contractResult = pip.contract.slice(0, MAX_DESC); changed = true;
+        }
+        // SR: mirror the 5-section release manifest the build writes at `ready` (generalises
+        // `migration`) + the archDecisions (an AUTO run's own forks feed result.autoDecisions).
+        if (pip.deploy && JSON.stringify(pip.deploy) !== JSON.stringify(card.deploy)) { card.deploy = pip.deploy; changed = true; }
+        if (Array.isArray(pip.archDecisions) && pip.archDecisions.length && JSON.stringify(pip.archDecisions) !== JSON.stringify(card.archDecisions || [])) { card.archDecisions = pip.archDecisions; changed = true; }
+        // Recompute the "Результат" aggregate from the freshly-mirrored fields (§6). Pure —
+        // only writes back (and flags `changed`) when it actually differs.
+        { const r = buildResult(card); if (JSON.stringify(r) !== JSON.stringify(card.result || null)) { card.result = r; changed = true; } }
         // B9: structured deferred[] → auto-spawn backlog cards (once per title, idempotent)
         if (Array.isArray(pip.deferred) && pip.deferred.length) {
           card.deferredSpawned = card.deferredSpawned || [];
@@ -516,6 +1784,18 @@ function syncFromPipeline() {
               column: "backlog", createdAt: new Date().toISOString(), dispatchedAt: null,
               history: [{ column: "backlog", ts: new Date().toISOString() }],
               spawnedFrom: card.id,
+              // S3 §4.2: a tail is NOT a fresh statement of work — it inherits the parent's
+              // context (sources / contract / req link / write footprint) and starts as a
+              // DRAFT: visible on the board, but dispatchBlock() refuses to run it until a
+              // human has looked it over. That is what stopped 30 tails/run being auto-work.
+              origin: "deferred", draft: true,
+              sources: Array.isArray(card.sources) ? card.sources.slice() : [],
+              // a parent whose contract was TBD has already published the real one — hand the
+              // tail the RESULT, not the placeholder, or the tail would re-design it.
+              contract: card.contractResult || card.contract || null,
+              files: Array.isArray(card.files) ? card.files.slice() : [],
+              outOfScope: null, acceptance: [],
+              planId: null, dependsOn: [], autonomy: null,
             });
             card.deferredSpawned.push(title);
             changed = true;
@@ -559,6 +1839,40 @@ function syncFromPipeline() {
         card.history.push({ column: "asking", ts: card.lastColumnChangeAt, via: "auto-architecture" });
         try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "auto-architecture", cardId: card.id, launch }) + "\n"); } catch {}
         changed = true;
+      } else if (Array.isArray(pip.archQuestions) && pip.archQuestions.length
+                 && !(Array.isArray(pip.archDecisions) && pip.archDecisions.length)
+                 && effAutonomy(card) === "auto" && !card.autoResolved) {
+        // AUTO (§5.3): the arch run proposed REAL forks but there's no human in AUTO. Auto-pick the
+        // recommended option per fork — UNLESS a fork is hard-floor (floor:true from the narrow
+        // classifier folded into the arch run), which ALWAYS waits for a human even in AUTO. Any
+        // floor fork present → hold the whole gate for the human (card stays in `asking`).
+        card.autoResolved = true; // idempotent — evaluate the AUTO gate once per card
+        const forks = pip.archQuestions;
+        const floorForks = forks.filter((f) => f && (f.floor === true || (Array.isArray(f.options) && f.options.some((o) => o && o.floor))));
+        if (floorForks.length) {
+          card.autoFloorHeld = floorForks.map((f) => f.q || f.id);
+          card.lastColumnChangeAt = new Date().toISOString();
+          try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "auto-floor-hold", cardId: card.id, forks: card.autoFloorHeld }) + "\n"); } catch {}
+          changed = true;
+        } else {
+          const decisions = forks.map((d) => {
+            const opt = (Array.isArray(d.options) ? d.options : []).find((o) => o && o.recommended) || (d.options || [])[0] || {};
+            return { id: d.id, q: d.q, choice: opt.id || "auto", chosenTitle: opt.title || "авто-выбор", ownText: "AUTO: выбран рекомендованный вариант (обратимо, порог §5.3)" };
+          });
+          try { pip.archDecisions = decisions; pip.askStage = "done"; pip.column = "implementing"; fs.writeFileSync(pipFile, JSON.stringify(pip, null, 2)); } catch {}
+          const launch = launchBuild(card, projectDir, runDir, pip.answers || card.answers || [], decisions, rigor);
+          recordLaunch(card, launch, "build");
+          card.archDecisions = decisions;
+          card.result = buildResult(card); // reflect the AUTO forks in «Результат» immediately (🤖 N)
+          card.buildLaunched = true;
+          card.column = "implementing";
+          card.askStage = "done";
+          card.blockReason = null;
+          card.lastColumnChangeAt = new Date().toISOString();
+          card.history.push({ column: "implementing", ts: card.lastColumnChangeAt, via: "auto-resolve" });
+          try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "auto-resolve", cardId: card.id, autoDecisions: decisions.length, launch }) + "\n"); } catch {}
+          changed = true;
+        }
       }
     }
 
@@ -574,6 +1888,15 @@ function syncFromPipeline() {
       const stalled = alive && lastMoveMs && now - lastMoveMs > STALL_MS;
       if (died || stalled) {
         if (stalled) { try { process.kill(card.runPid, "SIGTERM"); } catch {} }
+        // S4 §2.3: remember the death board-wide. Several deaths inside DEATH_WINDOW_MS is the
+        // objective signature of a GLOBAL event (subscription limit), not N independent bugs —
+        // the warden classifies on this signal, the board only records it.
+        if (died) {
+          board.recentDeaths = (board.recentDeaths || []).filter((d) => now - (Date.parse(d.ts || "") || 0) < 10 * 60 * 1000);
+          board.recentDeaths.push({ ts: new Date().toISOString(), cardId: card.id, column: card.column });
+          if (board.recentDeaths.length > 20) board.recentDeaths = board.recentDeaths.slice(-20);
+          changed = true;
+        }
         const fromCol = card.column;
         const how = stalled ? "ЗАВИС" : "УМЕР";
         const humanTail = stalled
@@ -589,7 +1912,7 @@ function syncFromPipeline() {
             tail || "(лог пуст/недоступен)",
             `----- /log tail -----`,
             `Диагностируй причину по этому хвосту САМ (отдельный вызов модели не нужен) и продолжи с самого`,
-            `дальнего ЗЕЛЁНОГО чекпоинта: "git log --oneline" в ветке "autodev/${card.slug}" → коммиты`,
+            `дальнего ЗЕЛЁНОГО чекпоинта: "git log --oneline" в ветке "${branchFor(card)}" → коммиты`,
             `"green(<cardId>): …"; при необходимости "git restore --source=<sha> -- <файл>". Фичу заново НЕ начинай.`,
           ].join("\n");
           const rigor = (card.rigor && card.rigor !== "auto") ? card.rigor : "off";
@@ -605,19 +1928,68 @@ function syncFromPipeline() {
             changed = true;
           } else {
             // the auto-relaunch itself failed to spawn → escalate now
-            blockCard(card, `${humanTail} Авто-исцеление не помогло — перезапуск не стартовал${launch && launch.error ? ": " + launch.error : ""}. Открой лог и перезапусти вручную.`);
+            escalate(board, card, `${humanTail} Авто-исцеление не помогло — перезапуск не стартовал${launch && launch.error ? ": " + launch.error : ""}. Открой лог и перезапусти вручную.`, { kind: "about-to-block", hint: "stall-real" });
             changed = true;
           }
         } else {
-          // second consecutive failure (or an unsafe project path) → escalate
+          // second consecutive failure (or an unsafe project path) → escalate. With a warden armed
+          // this HANDS THE CARD OVER instead of blocking it — §2.1: the board calls the agent.
           const healed = (card.autoHealCount || 0) >= 1 ? " Авто-исцеление уже применялось и не помогло." : "";
-          blockCard(card, `${humanTail}${healed} Открой лог и перезапусти.`);
+          escalate(board, card, `${humanTail}${healed} Открой лог и перезапусти.`, { kind: "about-to-block", hint: stalled ? "stall-real" : "run-died" });
           changed = true;
         }
       }
     }
+
+    // 3) S4 · the `asking` watchdog. ACTIVE_COLUMNS deliberately excludes `asking` — there the
+    //    run has exited and we wait on the HUMAN, so a dead pid is expected. But two states are
+    //    not a human wait at all: (a) crash-before-write — the run died before writing its
+    //    questions, so the card sits in `asking` with questions:[] and nothing to answer (the
+    //    exact dead end of 25.07); (b) the card has sat in `asking` past ASK_STALL_MS. Both go
+    //    to the warden, and NEITHER auto-blocks: blocking a card a human may simply not have
+    //    answered yet would be a lie.
+    if (card.column === "asking" && !card.queued && !card.paused && !card.wardenPending) {
+      const cooldownOk = !card.wardenCooldownUntil || now > Date.parse(card.wardenCooldownUntil);
+      const sinceMove = now - (Date.parse(card.lastColumnChangeAt || card.dispatchedAt || "") || now);
+      const nothingToAnswer = !(card.questions || []).length && !(card.archQuestions || []).length;
+      const crashed = nothingToAnswer && card.askStage !== "done" && !isAlive(card.runPid)
+        && sinceMove > LIVENESS_GRACE_MS;
+      if (cooldownOk && (crashed || sinceMove > ASK_STALL_MS)) {
+        if (fireWardenEvent(board, card, {
+          kind: crashed ? "crash-before-write" : "asking-stalled",
+          hint: crashed ? "crash-before-write" : "needs-human",
+          reason: crashed
+            ? `Карточка в «asking» без вопросов: ран умер до того, как записал questions — человеку отвечать не на что.`
+            : `Карточка стоит в «asking» больше ${Math.round(ASK_STALL_MS / 60000)} мин.`,
+          blockOnTimeout: false,
+        })) changed = true;
+      }
+    }
+
+    // 4) S4 · the warden did not answer. A deferred block is a promise: either the agent acts
+    //    within WARDEN_TIMEOUT_MS, or the board keeps its original decision. Never leave a card
+    //    hanging on an agent that may not even be installed.
+    if (card.wardenPending && now - (Date.parse(card.wardenPending.ts || "") || now) > WARDEN_TIMEOUT_MS) {
+      const p = card.wardenPending;
+      card.wardenPending = null;
+      if (p.blockOnTimeout) {
+        blockCard(card, `${p.reason || "Прогон остановлен."} Страж не ответил за ${Math.round(WARDEN_TIMEOUT_MS / 60000)} мин.`);
+      } else {
+        card.wardenCooldownUntil = new Date(now + ASK_STALL_MS).toISOString();
+        try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "warden-silent", cardId: card.id, kind: p.kind }) + "\n"); } catch {}
+      }
+      changed = true;
+    }
   }
+  // WIP=1 scheduler (§5.1/§5.2): after mirroring, feed each now-free project its next
+  // queued card. Runs last so it sees this pass's ready/blocked transitions (a card that
+  // just reached `ready` frees the slot for its successor in the same tick).
+  if (scheduleQueued(board)) changed = true;
+  // S5 §5.2: the closing phase runs itself once every stage of a plan is `ready`. Last, so it
+  // sees the transitions this pass produced (the final stage reaching `ready` closes the run).
+  if (planCloseTick(board)) changed = true;
   if (changed) writeBoard(board);
+  flushWardenQueue();   // strictly after the write — see the note on WARDEN_QUEUE
 }
 
 // ── http helpers ─────────────────────────────────────────────────────────────
@@ -668,6 +2040,128 @@ async function handleApi(req, res, urlPath) {
     return sendJSON(res, 200, readBoard());
   }
 
+  // PATCH /api/settings -> board-wide defaults. Today: the global autonomy (§5.3 header toggle).
+  if (req.method === "PATCH" && urlPath === "/api/settings") {
+    const b = await readBody(req);
+    const board = readBoard();
+    if (AUTONOMIES.includes(b.autonomy)) { board.autonomy = b.autonomy; GLOBAL_AUTONOMY = b.autonomy; }
+    writeBoard(board);
+    return sendJSON(res, 200, { autonomy: board.autonomy || GLOBAL_AUTONOMY });
+  }
+
+  // GET /api/plans/:planId/manifest -> plan.result.releaseManifest (§6.1): accumulated,
+  // per-section, DAG-ordered over the plan's stage cards. Read-only; feeds the plan-rail (S4).
+  const mpm = urlPath.match(/^\/api\/plans\/([^/]+)\/manifest$/);
+  if (mpm && req.method === "GET") {
+    return sendJSON(res, 200, planReleaseManifest(readBoard(), decodeURIComponent(mpm[1])));
+  }
+
+  // GET /api/plans -> all plans as rail projections (derived status + manifest)
+  if (req.method === "GET" && urlPath === "/api/plans") {
+    const board = readBoard();
+    return sendJSON(res, 200, { plans: (board.plans || []).map((p) => planView(board, p)) });
+  }
+  // GET /api/plans/:id -> one plan projection
+  const mpone = urlPath.match(/^\/api\/plans\/([^/]+)$/);
+  if (mpone && req.method === "GET") {
+    const board = readBoard();
+    const plan = planById(board, decodeURIComponent(mpone[1]));
+    return plan ? sendJSON(res, 200, { plan: planView(board, plan) }) : sendJSON(res, 404, { error: "plan not found" });
+  }
+  // DELETE /api/plans/:id -> archive a plan (hide its rail). Stage cards are left untouched —
+  // they keep their history/branch/manifest; only the run's rail is dismissed. Additive flag.
+  if (mpone && req.method === "DELETE") {
+    const board = readBoard();
+    const plan = planById(board, decodeURIComponent(mpone[1]));
+    if (!plan) return sendJSON(res, 404, { error: "plan not found" });
+    plan.archived = true;
+    writeBoard(board);
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "plan-archive", planId: plan.id }) + "\n"); } catch {}
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  // POST /api/plans/preflight -> S5 summary-gate items for a candidate plan (blockers/floor/forks)
+  if (req.method === "POST" && urlPath === "/api/plans/preflight") {
+    const b = await readBody(req);
+    const project = String(b.project || "").trim();
+    if (!project || !isInsideRoot(resolveProjectDir(project))) return sendJSON(res, 400, { error: "valid project required" });
+    const cardIds = Array.isArray(b.cardIds) ? b.cardIds.filter((x) => typeof x === "string") : [];
+    return sendJSON(res, 200, preflightPlan(readBoard(), project, cardIds));
+  }
+
+  // POST /api/plans -> ASSEMBLE a run from existing board cards (v2). Body:
+  //   { project, goal?, mode:"ask"|"auto", stages:[ { cardId, dependsOn:[cardId,...] } ] }
+  // Wires planId + integration branch + dependsOn onto the chosen cards and enqueues them.
+  if (req.method === "POST" && urlPath === "/api/plans") {
+    const b = await readBody(req);
+    const project = String(b.project || "").trim();
+    if (!project) return sendJSON(res, 400, { error: "project is required" });
+    if (!isInsideRoot(resolveProjectDir(project))) return sendJSON(res, 400, { error: `project must resolve inside ${PROJECTS_ROOT}` });
+    const stages = Array.isArray(b.stages) ? b.stages.filter((s) => s && typeof s.cardId === "string") : [];
+    if (!stages.length) return sendJSON(res, 400, { error: "select at least one card" });
+    const board = readBoard();
+    board.plans = board.plans || [];
+    const ids = stages.map((s) => s.cardId);
+    if (new Set(ids).size !== ids.length) return sendJSON(res, 400, { error: "duplicate card in stages" });
+    const cards = ids.map((id) => board.cards.find((c) => c.id === id));
+    if (cards.some((c) => !c)) return sendJSON(res, 400, { error: "unknown card in stages" });
+    if (cards.some((c) => c.project !== project)) return sendJSON(res, 400, { error: "a card does not belong to the project" });
+    if (cards.some((c) => !PLAN_ASSEMBLABLE.has(c.column) || c.dispatchedAt)) return sendJSON(res, 400, { error: "only undispatched Backlog/To do cards can be assembled" });
+    if (cards.some((c) => c.planId)) return sendJSON(res, 400, { error: "a card is already part of a plan" });
+    if (stagesHaveCycle(stages)) return sendJSON(res, 400, { error: "dependency cycle between stages — a plan DAG must be acyclic" });
+    // S3 §4.2: refuse the whole assembly if any stage's brief is incomplete (or is an unreviewed
+    // draft). Letting it in would park that stage in the queue forever — deps never satisfy.
+    const badStage = cards.map((c) => ({ c, veto: dispatchBlock(c) })).find((x) => x.veto);
+    if (badStage) return sendJSON(res, 400, { error: `этап «${badStage.c.theme || badStage.c.id}»: ${badStage.veto.error}`, cardId: badStage.c.id, missing: badStage.veto.missing });
+
+    const id = crypto.randomUUID().slice(0, 8);
+    const integrationBranch = `autodev/plan-${id}`;
+    const mode = AUTONOMIES.includes(b.mode) ? b.mode : "ask";
+    const idset = new Set(ids);
+    // S5: plan-level decisions from the summary gate (deduped, human-made once) — sanitized,
+    // then stamped onto every stage so no stage re-asks them (planDecisionsBlock).
+    const decisions = (Array.isArray(b.decisions) ? b.decisions : [])
+      .filter((d) => d && d.q)
+      .map((d) => ({ id: String(d.id || ""), q: String(d.q), choice: String(d.choice || ""), chosenTitle: String(d.chosenTitle || d.a || ""), ownText: d.ownText ? String(d.ownText) : null }));
+    // S5 §5.1: the release policy is set AT THE INPUT of the run — what came in the body wins,
+    // then .grace/project.md → deploy_policy, then always/manual/off.
+    const wanted = (b.policy && typeof b.policy === "object") ? b.policy : {};
+    const cfgPol = ((readProjectConfig(resolveProjectDir(project)) || {}).cfg || {}).deploy_policy || {};
+    const policy = {
+      pr: [wanted.pr, cfgPol.pr, DEPLOY_POLICY_DEFAULT.pr].find((v) => PR_MODES.includes(v)),
+      merge: [wanted.merge, cfgPol.merge, DEPLOY_POLICY_DEFAULT.merge].find((v) => MERGE_MODES.includes(v)),
+      deploy: [wanted.deploy, cfgPol.deploy, DEPLOY_POLICY_DEFAULT.deploy].find((v) => DEPLOY_MODES.includes(v)),
+    };
+    const plan = {
+      id, project, goal: String(b.goal || "").trim().slice(0, MAX_DESC) || null,
+      integrationBranch, mode, cardIds: ids, status: "running", policy,
+      decisions, createdAt: new Date().toISOString(), result: null,
+    };
+    board.plans.push(plan);
+    // Wire every stage, then enqueue it exactly like the launch lever (§5.1): dispatch if the
+    // project slot is free AND deps are ready, else queue. WIP=1 + dependsOn serialize the rest.
+    for (const s of stages) {
+      const card = board.cards.find((c) => c.id === s.cardId);
+      card.planId = id;
+      card.integrationBranch = integrationBranch;
+      card.autonomy = mode;
+      card.planDecisions = decisions; // S5: plan-level gate answers ride the stage seed
+      card.dependsOn = Array.isArray(s.dependsOn) ? s.dependsOn.filter((x) => idset.has(x) && x !== s.cardId) : [];
+      card.column = "todo";
+      if (canDispatchNow(board, card)) {
+        dispatchNow(board, card, "plan-launch");
+      } else {
+        card.queued = true;
+        card.queuedAt = new Date().toISOString();
+        card.lastColumnChangeAt = card.queuedAt;
+        card.history.push({ column: "todo", ts: card.queuedAt, via: "plan-queued" });
+      }
+    }
+    writeBoard(board);
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: plan.createdAt, event: "plan-create", planId: id, project, stages: ids.length, mode, policy, branch: integrationBranch }) + "\n"); } catch {}
+    return sendJSON(res, 201, { plan: planView(board, plan) });
+  }
+
   // POST /api/tasks  -> create in backlog
   if (req.method === "POST" && urlPath === "/api/tasks") {
     const b = await readBody(req);
@@ -689,6 +2183,17 @@ async function handleApi(req, res, urlPath) {
       requirements: String(b.requirements || "").trim() || null,
       attachments: [],
       rigor: RIGORS.includes(b.rigor) ? b.rigor : "off",
+      // Plan Run scaffold (additive; null/[] = single card = today's behaviour, §1).
+      // The integration branch / final-PR mechanics land with the Plan entity (S4);
+      // here the fields are just carried so a card can belong to a plan and declare its
+      // dependency edges + write-footprint. Empty → no DAG gating → immediate dispatch.
+      planId: (typeof b.planId === "string" && b.planId.trim()) ? b.planId.trim() : null,
+      dependsOn: Array.isArray(b.dependsOn) ? b.dependsOn.filter((x) => typeof x === "string") : [],
+      files: Array.isArray(b.files) ? b.files.filter((x) => typeof x === "string") : [],
+      autonomy: AUTONOMIES.includes(b.autonomy) ? b.autonomy : null,   // S3: null = inherit the global default (§5.3)
+      // S3 · statement of work (§4.1). Defaults = today's card: origin "human" → no checks.
+      outOfScope: null, acceptance: [], contract: null, sources: [], origin: "human", draft: false,
+      ...normalizeBrief(b),
       column: "backlog",
       createdAt: new Date().toISOString(),
       dispatchedAt: null,
@@ -782,6 +2287,71 @@ async function handleApi(req, res, urlPath) {
     return sendJSON(res, 200, { card, launch });
   }
 
+  // ── S4 · warden API (design §2.2). One contract for local and VPS: the agent NEVER writes
+  //    board.json, it only calls these. `by:"warden"` marks an agent action — that is what the
+  //    5-per-day budget counts (§2.4); a human pressing the same button is never rationed.
+  // GET /api/health[?minutes=N] -> cards standing longer than N, with classifier evidence
+  if (req.method === "GET" && urlPath === "/api/health") {
+    const m = Number(new URL(req.url, `http://${HOST}`).searchParams.get("minutes"));
+    return sendJSON(res, 200, healthReport(readBoard(), Number.isFinite(m) && m >= 0 ? m : 0));
+  }
+  // GET|POST /api/hooks/warden -> read / register the handler the board CALLS on an event
+  if (urlPath === "/api/hooks/warden") {
+    const board = readBoard();
+    if (req.method === "GET") return sendJSON(res, 200, { hook: wardenHook(board), stored: board.wardenHook || null });
+    if (req.method === "POST") {
+      const b = await readBody(req);
+      const kind = ["command", "http", "off"].includes(b.kind) ? b.kind : null;
+      if (!kind) return sendJSON(res, 400, { error: "kind must be command | http | off" });
+      if (kind === "command" && !String(b.cmd || "").trim()) return sendJSON(res, 400, { error: "cmd is required for kind=command" });
+      if (kind === "http" && !String(b.url || "").trim()) return sendJSON(res, 400, { error: "url is required for kind=http" });
+      board.wardenHook = kind === "off" ? { kind: "off" }
+        : { kind, cmd: b.cmd ? String(b.cmd) : undefined, url: b.url ? String(b.url) : undefined,
+            notify: ["desktop", "telegram", "none"].includes(b.notify) ? b.notify : "desktop",
+            registeredAt: new Date().toISOString() };
+      writeBoard(board);
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "warden-hook", kind }) + "\n"); } catch {}
+      return sendJSON(res, 200, { hook: wardenHook(board) });
+    }
+  }
+  // POST /api/tasks/:id/pause  { reason, minutes?, note?, by? } -> paused, place in queue kept
+  // POST /api/tasks/:id/resume { by? }
+  // POST /api/tasks/:id/note   { text, class?, by? } -> the diagnosis a human reads on the card
+  const mw = urlPath.match(/^\/api\/tasks\/([^/]+)\/(pause|resume|note)$/);
+  if (mw && req.method === "POST") {
+    const b = await readBody(req);
+    const board = readBoard();
+    const card = board.cards.find((c) => c.id === mw[1]);
+    if (!card) return sendJSON(res, 404, { error: "card not found" });
+    const action = mw[2], by = b.by === "warden" ? "warden" : "human";
+    const budget = wardenBudget(card);
+    if (by === "warden" && WARDEN_ACTIONS.has(action) && budget.left <= 0)
+      return sendJSON(res, 429, { error: `бюджет стража исчерпан: ${WARDEN_BUDGET} вмешательств на карточку за 24 ч (§2.4) — эскалируй человеку`, budget });
+    const ts = new Date().toISOString();
+    if (action === "pause") {
+      const mins = Number(b.minutes);
+      card.paused = true;
+      card.pausedReason = String(b.reason || "quota").slice(0, 200);
+      card.pausedUntil = Number.isFinite(mins) && mins > 0 ? new Date(Date.now() + mins * 60000).toISOString() : null;
+      card.pausedAt = ts;
+      if (b.note) (card.notes = card.notes || []).push({ ts, by, class: card.pausedReason, text: String(b.note).slice(0, 2000) });
+      card.wardenPending = null;
+    } else if (action === "resume") {
+      card.paused = false; card.pausedReason = null; card.pausedUntil = null; card.pausedAt = null;
+      card.wardenPending = null;
+    } else {
+      if (!String(b.text || "").trim()) return sendJSON(res, 400, { error: "text is required" });
+      card.notes = (card.notes || []).slice(-19);
+      card.notes.push({ ts, by, class: b.class ? String(b.class).slice(0, 40) : null, text: String(b.text).slice(0, 2000) });
+      // a note is DIAGNOSIS, not an intervention: it does not clear wardenPending, so a card the
+      // warden could only describe still falls through to the human on timeout (§2.3 needs-human).
+    }
+    if (by === "warden" && WARDEN_ACTIONS.has(action)) recordWardenAction(card, action);
+    writeBoard(board);
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts, event: "warden-" + action, cardId: card.id, by, reason: card.pausedReason || null }) + "\n"); } catch {}
+    return sendJSON(res, 200, { card, budget: wardenBudget(card) });
+  }
+
   // GET /api/tasks/:id/log  -> tail of the run's log (issue #8)
   const mlog = urlPath.match(/^\/api\/tasks\/([^/]+)\/log$/);
   if (mlog && req.method === "GET") {
@@ -831,9 +2401,19 @@ async function handleApi(req, res, urlPath) {
   // POST /api/tasks/:id/relaunch  -> re-spawn the run for a stuck/blocked card (issue #8)
   const mre = urlPath.match(/^\/api\/tasks\/([^/]+)\/relaunch$/);
   if (mre && req.method === "POST") {
+    const rb = await readBody(req);
+    const by = rb.by === "warden" ? "warden" : "human";
     const board = readBoard();
     const card = board.cards.find((c) => c.id === mre[1]);
     if (!card) return sendJSON(res, 404, { error: "card not found" });
+    // S4 §2.4: the warden's relaunches are rationed (5/card/24 h) — the human's are not.
+    if (by === "warden") {
+      const budget = wardenBudget(card);
+      if (budget.left <= 0) return sendJSON(res, 429, { error: `бюджет стража исчерпан: ${WARDEN_BUDGET} вмешательств за 24 ч (§2.4) — эскалируй человеку`, budget });
+      recordWardenAction(card, "relaunch");
+    }
+    card.wardenPending = null;   // the agent answered → the deferred block is cancelled
+    card.paused = false; card.pausedReason = null; card.pausedUntil = null;
     const projectDir = resolveProjectDir(card.project);
     if (!isInsideRoot(projectDir)) return sendJSON(res, 400, { error: "project resolves outside the projects root" });
     const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);
@@ -847,7 +2427,7 @@ async function handleApi(req, res, urlPath) {
     recordLaunch(card, launch, kind);
     card.history.push({ column: target, ts: card.lastColumnChangeAt, via: "relaunch" });
     writeBoard(board);
-    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "relaunch", cardId: card.id, kind, launch }) + "\n"); } catch {}
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "relaunch", cardId: card.id, kind, by, launch }) + "\n"); } catch {}
     return sendJSON(res, 200, { card, launch });
   }
 
@@ -863,12 +2443,33 @@ async function handleApi(req, res, urlPath) {
       const column = String(b.column || "");
       if (!COLUMNS.includes(column)) return sendJSON(res, 400, { error: "unknown column" });
       const from = card.column;
-      let dispatched = false;
+      let dispatched = false, queued = false;
       if (from === "backlog" && column !== "backlog" && !card.dispatchedAt) {
-        card.dispatchedAt = new Date().toISOString();
-        card.dispatch = dispatch(card);
-        dispatched = true;
+        // S3 §4.2 · REFUSE at the lever, not silently in the queue: an incomplete agent-authored
+        // brief (or an unreviewed deferred draft) must never leave Backlog. A `human` card is
+        // never refused here — it has nothing to fill in by design.
+        const veto = dispatchBlock(card);
+        if (veto) return sendJSON(res, 409, { error: veto.error, missing: veto.missing, draft: !!veto.draft, origin: cardOrigin(card) });
+        // Leaving Backlog = request to run. Serialize per project (§5.1): dispatch now
+        // only if the project's work slot is free; else QUEUE it (no spawn → the shared
+        // project cwd is never touched by two runs at once). A fresh card always enters
+        // at `todo`, whether it dispatches live or waits.
+        card.column = "todo";
+        if (canDispatchNow(board, card)) {
+          dispatchNow(board, card, "lever");
+          dispatched = true;
+        } else {
+          card.queued = true;
+          card.queuedAt = new Date().toISOString();
+          card.lastColumnChangeAt = card.queuedAt;
+          card.history.push({ column: "todo", ts: card.queuedAt, via: "queued" });
+          try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.queuedAt, event: "queued", cardId: card.id, project: card.project }) + "\n"); } catch {}
+          queued = true;
+        }
+        writeBoard(board);
+        return sendJSON(res, 200, { card, dispatched, queued });
       }
+      // any other move (manual station change on an already-dispatched card, etc.)
       card.column = column;
       card.lastColumnChangeAt = new Date().toISOString();
       card.history.push({ column, ts: card.lastColumnChangeAt });
@@ -885,8 +2486,11 @@ async function handleApi(req, res, urlPath) {
     if (b.designLink !== undefined) card.designLink = String(b.designLink).trim() || null;
     if (b.requirementsLink !== undefined) card.requirementsLink = String(b.requirementsLink).trim() || null;
     if (b.rigor !== undefined && RIGORS.includes(b.rigor)) card.rigor = b.rigor;
+    if (b.autonomy !== undefined) card.autonomy = AUTONOMIES.includes(b.autonomy) ? b.autonomy : null; // null = inherit global (§5.3)
+    if (Array.isArray(b.files)) card.files = b.files.filter((x) => typeof x === "string");
+    Object.assign(card, normalizeBrief(b, card));   // S3 §4.1 — incl. clearing the draft flag
     writeBoard(board);
-    return sendJSON(res, 200, { card });
+    return sendJSON(res, 200, { card, blocked: dispatchBlock(card) });
   }
 
   // DELETE /api/tasks/:id
@@ -909,9 +2513,43 @@ const server = http.createServer((req, res) => {
   return serveStatic(res, urlPath);
 });
 
+// region FUNC_legacyNotice — say it AT UPGRADE TIME, not in a README nobody re-reads
+// ## @purpose This version added a statement of work per card (§4) and an automatic closing
+// ##   phase per run (§5). Data written by an older version predates both: cards carry no
+// ##   `origin`, runs carry no `policy`. Nothing breaks — an old card reads as `origin: human`
+// ##   (no checks at all) and an old run is skipped by the closing phase on purpose — but a
+// ##   board still holding dozens of finished cards and runs starts the new automation on top
+// ##   of a history that was never meant for it. Cheapest honest fix: the server SAYS SO on the
+// ##   first boot after the upgrade, with the exact commands, and never nags again once clean.
+// ## @invariants Read-only: it looks at board.json and prints. It never deletes anything —
+// ##   wiping a board is the human's decision, and it is irreversible without the backup.
+function legacyDataNotice() {
+  let b;
+  try { b = JSON.parse(fs.readFileSync(BOARD_FILE, "utf8")); } catch { return; }
+  const cards = (b.cards || []).filter((c) => !c.origin);
+  const plans = (b.plans || []).filter((p) => !p.policy);
+  if (!cards.length && !plans.length) return;
+  const done = cards.filter((c) => c.column === TERMINAL).length;
+  console.log("");
+  console.log("⚠  На доске есть данные, созданные ПРЕДЫДУЩЕЙ версией:");
+  console.log(`   карточек без постановки (origin): ${cards.length}${done ? ` (из них выполненных: ${done})` : ""}`);
+  console.log(`   прогонов без политики релиза: ${plans.length}`);
+  console.log("   Работать они будут: старая карточка читается как origin=human (проверок нет),");
+  console.log("   старый прогон фаза закрытия НЕ трогает. Но новая автоматика — постановка,");
+  console.log("   страж, авто-закрытие — рассчитана на чистую доску.");
+  console.log("   РЕКОМЕНДУЕТСЯ очистить доску перед работой (сначала бэкап!):");
+  console.log("     cp data/board.json data/board.json.bak.pre-wipe");
+  console.log("     node -e 'const f=\"data/board.json\",fs=require(\"fs\"),b=JSON.parse(fs.readFileSync(f,\"utf8\"));" +
+              "b.cards=[];b.plans=[];fs.writeFileSync(f,JSON.stringify(b,null,2))'");
+  console.log("   Подробнее: README → «Upgrading».");
+  console.log("");
+}
+// endregion FUNC_legacyNotice
+
 ensureData();
 server.listen(PORT, HOST, () => {
   console.log(`grace-board → http://${HOST}:${PORT}`);
   console.log(`projects root: ${PROJECTS_ROOT}  (override with GRACE_PROJECTS_ROOT)`);
+  legacyDataNotice();
   setInterval(syncFromPipeline, 2000); // mirror pipeline phase onto the board
 });

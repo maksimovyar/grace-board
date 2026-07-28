@@ -17,12 +17,19 @@ Zero dependencies, no build step — plain Node ≥ 18, bound to `127.0.0.1` (lo
 | `.claude/commands/grace-feature-dev.md` | the `/grace-feature-dev` slash command |
 | `.claude/agents/gfd-*.md` | the pipeline's sub-agents (architect, coder, explorer, reviewer, verifier) |
 | `.claude/skills/grace-feature-dev` | the pipeline skill — board lifecycle, build phases, GRACE markup, anti-loop |
-| `install.sh` | links the command/agents/skill into your `~/.claude` |
+| `.claude/skills/graceboard-plan` | turns worked-out requirements into a run: stages, cards, source conflicts, the approval gate |
+| `.claude/skills/graceboard-card` \| `-run` | the mechanics — compose one card · assemble a run (DAG, branch, policy) |
+| `.claude/agents/board-warden.md` | the warden the board calls when a card stops (classifier + allowed actions) |
+| `.claude/bin/gb.mjs` | the helper CLI those three skills talk to the board through |
+| `install.sh` | links the commands/agents/skills/bin into your `~/.claude` |
 
 > The board is a **dispatcher**: it spawns `claude -p "/grace-feature-dev …"` runs
 > inside your *target* project. Those runs resolve the command, agents and skills from
 > your **user-level** Claude config (`~/.claude`) — not from this repo. That's why the
 > extensions are bundled here **and** installed into `~/.claude` by `install.sh`.
+> `install.sh` **symlinks**, so this repo stays the single source: edit a skill here (or
+> `git pull`) and your `~/.claude` has it. A pre-existing regular file is never clobbered —
+> it is reported as skipped, and you move it aside yourself if you want the bundled copy.
 
 ## Why GRACE — the method behind the board
 
@@ -120,6 +127,11 @@ over it. See [`.env.example`](.env.example).
 | `GRACE_BIN_PATH` | derived | extra `PATH` for spawned runs, if `claude`/`node` aren't on it |
 | `GRACE_AUTORUN` | on | set `0` to disable auto-launch (dispatch then only seeds) |
 | `GRACE_STALL_MIN` | `120` | minutes a phase may stall before the watchdog steps in |
+| `GRACE_ASK_STALL_MIN` | `30` | minutes a card may sit in `asking` before the warden is called |
+| `GRACE_WARDEN_TIMEOUT_MIN` | `10` | how long a deferred block waits for the warden's answer |
+| `GRACE_WARDEN_BUDGET` | `5` | warden interventions per card per 24 h |
+| `GRACE_WARDEN_CMD` | — | zero-config warden hook (same as registering `{kind:"command"}`) |
+| `GRACE_GH_BIN` | `gh` | GitHub CLI used to open/merge the final PR of a run |
 
 ## Stations (= the grace-feature-dev build phases)
 
@@ -192,6 +204,30 @@ and the time of the last phase change, and adds two layers of resilience (**LA4*
 From a dispatched card you can **⊟ log** (tail the run's log live) and **↻ relaunch**
 (manually re-spawn from the furthest-reached step, reusing saved answers/decisions).
 
+### The warden — the board calls an agent, the agent never polls the board
+
+Auto-heal answers "the run died"; it cannot answer **why**. A subscription token limit
+kills every retry just as fast, so the card lands in `blocked` and waits for a human —
+that alone cost 3.6 h of idle time in one run. So the supervisor stays a free timer and
+a model is invoked **only on an event**: the board is about to block a card · a card
+sits in `asking` with nothing to answer (its run died before writing the questions) ·
+a card is stalled. The agent (`~/.claude/agents/board-warden.md`) classifies the stop
+against a fixed table and acts through HTTP only — it never writes `board.json`:
+
+| Endpoint | What it does |
+|---|---|
+| `GET /api/health[?minutes=N]` | every card standing longer than N, with the evidence: station, pid alive, questions, log tail, **how many runs died in the last 60 s**, budget left |
+| `POST /api/tasks/:id/pause` \| `resume` | `paused` — not broken, waiting out an external limit; **keeps its station and its place in the queue** |
+| `POST /api/tasks/:id/note` | the diagnosis, shown on the card, so a human reads "why we stand" instead of a log |
+| `POST /api/hooks/warden` | register the handler: `{kind:"command",cmd}` locally, `{kind:"http",url}` on a VPS, `{kind:"off"}` to disable |
+
+While the warden holds a card the block is **deferred**; if the agent stays silent for
+`GRACE_WARDEN_TIMEOUT_MIN` the board keeps its original decision. Its actions are
+rationed — `GRACE_WARDEN_BUDGET` (default 5) state-changing actions per card per day —
+and it may not answer questions for you, move a card to `ready`, merge, deploy, edit a
+card, or fix the environment. **With no hook registered nothing changes**: the board
+blocks exactly as it did before.
+
 > ⚠️ **The launched run uses `--permission-mode bypassPermissions`** — it writes files
 > and runs commands autonomously with no prompts, scoped to the project dir
 > (`--add-dir`). That is what "drag right → the team works" requires, but it means
@@ -199,10 +235,72 @@ From a dispatched card you can **⊟ log** (tail the run's log live) and **↻ r
 > from its own loopback origin (CSRF guard) and confines every task's project to
 > `GRACE_PROJECTS_ROOT`. Disable auto-launch with `GRACE_AUTORUN=0` to launch by hand.
 
+### Closing a run — manifest → acceptance → PR → policy
+
+Six plans out of six once ended with `status: "running"`, `result: null`, four archived
+by hand: the result of a run evaporated. Closing is now an **automatic phase** that
+starts by itself when every stage reaches `ready`:
+
+1. `plan.status: running → verifying`;
+2. the stages' `deploy{}` blocks are merged into `plan.result.releaseManifest`
+   (per-section rules, migration order preserved);
+3. **acceptance** — one run on a *clean worktree* of the integration branch: the
+   deterministic part (`typecheck`/`test`/`build` from `.grace/project.md`), then the
+   functional scenarios assembled from the `acceptance` of **every** stage plus the
+   manifest's `manualChecks`, with evidence. A malformed or missing report is a **red**
+   acceptance — "passed" is earned, never defaulted;
+4. **a PR, always** — body assembled by the board: goal · stages · release manifest ·
+   acceptance with evidence · decisions taken without a human · **the list of tails** ·
+   open risks. It is the single human-readable trace of a run;
+5. branching by policy, set at the run's input (`gb run --pr … --merge … --deploy …`,
+   defaults from `.grace/project.md → deploy_policy`, then `always/manual/off`):
+
+| acceptance | `merge` | `deploy` | what happens |
+|---|---|---|---|
+| red | any | any | PR → draft, `failed`, one notice. **No deploy, ever** |
+| green | `manual` | — | "ready to merge" + the PR link. **Your one button** |
+| green | `auto` | `off` | merged, no deploy |
+| green | `auto` | `after-merge` | merged → deploy (`stand.deploy_cmd` from `.grace/local.md`) |
+| green | `auto` | `ask` | merged, the deploy waits for you |
+
+`stand.is_production: true` demotes any deploy policy to "waits for a human",
+**regardless of autonomy** — the mechanical floor sits before the policy, not after it.
+`gh` and the deploy command run as plain child processes (no model, no tokens); if `gh`
+is missing the composed PR body stays on disk and its path is reported, never swallowed.
+
 ## Storage
 
 All board state lives in `data/board.json` (single source of truth, git-ignored).
 Deleting it resets the board.
+
+## Upgrading — wipe the old tasks first
+
+This version added a **statement of work per card** (`origin`, `outOfScope`,
+`acceptance`, `contract`, `sources`) and an **automatic closing phase per run**
+(acceptance → PR → policy). Data written by an older version predates both: its cards
+carry no `origin`, its runs carry no `policy`.
+
+Nothing breaks if you keep it — an old card reads as `origin: human` (no checks at all)
+and an old run is deliberately skipped by the closing phase. But the new automation is
+meant to start on a clean board, so **before working with this version, wipe the old
+tasks and runs — including the finished ones**:
+
+```bash
+pkill -f "node server.js"                       # stop the board first
+cp data/board.json data/board.json.bak.pre-wipe # backups are the only undo
+mv data/dispatch-log.ndjson data/dispatch-log.ndjson.bak.pre-wipe
+node -e 'const f="data/board.json",fs=require("fs"),b=JSON.parse(fs.readFileSync(f,"utf8"));
+         b.cards=[];b.plans=[];fs.writeFileSync(f,JSON.stringify(b,null,2))'
+rm -rf data/uploads/*
+npm start
+```
+
+Board-level settings (`autonomy`, the warden hook) survive the snippet above — only tasks
+and runs are removed. The run artefacts inside your projects (`<project>/.grace-feature-dev/`)
+are **not** touched: they are the trail of past runs, delete them yourself if you want to.
+
+On the first boot after the upgrade the server prints exactly this reminder if it finds
+old data, and stops mentioning it once the board is clean.
 
 ## License
 
