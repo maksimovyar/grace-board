@@ -136,6 +136,187 @@ function isInsideRoot(dir) {
   return dir === PROJECTS_ROOT_ABS || dir.startsWith(PROJECTS_ROOT_ABS + path.sep);
 }
 
+// region FUNC_projectConfig — .grace/project.md (+ local.md) merged into every run (design §3)
+// ## @purpose A run starts headless in the target project and knows nothing about its
+// ##   environment constants (vault path, digest time, role/category enums, stand, release
+// ##   policy) — so it ASKS, and the card stalls waiting for a human. The project now carries
+// ##   that answer in-repo: `.grace/project.md` (committed: safe to publish) + `.grace/local.md`
+// ##   (gitignored: stand URLs, deploy commands, chat ids, absolute paths). Both are read here
+// ##   and injected into every phase prompt as CONSTANTS — "don't re-ask, don't invent".
+// ## @io (projectDir) -> { cfg, text, files[] } | null   ·  (card) -> prompt block | ""
+// ## @invariants
+// ## - NO config (no .grace/, unreadable, empty) → returns null → compiledRequirements is
+// ##   byte-identical to before. Every existing card of every existing project is untouched.
+// ## - local.md OVERRIDES same-named keys of project.md — front-matter deep-merged key by key,
+// ##   body merged by "## heading" (local's section replaces project's of the same title).
+// ##   A missing local.md is NOT an error (design §3): the run proceeds, deploy data is absent.
+// ## - Truncation is never silent (the MAX_DESC lesson): an over-long merge is cut with a
+// ##   visible marker naming the dropped char count.
+// ## @rationale Q: a real YAML parser? A: zero-dependency is a project invariant, and the
+// ##   config schema (§3.2/§3.3) is a small subset — scalars, one nesting level, inline flow
+// ##   maps, "- " lists. Parsing that subset is ~40 lines; anything richer is out of contract
+// ##   and lands in the body as prose, which is where an LLM reads it just as well.
+// ## @modulemap
+// ## FUNC 3[calc]  => parseYamlish       — front-matter subset → object
+// ## FUNC 3[calc]  => renderYamlish      — object → deterministic yaml-ish text
+// ## FUNC 4[calc]  => mergeBodySections  — "## heading" merge, local wins
+// ## FUNC 5[io]    => readProjectConfig  — read + merge both files
+// ## FUNC 3[calc]  => projectConfigBlock — the prompt block glued into compiledRequirements
+// GREP_SUMMARY: .grace/project.md, .grace/local.md, project config, constants, deploy_policy, plan_approval
+// STRUCTURE: ▶ parseYamlish → ⊕ deepMerge → ⚡ readProjectConfig(projectDir) → ⎋ projectConfigBlock(card)
+
+const GRACE_CFG_DIR = ".grace";
+const MAX_PROJECT_CFG = 8000;          // merged config hard cap (chars) — see the truncation invariant
+
+// Strip a trailing `# comment` outside quotes ("http://h:1#x" and "a: 'b # c'" survive).
+function stripYamlComment(line) {
+  let q = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (q) { if (ch === q) q = null; continue; }
+    if (ch === '"' || ch === "'") { q = ch; continue; }
+    if (ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+  }
+  return line;
+}
+const unquote = (s) => String(s).trim().replace(/^["']|["']$/g, "");
+// `{ a: b, c: d }` → { a: "b", c: "d" } (flat flow map only — the schema has no nested flow).
+function parseFlowMap(s) {
+  const out = {};
+  for (const pair of s.slice(1, -1).split(",")) {
+    const i = pair.indexOf(":");
+    if (i === -1) continue;
+    out[pair.slice(0, i).trim()] = unquote(pair.slice(i + 1));
+  }
+  return out;
+}
+// Front-matter subset → object: `key: scalar`, `key: { flow map }`, `key:` + indented block,
+// `- item` lists. Anything else is ignored (it belongs in the markdown body, not the schema).
+function parseYamlish(text) {
+  const root = {};
+  const stack = [{ indent: -1, obj: root }];
+  let listKey = null, listOwner = null;
+  for (const raw of String(text).split("\n")) {
+    const line = stripYamlComment(raw).replace(/\s+$/, "");
+    if (!line.trim()) continue;
+    const indent = line.length - line.trimStart().length;
+    const t = line.trim();
+    if (t.startsWith("- ")) {                       // list item under the last seen key
+      if (listOwner && listKey) (listOwner[listKey] = listOwner[listKey] || []).push(unquote(t.slice(2)));
+      continue;
+    }
+    const m = t.match(/^([A-Za-z_][\w.-]*)\s*:\s*(.*)$/);
+    if (!m) continue;
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
+    const parent = stack[stack.length - 1].obj;
+    const [, key, rest] = m;
+    const val = rest.trim();
+    if (!val) {                                     // `key:` → nested block OR a list
+      parent[key] = {};
+      stack.push({ indent, obj: parent[key] });
+      listOwner = parent; listKey = key;
+    } else if (val.startsWith("{") && val.endsWith("}")) {
+      parent[key] = parseFlowMap(val);
+      listOwner = null; listKey = null;
+    } else {
+      parent[key] = unquote(val);
+      listOwner = null; listKey = null;
+    }
+  }
+  // `key:` that never got children and never got list items is an empty value, not an empty map
+  // — "checked, nothing here" (§3.1 rule 7). Collapse it so the render shows `key:`.
+  const collapse = (o) => { for (const k of Object.keys(o)) {
+    const v = o[k];
+    if (v && typeof v === "object" && !Array.isArray(v)) { Object.keys(v).length ? collapse(v) : (o[k] = ""); }
+  } };
+  collapse(root);
+  return root;
+}
+// local.md wins key by key; a nested map merges, a scalar/list replaces wholesale.
+function deepMerge(base, over) {
+  const out = { ...base };
+  for (const k of Object.keys(over || {})) {
+    const a = out[k], b = over[k];
+    out[k] = (a && b && typeof a === "object" && typeof b === "object" && !Array.isArray(a) && !Array.isArray(b))
+      ? deepMerge(a, b) : b;
+  }
+  return out;
+}
+function renderYamlish(obj, indent) {
+  const pad = " ".repeat(indent || 0);
+  return Object.keys(obj).map((k) => {
+    const v = obj[k];
+    if (Array.isArray(v)) return `${pad}${k}:\n` + v.map((x) => `${pad}  - ${x}`).join("\n");
+    if (v && typeof v === "object") return `${pad}${k}:\n` + renderYamlish(v, (indent || 0) + 2);
+    return `${pad}${k}: ${v}`;
+  }).join("\n");
+}
+// Split a markdown body into a preamble + ordered "## heading" sections.
+function splitSections(body) {
+  const pre = [], sections = new Map();
+  let cur = null;
+  for (const line of String(body || "").split("\n")) {
+    const h = line.match(/^##\s+(.+?)\s*$/);
+    if (h) { cur = h[1]; sections.set(cur, sections.get(cur) || []); continue; }
+    (cur ? sections.get(cur) : pre).push(line);
+  }
+  return { pre: pre.join("\n").trim(), sections };
+}
+// Merge two bodies by heading: local's section REPLACES the project's of the same title,
+// its extra sections are appended in order. Same rule as the front-matter merge, one level up.
+function mergeBodySections(bodyA, bodyB) {
+  const A = splitSections(bodyA), B = splitSections(bodyB);
+  const merged = new Map(A.sections);
+  for (const [h, lines] of B.sections) merged.set(h, lines);
+  const pre = [A.pre, B.pre].filter(Boolean).join("\n\n");
+  const out = [...merged].map(([h, lines]) => `## ${h}\n${lines.join("\n").trim()}`).join("\n\n");
+  return [pre, out].filter(Boolean).join("\n\n").trim();
+}
+// `---\n<front matter>\n---\n<body>` → { fm, body }. No front matter → all body.
+function splitFrontMatter(text) {
+  const m = String(text).match(/^﻿?---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  return m ? { fm: m[1], body: m[2] } : { fm: "", body: String(text) };
+}
+const readIfFile = (p) => { try { return fs.readFileSync(p, "utf8"); } catch { return null; } };
+
+// Read + merge the project's config pair. Returns null when the project carries no config
+// at all — the caller then behaves exactly as it did before this existed.
+function readProjectConfig(projectDir) {
+  if (!isInsideRoot(projectDir)) return null;
+  const files = [];
+  const pRaw = readIfFile(path.join(projectDir, GRACE_CFG_DIR, "project.md"));
+  const lRaw = readIfFile(path.join(projectDir, GRACE_CFG_DIR, "local.md"));   // absent is NOT an error (§3)
+  if (pRaw === null && lRaw === null) return null;
+  if (pRaw !== null) files.push(`${GRACE_CFG_DIR}/project.md`);
+  if (lRaw !== null) files.push(`${GRACE_CFG_DIR}/local.md`);
+  const P = splitFrontMatter(pRaw || ""), L = splitFrontMatter(lRaw || "");
+  const cfg = deepMerge(parseYamlish(P.fm), parseYamlish(L.fm));
+  const body = mergeBodySections(P.body, L.body);
+  const head = Object.keys(cfg).length ? renderYamlish(cfg, 0) : "";
+  let text = [head, body].filter(Boolean).join("\n\n").trim();
+  if (!text) return null;
+  if (text.length > MAX_PROJECT_CFG) {
+    const dropped = text.length - MAX_PROJECT_CFG;
+    text = text.slice(0, MAX_PROJECT_CFG) + `\n… (конфиг обрезан: отброшено ${dropped} симв.; лимит §3.1 — 4000 на файл)`;
+  }
+  return { cfg, text, files };
+}
+// The prompt block. Framed as CONSTANTS, because the whole point is that the run stops
+// asking about them (design §1.5 / §3): an answer that is a project constant lives here.
+function projectConfigBlock(card) {
+  const conf = readProjectConfig(resolveProjectDir(card.project));
+  if (!conf) return "";
+  return [
+    `КОНФИГ ПРОЕКТА (${conf.files.join(" + ")}) — КОНСТАНТЫ ОКРУЖЕНИЯ, заданные владельцем проекта.`,
+    `Считай их данностью: НЕ переспрашивай их у человека, НЕ выдумывай альтернативы, НЕ ищи их заново в коде.`,
+    `Если нужной константы здесь НЕТ — это пробел конфига: реши по коду и отметь в finishNote, что константа отсутствует.`,
+    `----- начало конфига -----`,
+    conf.text,
+    `----- конец конфига -----`,
+  ].join("\n");
+}
+// endregion FUNC_projectConfig
+
 // The headline the pipeline builds against = the task theme; the detail (long
 // description, links, attached files) is compiled into the requirements context.
 const featureLine = (card) => card.theme || card.description || "task";
@@ -147,6 +328,9 @@ function compiledRequirements(card) {
   if (card.designLink) parts.push("Макеты (ссылка): " + card.designLink);
   if (Array.isArray(card.attachments) && card.attachments.length)
     parts.push("Вложения с требованиями: " + card.attachments.map((a) => a.name).join(", "));
+  // S1 · project config (§3): environment constants of the TARGET project ride every prompt.
+  const cfg = projectConfigBlock(card);
+  if (cfg) parts.push(cfg);
   return parts.join("\n\n") || null;
 }
 
