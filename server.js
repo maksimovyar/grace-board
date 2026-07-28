@@ -1055,6 +1055,11 @@ function planCloseTick(board) {
     // ── start: every stage reached `ready` → the closing phase begins by itself (§5.2) ──
     if (!plan.closeStatus) {
       if (plan.archived) continue;                       // a run dismissed by hand is not closed
+      // A run assembled BEFORE this feature existed carries no `policy` — and its stages have
+      // long been `ready`. Closing it now would spawn an acceptance run over finished work in a
+      // live project (it did, on two runs, during this very step). The closing phase applies to
+      // runs launched with a policy, i.e. from this version on; older runs stay as they are.
+      if (!plan.policy) continue;
       if (!cards.every((c) => c.column === TERMINAL)) continue;
       plan.closeStatus = "verifying";
       plan.closeStep = "acceptance";
