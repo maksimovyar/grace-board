@@ -107,6 +107,9 @@ body{
 /* S3 · AUTO trail + hard-floor chips (§5.3) */
 .tag--auto{border-color:rgba(139,83,224,.4);background:rgba(139,83,224,.08);color:#6a3fc0}
 .tag--floor{border-color:rgba(211,63,53,.45);background:rgba(211,63,53,.08);color:#a8362e}
+/* S4 · warden (§2): paused ≠ broken — a distinct, calm tone, not the red of `blocked` */
+.tag--paused{border-color:rgba(47,115,194,.45);background:rgba(47,115,194,.10);color:#255a97}
+.tag--warden{border-color:rgba(20,155,139,.45);background:rgba(20,155,139,.10);color:#0e6f64}
 /* S3 · statement of work (§4): who authored the card · unreviewed tail held as a draft */
 .tag--origin{border-style:dashed;color:var(--ink-faint)}
 .tag--draft{border-color:rgba(107,116,128,.5);background:repeating-linear-gradient(135deg,var(--surface-2),var(--surface-2) 5px,var(--well) 5px,var(--well) 10px);color:var(--s-backlog)}
@@ -197,6 +200,13 @@ body{
 .dt__links{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
 .dt__note{font-size:12.5px;color:var(--ink-faint);background:var(--surface);border:1px dashed var(--line-2);border-radius:9px;padding:10px 12px;line-height:1.5}
 .dt__note b{color:var(--s-asking)}
+
+/* S4 · «почему стоим» in the drawer (§2.2) */
+.warden{display:flex;flex-direction:column;gap:9px;margin-top:6px;background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--s-reviewing);border-radius:var(--radius);padding:12px 14px}
+.warden__row{display:flex;gap:11px;align-items:flex-start}
+.warden__k{flex:0 0 92px;font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-faint);padding-top:2px}
+.warden__v{flex:1;font-size:13px;line-height:1.5;color:var(--ink-soft)}
+.warden__ts{display:block;font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:3px}
 
 /* S3 · statement of work in the drawer (§4.1) — same order as the run's prompt block */
 .dt__draft{display:flex;flex-wrap:wrap;align-items:center;gap:9px;font-size:12.5px;line-height:1.5;color:var(--ink-soft);

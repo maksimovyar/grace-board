@@ -55,6 +55,13 @@ const ORIGIN_BADGE = { skill: ["◇ скилл", "заведена скилло�
   deferred: ["↳ хвост", "отложено из другой карточки — поля унаследованы"] };
 function cardTags(card) {
   const t = [];
+  // S4 §2.2: paused ≠ broken. The card keeps its station and its place in the queue, and the
+  // chip says WHY it stands — that is the whole point of the warden's note.
+  if (card.paused) {
+    const until = card.pausedUntil ? " · до " + new Date(card.pausedUntil).toLocaleTimeString() : "";
+    t.push(`<span class="tag tag--paused" title="${esc((card.notes || []).slice(-1)[0]?.text || "пауза: " + (card.pausedReason || ""))}">⏸ пауза · ${esc(card.pausedReason || "")}${esc(until)}</span>`);
+  }
+  if (card.wardenPending) t.push(`<span class="tag tag--warden" title="${esc(card.wardenPending.reason || "")}">🛡 страж · ${esc(card.wardenPending.kind || "")}</span>`);
   // S3: draft (an unreviewed tail) never dispatches — say so where the card is, not in a 409.
   if (card.draft) t.push(`<span class="tag tag--draft" title="черновик: не уедет в работу, пока человек не снимет пометку">✎ черновик</span>`);
   const ob = ORIGIN_BADGE[card.origin];
@@ -379,6 +386,19 @@ function linksHTML(card) {
   const rl = card.requirementsLink && safeUrl(card.requirementsLink); if (rl) l.push(`<a class="tag" href="${esc(rl)}" target="_blank" rel="noopener">▤ требования</a>`);
   return l.length ? `<div class="dt__links">${l.join("")}</div>` : "";
 }
+// S4 §2.2 — «почему стоим»: the pause and the warden's diagnosis, in the human's words. Without
+// this the agent's classification is invisible and the human is back to reading logs.
+function wardenHTML(card) {
+  const notes = card.notes || [];
+  if (!card.paused && !card.wardenPending && !notes.length) return "";
+  const rows = [];
+  if (card.paused) rows.push(`<div class="warden__row"><span class="warden__k">⏸ пауза</span><span class="warden__v">${esc(card.pausedReason || "—")}${
+    card.pausedUntil ? ` · повтор после ${esc(new Date(card.pausedUntil).toLocaleString())}` : ""} · место в очереди сохранено</span></div>`);
+  if (card.wardenPending) rows.push(`<div class="warden__row"><span class="warden__k">🛡 разбирает</span><span class="warden__v">${esc(card.wardenPending.kind || "")} · ${esc(card.wardenPending.reason || "")}</span></div>`);
+  for (const n of notes.slice(-5)) rows.push(`<div class="warden__row"><span class="warden__k">${esc(n.by === "warden" ? "диагноз" : "заметка")}${n.class ? " · " + esc(n.class) : ""}</span><span class="warden__v">${esc(n.text)}<span class="warden__ts">${esc(new Date(n.ts).toLocaleString())}</span></span></div>`);
+  return `<div><div class="dt__label">Страж</div><div class="warden">${rows.join("")}</div></div>`;
+}
+
 // S3 §4.1 — the statement of work, as the run receives it. Rendered in the same order as the
 // prompt block so «что видит человек» and «что видит агент» stay the same document.
 function briefHTML(card) {
@@ -427,6 +447,7 @@ function openDetail(id) {
     </div>
     <h2 class="dt__theme">${esc(card.theme || "—")}</h2>
     ${draftNote}
+    ${wardenHTML(card)}
     <div><div class="dt__label">Описание</div><p class="dt__desc">${esc(card.description || "Описание не задано.")}</p></div>
     ${briefHTML(card)}
     ${linksHTML(card)}

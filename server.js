@@ -556,7 +556,8 @@ function hasActiveForProject(board, project, exceptId) {
 //   1) the per-project WIP=1 slot is free (S0), 2) every dependsOn card is `ready` (S1),
 //   3) no files[] conflict with an active sibling (S1 — subsumed by WIP=1, forward-compat).
 function canDispatchNow(board, card) {
-  return dispatchBlock(card) === null            // S3 §4.2: draft / incomplete brief never starts
+  return !card.paused                            // S4 §2.2: paused keeps its place in the queue
+    && dispatchBlock(card) === null              // S3 §4.2: draft / incomplete brief never starts
     && !hasActiveForProject(board, card.project, card.id)
     && depsSatisfied(board, card)
     && !filesConflict(board, card);
@@ -1120,6 +1121,169 @@ function blockCard(card, reason) {
   try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "blocked", cardId: card.id, reason }) + "\n"); } catch {}
 }
 
+// region FUNC_warden — the board CALLS the agent; the agent never polls the board (design §2)
+// ## @purpose 3.6 h of a single run were lost to token-limit deaths: autoheal fires its one
+// ##   retry, the global limit kills that too, the card lands in `blocked` and waits for a
+// ##   human to relaunch it by hand. A stuck card needs a JUDGEMENT (temporary limit? crashed
+// ##   before writing its questions? environment broken?) and that judgement needs a model —
+// ##   but a model called every 30 s is pure waste. So: the supervisor stays a free timer, and
+// ##   the model is invoked ONLY on an event — «about to block», «asking too long», «stalled».
+// ## @io (board,card,meta) -> spawn/POST one warden run + card.wardenPending
+// ##     HTTP: GET /api/health · POST /api/tasks/:id/pause|resume|note · POST /api/hooks/warden
+// ## @invariants
+// ## - NO hook registered → escalate() === blockCard(), i.e. today's behaviour byte for byte.
+// ##   The warden is an addition, never a dependency: a broken/absent agent must not strand a card.
+// ## - Deferred block: when a hook IS registered the supervisor does NOT block immediately — it
+// ##   hands the card to the warden and blocks only if no answer comes within WARDEN_TIMEOUT_MS.
+// ##   That is what lets a quota death end in `paused` instead of `blocked`.
+// ## - `asking` events NEVER auto-block: there the human is legitimately being waited on.
+// ## - The agent touches state through HTTP only (no board.json write), so local and VPS run the
+// ##   SAME contract — only BOARD_URL and the notify channel differ (§2.5).
+// ## - Budget: WARDEN_BUDGET state-changing actions per card per rolling 24 h (§2.4). Notes are
+// ##   NOT counted — they are diagnosis, and the budget exists to stop ACTION loops.
+// ## @rationale Q: why does the board not classify quota itself? A: §2.3 gives the classifier to
+// ##   the agent. The board only supplies DETERMINISTIC signals (pid alive, questions empty, log
+// ##   tail, how many runs died in the last 60 s) — cheap, honest, and no model call.
+// ## @modulemap
+// ## FUNC 2[calc]   => wardenHook        — registered handler (board.json → env fallback)
+// ## FUNC 3[calc]   => wardenBudget      — interventions used / left in the rolling day
+// ## FUNC 4[calc]   => cardSignals       — deterministic evidence for the classifier
+// ## FUNC 6[io]     => fireWardenEvent   — spawn a command / POST a webhook, once per card
+// ## FUNC 4[persist]=> escalate          — the ONE «something is wrong» exit of the supervisor
+// ## FUNC 3[calc]   => healthReport      — GET /api/health projection
+// GREP_SUMMARY: warden, board-warden, health, pause, resume, note, hooks, quota, crash-before-write, §2
+// STRUCTURE: ▶ supervisor → ⊕ escalate → ⚡ fireWardenEvent(hook) → ⎋ agent → HTTP pause/relaunch/note
+
+const ASK_STALL_MS = Number(process.env.GRACE_ASK_STALL_MIN || 30) * 60 * 1000;
+const WARDEN_TIMEOUT_MS = Number(process.env.GRACE_WARDEN_TIMEOUT_MIN || 10) * 60 * 1000;
+const WARDEN_BUDGET = Number(process.env.GRACE_WARDEN_BUDGET || 5);   // state-changing actions / card / 24 h
+const WARDEN_ACTIONS = new Set(["pause", "resume", "relaunch"]);      // what the budget counts
+const DEATH_WINDOW_MS = 60 * 1000;                                    // §2.3 «несколько ранов умерли в окне < 60 с»
+const WARDEN_LOG_DIR = path.join(DATA_DIR, "warden");
+
+// The registered handler. board.wardenHook wins; GRACE_WARDEN_CMD is the zero-config fallback
+// (a fresh VPS install can arm the warden without an API call).
+function wardenHook(board) {
+  const h = board && board.wardenHook;
+  if (h && h.kind === "command" && h.cmd) return h;
+  if (h && h.kind === "http" && h.url) return h;
+  if (h && h.kind === "off") return null;
+  return process.env.GRACE_WARDEN_CMD ? { kind: "command", cmd: process.env.GRACE_WARDEN_CMD, notify: "desktop" } : null;
+}
+function wardenBudget(card) {
+  const since = Date.now() - 24 * 60 * 60 * 1000;
+  const acts = (card.wardenActions || []).filter((a) => Date.parse(a.ts || "") > since);
+  return { used: acts.length, left: Math.max(0, WARDEN_BUDGET - acts.length), window: "24h" };
+}
+function recordWardenAction(card, action) {
+  const since = Date.now() - 24 * 60 * 60 * 1000;
+  card.wardenActions = (card.wardenActions || []).filter((a) => Date.parse(a.ts || "") > since);
+  card.wardenActions.push({ ts: new Date().toISOString(), action });
+}
+// Deterministic evidence the classifier runs on — no model, no guessing. `deathsInWindow` is the
+// §2.3 «global event» signal: several runs dying inside a minute is a limit, not N card bugs.
+function cardSignals(board, card) {
+  const runDir = path.join(resolveProjectDir(card.project), ".grace-feature-dev", card.slug);
+  const now = Date.now();
+  const deaths = (board.recentDeaths || []).filter((d) => now - (Date.parse(d.ts || "") || 0) < DEATH_WINDOW_MS);
+  const logFile = card.runLog || path.join(runDir, "build.log");
+  return {
+    pidAlive: isAlive(card.runPid),
+    runPid: card.runPid || null,
+    runKind: card.runKind || null,
+    askStage: card.askStage || null,
+    questions: (card.questions || []).length,
+    archQuestions: (card.archQuestions || []).length,
+    minutesInColumn: Math.round((now - (Date.parse(card.lastColumnChangeAt || card.createdAt || "") || now)) / 60000),
+    autoHealCount: card.autoHealCount || 0,
+    deathsInWindow: deaths.length,
+    runDir, logFile,
+    logTail: tailLog(logFile, 60),
+    budget: wardenBudget(card),
+  };
+}
+// Hand ONE event to the warden. Fire-and-forget by design: the supervisor tick must never wait
+// on a model. `blockOnTimeout` decides what happens if the agent stays silent.
+//
+// The event is QUEUED here and dispatched by flushWardenQueue() only AFTER the tick has written
+// board.json. Otherwise the agent (which answers over HTTP within milliseconds) would write the
+// card while this tick still holds an older in-memory copy, and the tick's trailing write would
+// silently erase the pause it just asked for.
+const WARDEN_QUEUE = [];
+function fireWardenEvent(board, card, meta) {
+  const hook = wardenHook(board);
+  if (!hook) return false;
+  const event = {
+    ts: new Date().toISOString(),
+    kind: meta.kind,                       // about-to-block | asking-stalled | crash-before-write
+    hint: meta.hint || null,               // the board's non-binding guess; the agent decides
+    reason: meta.reason || null,
+    boardUrl: `http://${HOST}:${PORT}`,
+    notify: hook.notify || "desktop",
+    card: { id: card.id, theme: card.theme, project: card.project, slug: card.slug, column: card.column,
+            planId: card.planId || null, paused: !!card.paused },
+    signals: cardSignals(board, card),
+  };
+  card.wardenPending = { ts: event.ts, kind: meta.kind, reason: meta.reason || null, blockOnTimeout: !!meta.blockOnTimeout };
+  WARDEN_QUEUE.push({ hook, event, projectDir: resolveProjectDir(card.project) });
+  return true;
+}
+// Deliver every queued event: spawn the command (local) or POST the webhook (VPS). Same JSON body
+// either way — that is what makes «один контракт, различаются BOARD_URL и канал» true (§2.5).
+function flushWardenQueue() {
+  while (WARDEN_QUEUE.length) {
+    const { hook, event, projectDir } = WARDEN_QUEUE.shift();
+    const json = JSON.stringify(event);
+    try {
+      if (hook.kind === "command") {
+        fs.mkdirSync(WARDEN_LOG_DIR, { recursive: true });
+        const out = fs.openSync(path.join(WARDEN_LOG_DIR, `${event.card.id}.log`), "a");
+        const env = { ...process.env, PATH: `${BIN_PATH_HINT}:${process.env.PATH || ""}`,
+          GRACE_WARDEN_EVENT: json, GRACE_BOARD_URL: event.boardUrl, GRACE_CARD_ID: event.card.id };
+        const child = spawn("/bin/sh", ["-lc", hook.cmd], { cwd: projectDir, env, detached: true, stdio: ["ignore", out, out] });
+        child.unref();
+      } else {
+        const u = new URL(hook.url);
+        const req = http.request({ hostname: u.hostname, port: u.port || 80, path: u.pathname + u.search, method: "POST",
+          headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(json) } }, (r) => r.resume());
+        req.on("error", () => {});
+        req.setTimeout(5000, () => req.destroy());
+        req.end(json);
+      }
+      fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: event.ts, event: "warden-call", cardId: event.card.id, kind: event.kind, hint: event.hint, via: hook.kind }) + "\n");
+    } catch (e) {
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "warden-call-failed", cardId: event.card.id, error: String(e.message || e) }) + "\n"); } catch {}
+    }
+  }
+}
+// The single «something is wrong» exit of the supervisor. With a warden armed the block is
+// DEFERRED — that is the whole mechanism behind «quota ends in paused, not blocked».
+function escalate(board, card, reason, meta) {
+  const budget = wardenBudget(card);
+  if (!card.wardenPending && budget.left > 0 && fireWardenEvent(board, card, { ...meta, reason, blockOnTimeout: true })) return;
+  const exhausted = budget.left <= 0 ? " Бюджет стража на сутки исчерпан — решает человек." : "";
+  blockCard(card, reason + exhausted);
+}
+// GET /api/health — every card standing longer than `minutes`, with the evidence a classifier
+// needs. Read-only: the warden looks here first, then acts through the write endpoints.
+function healthReport(board, minutes) {
+  const now = Date.now(), cutMs = minutes * 60 * 1000;
+  const cards = board.cards.filter((c) => {
+    if (c.column === TERMINAL || c.column === "backlog") return false;
+    if (!c.dispatchedAt && !c.queued) return false;
+    return now - (Date.parse(c.lastColumnChangeAt || c.dispatchedAt || "") || now) >= cutMs;
+  }).map((c) => ({
+    id: c.id, theme: c.theme, project: c.project, column: c.column, planId: c.planId || null,
+    queued: !!c.queued, paused: !!c.paused, pausedReason: c.pausedReason || null, pausedUntil: c.pausedUntil || null,
+    blockReason: c.blockReason || null, since: c.lastColumnChangeAt || c.dispatchedAt || null,
+    wardenPending: c.wardenPending || null, lastNote: (c.notes || []).slice(-1)[0] || null,
+    signals: cardSignals(board, c),
+  }));
+  return { ts: new Date().toISOString(), minutes, stallMinutes: Math.round(STALL_MS / 60000),
+    askStallMinutes: Math.round(ASK_STALL_MS / 60000), hook: wardenHook(board) ? "armed" : "none", cards };
+}
+// endregion FUNC_warden
+
 // Read the last `maxLines` lines of a log file (last 64 KB only, so a huge log is cheap).
 function tailLog(file, maxLines) {
   try {
@@ -1177,6 +1341,10 @@ function syncFromPipeline() {
   const now = Date.now();
   for (const card of board.cards) {
     if (!card.dispatchedAt || card.column === TERMINAL || card.column === "blocked") continue;
+    // S4 §2.2: a paused card is NOT broken — it is waiting out an external limit. Keep its
+    // station and its place in the queue, and take the supervisor's hands off it entirely,
+    // otherwise the liveness watchdog would «heal» it straight back into the dead limit.
+    if (card.paused) continue;
     const projectDir = resolveProjectDir(card.project);
     const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);
     const pipFile = path.join(runDir, "board.json");
@@ -1339,6 +1507,15 @@ function syncFromPipeline() {
       const stalled = alive && lastMoveMs && now - lastMoveMs > STALL_MS;
       if (died || stalled) {
         if (stalled) { try { process.kill(card.runPid, "SIGTERM"); } catch {} }
+        // S4 §2.3: remember the death board-wide. Several deaths inside DEATH_WINDOW_MS is the
+        // objective signature of a GLOBAL event (subscription limit), not N independent bugs —
+        // the warden classifies on this signal, the board only records it.
+        if (died) {
+          board.recentDeaths = (board.recentDeaths || []).filter((d) => now - (Date.parse(d.ts || "") || 0) < 10 * 60 * 1000);
+          board.recentDeaths.push({ ts: new Date().toISOString(), cardId: card.id, column: card.column });
+          if (board.recentDeaths.length > 20) board.recentDeaths = board.recentDeaths.slice(-20);
+          changed = true;
+        }
         const fromCol = card.column;
         const how = stalled ? "ЗАВИС" : "УМЕР";
         const humanTail = stalled
@@ -1370,16 +1547,57 @@ function syncFromPipeline() {
             changed = true;
           } else {
             // the auto-relaunch itself failed to spawn → escalate now
-            blockCard(card, `${humanTail} Авто-исцеление не помогло — перезапуск не стартовал${launch && launch.error ? ": " + launch.error : ""}. Открой лог и перезапусти вручную.`);
+            escalate(board, card, `${humanTail} Авто-исцеление не помогло — перезапуск не стартовал${launch && launch.error ? ": " + launch.error : ""}. Открой лог и перезапусти вручную.`, { kind: "about-to-block", hint: "stall-real" });
             changed = true;
           }
         } else {
-          // second consecutive failure (or an unsafe project path) → escalate
+          // second consecutive failure (or an unsafe project path) → escalate. With a warden armed
+          // this HANDS THE CARD OVER instead of blocking it — §2.1: the board calls the agent.
           const healed = (card.autoHealCount || 0) >= 1 ? " Авто-исцеление уже применялось и не помогло." : "";
-          blockCard(card, `${humanTail}${healed} Открой лог и перезапусти.`);
+          escalate(board, card, `${humanTail}${healed} Открой лог и перезапусти.`, { kind: "about-to-block", hint: stalled ? "stall-real" : "run-died" });
           changed = true;
         }
       }
+    }
+
+    // 3) S4 · the `asking` watchdog. ACTIVE_COLUMNS deliberately excludes `asking` — there the
+    //    run has exited and we wait on the HUMAN, so a dead pid is expected. But two states are
+    //    not a human wait at all: (a) crash-before-write — the run died before writing its
+    //    questions, so the card sits in `asking` with questions:[] and nothing to answer (the
+    //    exact dead end of 25.07); (b) the card has sat in `asking` past ASK_STALL_MS. Both go
+    //    to the warden, and NEITHER auto-blocks: blocking a card a human may simply not have
+    //    answered yet would be a lie.
+    if (card.column === "asking" && !card.queued && !card.paused && !card.wardenPending) {
+      const cooldownOk = !card.wardenCooldownUntil || now > Date.parse(card.wardenCooldownUntil);
+      const sinceMove = now - (Date.parse(card.lastColumnChangeAt || card.dispatchedAt || "") || now);
+      const nothingToAnswer = !(card.questions || []).length && !(card.archQuestions || []).length;
+      const crashed = nothingToAnswer && card.askStage !== "done" && !isAlive(card.runPid)
+        && sinceMove > LIVENESS_GRACE_MS;
+      if (cooldownOk && (crashed || sinceMove > ASK_STALL_MS)) {
+        if (fireWardenEvent(board, card, {
+          kind: crashed ? "crash-before-write" : "asking-stalled",
+          hint: crashed ? "crash-before-write" : "needs-human",
+          reason: crashed
+            ? `Карточка в «asking» без вопросов: ран умер до того, как записал questions — человеку отвечать не на что.`
+            : `Карточка стоит в «asking» больше ${Math.round(ASK_STALL_MS / 60000)} мин.`,
+          blockOnTimeout: false,
+        })) changed = true;
+      }
+    }
+
+    // 4) S4 · the warden did not answer. A deferred block is a promise: either the agent acts
+    //    within WARDEN_TIMEOUT_MS, or the board keeps its original decision. Never leave a card
+    //    hanging on an agent that may not even be installed.
+    if (card.wardenPending && now - (Date.parse(card.wardenPending.ts || "") || now) > WARDEN_TIMEOUT_MS) {
+      const p = card.wardenPending;
+      card.wardenPending = null;
+      if (p.blockOnTimeout) {
+        blockCard(card, `${p.reason || "Прогон остановлен."} Страж не ответил за ${Math.round(WARDEN_TIMEOUT_MS / 60000)} мин.`);
+      } else {
+        card.wardenCooldownUntil = new Date(now + ASK_STALL_MS).toISOString();
+        try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "warden-silent", cardId: card.id, kind: p.kind }) + "\n"); } catch {}
+      }
+      changed = true;
     }
   }
   // WIP=1 scheduler (§5.1/§5.2): after mirroring, feed each now-free project its next
@@ -1387,6 +1605,7 @@ function syncFromPipeline() {
   // just reached `ready` frees the slot for its successor in the same tick).
   if (scheduleQueued(board)) changed = true;
   if (changed) writeBoard(board);
+  flushWardenQueue();   // strictly after the write — see the note on WARDEN_QUEUE
 }
 
 // ── http helpers ─────────────────────────────────────────────────────────────
@@ -1675,6 +1894,71 @@ async function handleApi(req, res, urlPath) {
     return sendJSON(res, 200, { card, launch });
   }
 
+  // ── S4 · warden API (design §2.2). One contract for local and VPS: the agent NEVER writes
+  //    board.json, it only calls these. `by:"warden"` marks an agent action — that is what the
+  //    5-per-day budget counts (§2.4); a human pressing the same button is never rationed.
+  // GET /api/health[?minutes=N] -> cards standing longer than N, with classifier evidence
+  if (req.method === "GET" && urlPath === "/api/health") {
+    const m = Number(new URL(req.url, `http://${HOST}`).searchParams.get("minutes"));
+    return sendJSON(res, 200, healthReport(readBoard(), Number.isFinite(m) && m >= 0 ? m : 0));
+  }
+  // GET|POST /api/hooks/warden -> read / register the handler the board CALLS on an event
+  if (urlPath === "/api/hooks/warden") {
+    const board = readBoard();
+    if (req.method === "GET") return sendJSON(res, 200, { hook: wardenHook(board), stored: board.wardenHook || null });
+    if (req.method === "POST") {
+      const b = await readBody(req);
+      const kind = ["command", "http", "off"].includes(b.kind) ? b.kind : null;
+      if (!kind) return sendJSON(res, 400, { error: "kind must be command | http | off" });
+      if (kind === "command" && !String(b.cmd || "").trim()) return sendJSON(res, 400, { error: "cmd is required for kind=command" });
+      if (kind === "http" && !String(b.url || "").trim()) return sendJSON(res, 400, { error: "url is required for kind=http" });
+      board.wardenHook = kind === "off" ? { kind: "off" }
+        : { kind, cmd: b.cmd ? String(b.cmd) : undefined, url: b.url ? String(b.url) : undefined,
+            notify: ["desktop", "telegram", "none"].includes(b.notify) ? b.notify : "desktop",
+            registeredAt: new Date().toISOString() };
+      writeBoard(board);
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "warden-hook", kind }) + "\n"); } catch {}
+      return sendJSON(res, 200, { hook: wardenHook(board) });
+    }
+  }
+  // POST /api/tasks/:id/pause  { reason, minutes?, note?, by? } -> paused, place in queue kept
+  // POST /api/tasks/:id/resume { by? }
+  // POST /api/tasks/:id/note   { text, class?, by? } -> the diagnosis a human reads on the card
+  const mw = urlPath.match(/^\/api\/tasks\/([^/]+)\/(pause|resume|note)$/);
+  if (mw && req.method === "POST") {
+    const b = await readBody(req);
+    const board = readBoard();
+    const card = board.cards.find((c) => c.id === mw[1]);
+    if (!card) return sendJSON(res, 404, { error: "card not found" });
+    const action = mw[2], by = b.by === "warden" ? "warden" : "human";
+    const budget = wardenBudget(card);
+    if (by === "warden" && WARDEN_ACTIONS.has(action) && budget.left <= 0)
+      return sendJSON(res, 429, { error: `бюджет стража исчерпан: ${WARDEN_BUDGET} вмешательств на карточку за 24 ч (§2.4) — эскалируй человеку`, budget });
+    const ts = new Date().toISOString();
+    if (action === "pause") {
+      const mins = Number(b.minutes);
+      card.paused = true;
+      card.pausedReason = String(b.reason || "quota").slice(0, 200);
+      card.pausedUntil = Number.isFinite(mins) && mins > 0 ? new Date(Date.now() + mins * 60000).toISOString() : null;
+      card.pausedAt = ts;
+      if (b.note) (card.notes = card.notes || []).push({ ts, by, class: card.pausedReason, text: String(b.note).slice(0, 2000) });
+      card.wardenPending = null;
+    } else if (action === "resume") {
+      card.paused = false; card.pausedReason = null; card.pausedUntil = null; card.pausedAt = null;
+      card.wardenPending = null;
+    } else {
+      if (!String(b.text || "").trim()) return sendJSON(res, 400, { error: "text is required" });
+      card.notes = (card.notes || []).slice(-19);
+      card.notes.push({ ts, by, class: b.class ? String(b.class).slice(0, 40) : null, text: String(b.text).slice(0, 2000) });
+      // a note is DIAGNOSIS, not an intervention: it does not clear wardenPending, so a card the
+      // warden could only describe still falls through to the human on timeout (§2.3 needs-human).
+    }
+    if (by === "warden" && WARDEN_ACTIONS.has(action)) recordWardenAction(card, action);
+    writeBoard(board);
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts, event: "warden-" + action, cardId: card.id, by, reason: card.pausedReason || null }) + "\n"); } catch {}
+    return sendJSON(res, 200, { card, budget: wardenBudget(card) });
+  }
+
   // GET /api/tasks/:id/log  -> tail of the run's log (issue #8)
   const mlog = urlPath.match(/^\/api\/tasks\/([^/]+)\/log$/);
   if (mlog && req.method === "GET") {
@@ -1724,9 +2008,19 @@ async function handleApi(req, res, urlPath) {
   // POST /api/tasks/:id/relaunch  -> re-spawn the run for a stuck/blocked card (issue #8)
   const mre = urlPath.match(/^\/api\/tasks\/([^/]+)\/relaunch$/);
   if (mre && req.method === "POST") {
+    const rb = await readBody(req);
+    const by = rb.by === "warden" ? "warden" : "human";
     const board = readBoard();
     const card = board.cards.find((c) => c.id === mre[1]);
     if (!card) return sendJSON(res, 404, { error: "card not found" });
+    // S4 §2.4: the warden's relaunches are rationed (5/card/24 h) — the human's are not.
+    if (by === "warden") {
+      const budget = wardenBudget(card);
+      if (budget.left <= 0) return sendJSON(res, 429, { error: `бюджет стража исчерпан: ${WARDEN_BUDGET} вмешательств за 24 ч (§2.4) — эскалируй человеку`, budget });
+      recordWardenAction(card, "relaunch");
+    }
+    card.wardenPending = null;   // the agent answered → the deferred block is cancelled
+    card.paused = false; card.pausedReason = null; card.pausedUntil = null;
     const projectDir = resolveProjectDir(card.project);
     if (!isInsideRoot(projectDir)) return sendJSON(res, 400, { error: "project resolves outside the projects root" });
     const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);
@@ -1740,7 +2034,7 @@ async function handleApi(req, res, urlPath) {
     recordLaunch(card, launch, kind);
     card.history.push({ column: target, ts: card.lastColumnChangeAt, via: "relaunch" });
     writeBoard(board);
-    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "relaunch", cardId: card.id, kind, launch }) + "\n"); } catch {}
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "relaunch", cardId: card.id, kind, by, launch }) + "\n"); } catch {}
     return sendJSON(res, 200, { card, launch });
   }
 
