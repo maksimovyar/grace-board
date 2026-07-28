@@ -334,6 +334,120 @@ function compiledRequirements(card) {
   return parts.join("\n\n") || null;
 }
 
+// region FUNC_cardBrief — statement-of-work fields + strictness by author (design §4)
+// ## @purpose The two most expensive stalls of a run are «is X in scope?» (8 h idle on two
+// ##   such questions) and «which fields does entity Y have?». Both are answerable at
+// ##   composition time. So a card now carries the answers as first-class fields —
+// ##   outOfScope · acceptance · contract · sources — and STRICTNESS depends on WHO wrote it
+// ##   (`origin`), not on text length: an agent must fill them, a human owes nothing.
+// ## @io (card) -> prompt block · (card) -> dispatch veto · (board,card) -> inherited contracts
+// ## @invariants
+// ## - `origin` defaults to "human" for every card that lacks the field → ZERO requirements →
+// ##   every one of the 86 live cards keeps dispatching exactly as before. No migration needed.
+// ## - Only `skill`/`agent` are gated. `deferred` is gated by the draft flag instead (§4.2),
+// ##   because a tail inherits its parent's fields and is not a fresh statement of work.
+// ## - contract has THREE states: filled (follow verbatim) · "TBD" (design it here, publish it
+// ##   to result.contract) · empty (a defect only for skill/agent). Never invent a 4th.
+// ## - DAG inheritance is stamped AT DISPATCH (dispatchNow), not read live: the prompt builders
+// ##   stay pure over the card, and what the run was told stays visible on the card afterwards.
+// ## @rationale Q: why not "description must be ≥ N chars"? A: rejected in the design — a human
+// ##   writes short on purpose and drives the task home through the ask gate; that is his mode
+// ##   of work, not a defect. The agent has no such excuse.
+// ## @modulemap
+// ## FUNC 3[calc] => normalizeBrief     — request body → the 5 fields, coerced + capped
+// ## FUNC 2[guard]=> briefGaps          — which required fields are missing (strict origins only)
+// ## FUNC 2[guard]=> dispatchBlock      — the single dispatch veto (draft OR gaps)
+// ## FUNC 4[calc] => briefBlock         — the prompt block ("это решено, не спрашивай")
+// ## FUNC 3[calc] => inheritContracts   — pull dep cards' published contracts onto this card
+// GREP_SUMMARY: outOfScope, acceptance, contract, sources, origin, draft, deferred, strictness, §4
+// STRUCTURE: ▶ normalizeBrief → ⊕ briefGaps → ⚡ dispatchBlock(lever/tick) → ⎋ briefBlock(prompt)
+
+const ORIGINS = ["human", "skill", "agent", "deferred"];
+const STRICT_ORIGINS = new Set(["skill", "agent"]);       // §4.2 — the board demands a full brief
+const MAX_SOURCES = 20, MAX_SOURCE_LEN = 500;             // §4.3
+const MAX_ACCEPTANCE = 50, MAX_ACCEPTANCE_LEN = 2000;
+const cardOrigin = (card) => (card && ORIGINS.includes(card.origin)) ? card.origin : "human";
+
+// A list field accepts an array OR a newline/«- »-separated block (what a textarea and a CLI
+// heredoc both produce). Empty entries are dropped; the cap is applied, never silently — the
+// caller reports it back, same rule as MAX_DESC.
+function toLines(v, maxItems, maxLen) {
+  const arr = Array.isArray(v) ? v : (typeof v === "string" ? v.split("\n") : []);
+  return arr.map((x) => String(x).replace(/^\s*[-•*]\s*/, "").trim()).filter(Boolean)
+    .slice(0, maxItems).map((x) => x.slice(0, maxLen));
+}
+// Coerce the statement-of-work half of a create/edit body. `base` supplies the current values
+// so PATCH can send a subset. Returns only the keys present in the body (undefined = untouched).
+function normalizeBrief(b, base) {
+  const out = {};
+  if (b.outOfScope !== undefined) out.outOfScope = String(b.outOfScope).trim().slice(0, MAX_DESC) || null;
+  if (b.contract !== undefined) out.contract = String(b.contract).trim().slice(0, MAX_DESC) || null;
+  if (b.acceptance !== undefined) out.acceptance = toLines(b.acceptance, MAX_ACCEPTANCE, MAX_ACCEPTANCE_LEN);
+  if (b.sources !== undefined) out.sources = toLines(b.sources, MAX_SOURCES, MAX_SOURCE_LEN);
+  if (b.origin !== undefined) out.origin = ORIGINS.includes(b.origin) ? b.origin : (base ? cardOrigin(base) : "human");
+  if (b.draft !== undefined) out.draft = !!b.draft;
+  return out;
+}
+// Which required fields are missing? Empty for `human`/`deferred` — by design, not by omission.
+function briefGaps(card) {
+  if (!STRICT_ORIGINS.has(cardOrigin(card))) return [];
+  const gaps = [];
+  if (!String(card.outOfScope || "").trim()) gaps.push("outOfScope");
+  if (!(Array.isArray(card.acceptance) && card.acceptance.length)) gaps.push("acceptance");
+  if (!(Array.isArray(card.sources) && card.sources.length)) gaps.push("sources");
+  if (!String(card.contract || "").trim()) gaps.push("contract (текст или TBD)");
+  return gaps;
+}
+// The ONE dispatch veto, shared by the lever, the queue tick and plan assembly, so a card can
+// never start a run through one door that the other door would have refused.
+function dispatchBlock(card) {
+  if (card.draft) return { error: "черновик: проверь унаследованные поля и сними пометку черновика", draft: true, missing: [] };
+  const missing = briefGaps(card);
+  if (missing.length) return { error: `постановка неполна для origin=${cardOrigin(card)}: не заполнено — ${missing.join(", ")}`, missing };
+  return null;
+}
+// Contracts published by this card's dependencies (§4.1): stamped at dispatch so the run gets
+// them ready instead of asking the human what the previous stage decided.
+function inheritContracts(board, card) {
+  const deps = Array.isArray(card.dependsOn) ? card.dependsOn : [];
+  const got = [];
+  for (const id of deps) {
+    const dep = board.cards.find((c) => c.id === id);
+    const text = dep && ((dep.result && dep.result.contract) || dep.contractResult);
+    if (text) got.push({ from: dep.id, theme: dep.theme || null, contract: String(text).slice(0, MAX_DESC) });
+  }
+  card.inheritedContracts = got;
+}
+// The prompt block. Each field gets its own heading with an explicit instruction — a scope
+// boundary buried in prose is exactly how «is X in scope?» reached the human in the first place.
+function briefBlock(card) {
+  const out = [];
+  if (String(card.outOfScope || "").trim()) out.push(
+    `НЕ ВХОДИТ В ОБЪЁМ — ЭТО УЖЕ РЕШЕНО НА ЭТАПЕ ПОСТАНОВКИ. НЕ спрашивай про это, НЕ делай это,`,
+    `НЕ выноси это в deferred как «обнаруженное»:`, card.outOfScope, ``);
+  if (Array.isArray(card.acceptance) && card.acceptance.length) out.push(
+    `ПРИЁМКА (Definition of Done карточки — каждый пункт обязан иметь прогоняемую проверку;`,
+    `из этих же пунктов собирается приёмка всего прогона):`,
+    ...card.acceptance.map((a, i) => `${i + 1}) ${a}`), ``);
+  const contract = String(card.contract || "").trim();
+  if (contract && /^tbd$/i.test(contract)) out.push(
+    `КОНТРАКТ ДАННЫХ: TBD — его проектируешь ТЫ в этой карточке (это и есть часть задачи).`,
+    `Перед "ready" запиши получившийся контракт (модели, поля, эндпоинты — дословно) в top-level`,
+    `"contract" своего board.json: зависимые этапы получат его готовым и не будут переспрашивать.`, ``);
+  else if (contract) out.push(
+    `КОНТРАКТ ДАННЫХ — СЛЕДУЙ ДОСЛОВНО, не синтезируй свой и не переспрашивай:`, contract, ``);
+  if (Array.isArray(card.sources) && card.sources.length) out.push(
+    `ИСТОЧНИКИ ТРЕБОВАНИЙ (в порядке приоритета; помеченное как устаревшее — не использовать):`,
+    ...card.sources.map((s) => `• ${s}`), ``);
+  const inh = Array.isArray(card.inheritedContracts) ? card.inheritedContracts : [];
+  if (inh.length) out.push(
+    `КОНТРАКТ ОТ ПРЕДЫДУЩИХ ЭТАПОВ ПРОГОНА (уже спроектирован — бери как есть, НЕ переспрашивай`,
+    `и НЕ переопределяй; расхождение с ним — повод остановиться, а не «улучшить»):`,
+    ...inh.map((x) => `• этап «${x.theme || x.from}»:\n${x.contract}`), ``);
+  return out.length ? out.join("\n").trim() : "";
+}
+// endregion FUNC_cardBrief
+
 // region FUNC_detectDirectives — pull build-METHOD directives out of the task text
 // The task body mixes WHAT to build (functional) with HOW to build it (use skill X,
 // a theme, a stack). Requirements-synthesis legitimately drops the HOW — so we extract
@@ -442,7 +556,8 @@ function hasActiveForProject(board, project, exceptId) {
 //   1) the per-project WIP=1 slot is free (S0), 2) every dependsOn card is `ready` (S1),
 //   3) no files[] conflict with an active sibling (S1 — subsumed by WIP=1, forward-compat).
 function canDispatchNow(board, card) {
-  return !hasActiveForProject(board, card.project, card.id)
+  return dispatchBlock(card) === null            // S3 §4.2: draft / incomplete brief never starts
+    && !hasActiveForProject(board, card.project, card.id)
     && depsSatisfied(board, card)
     && !filesConflict(board, card);
 }
@@ -450,6 +565,7 @@ function canDispatchNow(board, card) {
 // Shared by the PATCH (lever) path and the tick scheduler so both dispatch identically.
 function dispatchNow(board, card, via) {
   card.queued = false;
+  inheritContracts(board, card);   // S3 §4.1: dep contracts are frozen onto the card at dispatch
   card.dispatchedAt = new Date().toISOString();
   card.dispatch = dispatch(card);
   card.lastColumnChangeAt = card.dispatchedAt;
@@ -581,6 +697,9 @@ function buildResult(card) {
     finishNote: card.finishNote || null,
     blockReason: card.column === "blocked" ? (card.blockReason || null) : null,
     autoDecisions: auto,
+    // S3 §4.1: the contract this card DESIGNED (card.contract === "TBD" → the run publishes it
+    // as top-level "contract"). Dependents inherit it at dispatch — see inheritContracts().
+    contract: card.contractResult || null,
     releaseManifest: present ? manifest : null,
     manifestMissing: present ? missing : [],
     floor: present ? mechanicalFloor(card.deploy) : [],   // S3: hard-floor flags (human sign-off), §5.3
@@ -835,9 +954,11 @@ function launchAskFunctional(card, projectDir, runDir) {
   const dirs = directivesBlock(card);
   const auto = autonomyBlock(card);
   const planDec = planDecisionsBlock(card);
+  const brief = briefBlock(card);
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
+    brief ? `${brief}\n` : ``,
     dirs ? `${dirs}\n` : ``,
     auto ? `${auto}\n` : ``,
     planDec ? `${planDec}\n` : ``,
@@ -872,9 +993,11 @@ function launchAskArchitecture(card, projectDir, runDir, funcQA, rigor) {
   const dirs = directivesBlock(card);
   const auto = autonomyBlock(card);
   const planDec = planDecisionsBlock(card);
+  const brief = briefBlock(card);
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
+    brief ? `${brief}\n` : ``,
     `Ответы по функционалу (блок 1):\n${qa}\n`,
     dirs ? `${dirs}\n` : ``,
     auto ? `${auto}\n` : ``,
@@ -909,6 +1032,7 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
   const dirs = directivesBlock(card);
   const auto = autonomyBlock(card);
   const planDec = planDecisionsBlock(card);
+  const brief = briefBlock(card);
   // S4: a plan stage commits to the plan's SHARED integration branch (base = its tip → sees
   // predecessors' commits, §4); a single card keeps its own autodev/<slug>. branchFor() is the
   // single source of the branch name across green-checkpoints, the final push, and resume.
@@ -919,6 +1043,7 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
   const prompt = [
     `/grace-feature-dev ${featureLine(card)}`, ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
+    brief ? `${brief}\n` : ``,
     fq ? `Ответы по функционалу:\n${fq}\n` : ``,
     ad ? `Принятые архитектурные решения (человек выбрал — СОБЛЮДАЙ их):\n${ad}\n` : ``,
     dirs ? `${dirs}\n` : ``,
@@ -1079,6 +1204,11 @@ function syncFromPipeline() {
         if (pip.branchLink && pip.branchLink !== card.branchLink) { card.branchLink = String(pip.branchLink); changed = true; }
         if (pip.finishNote && pip.finishNote !== card.finishNote) { card.finishNote = String(pip.finishNote); changed = true; }
         if (pip.migration && JSON.stringify(pip.migration) !== JSON.stringify(card.migration)) { card.migration = pip.migration; changed = true; }
+        // S3 §4.1: a `contract: TBD` card publishes the contract it designed as top-level
+        // "contract" — mirror it so buildResult exposes it and dependents inherit it.
+        if (typeof pip.contract === "string" && pip.contract.trim() && pip.contract !== card.contractResult) {
+          card.contractResult = pip.contract.slice(0, MAX_DESC); changed = true;
+        }
         // SR: mirror the 5-section release manifest the build writes at `ready` (generalises
         // `migration`) + the archDecisions (an AUTO run's own forks feed result.autoDecisions).
         if (pip.deploy && JSON.stringify(pip.deploy) !== JSON.stringify(card.deploy)) { card.deploy = pip.deploy; changed = true; }
@@ -1105,6 +1235,18 @@ function syncFromPipeline() {
               column: "backlog", createdAt: new Date().toISOString(), dispatchedAt: null,
               history: [{ column: "backlog", ts: new Date().toISOString() }],
               spawnedFrom: card.id,
+              // S3 §4.2: a tail is NOT a fresh statement of work — it inherits the parent's
+              // context (sources / contract / req link / write footprint) and starts as a
+              // DRAFT: visible on the board, but dispatchBlock() refuses to run it until a
+              // human has looked it over. That is what stopped 30 tails/run being auto-work.
+              origin: "deferred", draft: true,
+              sources: Array.isArray(card.sources) ? card.sources.slice() : [],
+              // a parent whose contract was TBD has already published the real one — hand the
+              // tail the RESULT, not the placeholder, or the tail would re-design it.
+              contract: card.contractResult || card.contract || null,
+              files: Array.isArray(card.files) ? card.files.slice() : [],
+              outOfScope: null, acceptance: [],
+              planId: null, dependsOn: [], autonomy: null,
             });
             card.deferredSpawned.push(title);
             changed = true;
@@ -1364,6 +1506,10 @@ async function handleApi(req, res, urlPath) {
     if (cards.some((c) => !PLAN_ASSEMBLABLE.has(c.column) || c.dispatchedAt)) return sendJSON(res, 400, { error: "only undispatched Backlog/To do cards can be assembled" });
     if (cards.some((c) => c.planId)) return sendJSON(res, 400, { error: "a card is already part of a plan" });
     if (stagesHaveCycle(stages)) return sendJSON(res, 400, { error: "dependency cycle between stages — a plan DAG must be acyclic" });
+    // S3 §4.2: refuse the whole assembly if any stage's brief is incomplete (or is an unreviewed
+    // draft). Letting it in would park that stage in the queue forever — deps never satisfy.
+    const badStage = cards.map((c) => ({ c, veto: dispatchBlock(c) })).find((x) => x.veto);
+    if (badStage) return sendJSON(res, 400, { error: `этап «${badStage.c.theme || badStage.c.id}»: ${badStage.veto.error}`, cardId: badStage.c.id, missing: badStage.veto.missing });
 
     const id = crypto.randomUUID().slice(0, 8);
     const integrationBranch = `autodev/plan-${id}`;
@@ -1433,6 +1579,9 @@ async function handleApi(req, res, urlPath) {
       dependsOn: Array.isArray(b.dependsOn) ? b.dependsOn.filter((x) => typeof x === "string") : [],
       files: Array.isArray(b.files) ? b.files.filter((x) => typeof x === "string") : [],
       autonomy: AUTONOMIES.includes(b.autonomy) ? b.autonomy : null,   // S3: null = inherit the global default (§5.3)
+      // S3 · statement of work (§4.1). Defaults = today's card: origin "human" → no checks.
+      outOfScope: null, acceptance: [], contract: null, sources: [], origin: "human", draft: false,
+      ...normalizeBrief(b),
       column: "backlog",
       createdAt: new Date().toISOString(),
       dispatchedAt: null,
@@ -1609,6 +1758,11 @@ async function handleApi(req, res, urlPath) {
       const from = card.column;
       let dispatched = false, queued = false;
       if (from === "backlog" && column !== "backlog" && !card.dispatchedAt) {
+        // S3 §4.2 · REFUSE at the lever, not silently in the queue: an incomplete agent-authored
+        // brief (or an unreviewed deferred draft) must never leave Backlog. A `human` card is
+        // never refused here — it has nothing to fill in by design.
+        const veto = dispatchBlock(card);
+        if (veto) return sendJSON(res, 409, { error: veto.error, missing: veto.missing, draft: !!veto.draft, origin: cardOrigin(card) });
         // Leaving Backlog = request to run. Serialize per project (§5.1): dispatch now
         // only if the project's work slot is free; else QUEUE it (no spawn → the shared
         // project cwd is never touched by two runs at once). A fresh card always enters
@@ -1646,8 +1800,10 @@ async function handleApi(req, res, urlPath) {
     if (b.requirementsLink !== undefined) card.requirementsLink = String(b.requirementsLink).trim() || null;
     if (b.rigor !== undefined && RIGORS.includes(b.rigor)) card.rigor = b.rigor;
     if (b.autonomy !== undefined) card.autonomy = AUTONOMIES.includes(b.autonomy) ? b.autonomy : null; // null = inherit global (§5.3)
+    if (Array.isArray(b.files)) card.files = b.files.filter((x) => typeof x === "string");
+    Object.assign(card, normalizeBrief(b, card));   // S3 §4.1 — incl. clearing the draft flag
     writeBoard(board);
-    return sendJSON(res, 200, { card });
+    return sendJSON(res, 200, { card, blocked: dispatchBlock(card) });
   }
 
   // DELETE /api/tasks/:id

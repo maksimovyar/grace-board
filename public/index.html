@@ -128,8 +128,24 @@
     <label class="field"><span class="field__label">Тема</span>
       <input class="field__input" name="theme" required placeholder="Коротко — что делаем" /></label>
 
-    <label class="field"><span class="field__label">Описание <span class="field__opt"><span id="cnt">0</span> / 2000</span></span>
-      <textarea class="field__input field__input--area" name="description" rows="5" maxlength="2000" placeholder="Подробно: поведение, сценарии, что важно…"></textarea></label>
+    <label class="field"><span class="field__label">Описание <span class="field__opt"><span id="cnt">0</span> / 50000</span></span>
+      <textarea class="field__input field__input--area" name="description" rows="5" maxlength="50000" placeholder="Подробно: поведение, сценарии, что важно…"></textarea></label>
+
+    <div class="sheet__divider">Постановка — границы и приёмка</div>
+    <p class="sheet__hint">Заполнять не обязательно: это твоя задача, вопросы в <b>Asking</b> — нормальный способ её довести.
+      Для карточек, заведённых агентом (<code>origin: skill/agent</code>), эти поля обязательны.</p>
+
+    <label class="field"><span class="field__label">Не входит в объём <span class="field__opt">агенту отдаётся как «решено, не спрашивай»</span></span>
+      <textarea class="field__input field__input--area" name="outOfScope" rows="3" placeholder="Что НЕ делаем и куда это ушло: «настройки уведомлений — отложено в этап C»"></textarea></label>
+
+    <label class="field"><span class="field__label">Приёмка <span class="field__opt">по пункту на строку</span></span>
+      <textarea class="field__input field__input--area" name="acceptance" rows="3" placeholder="Проверяемые пункты — из них собирается приёмка всего прогона"></textarea></label>
+
+    <label class="field"><span class="field__label">Контракт данных <span class="field__opt">дословно, либо TBD</span></span>
+      <textarea class="field__input field__input--area" name="contract" rows="3" placeholder="Модели / поля / эндпоинты дословно. TBD = контракт проектируется в этой карточке"></textarea></label>
+
+    <label class="field"><span class="field__label">Источники <span class="field__opt">по одному на строку, в порядке приоритета</span></span>
+      <textarea class="field__input field__input--area" name="sources" rows="3" placeholder="docs/plans/xxx.md — главный&#10;макет v3.3 — устарел в части списков"></textarea></label>
 
     <div class="field-row">
       <label class="field"><span class="field__label">Макеты <span class="field__opt">ссылка</span></span>
