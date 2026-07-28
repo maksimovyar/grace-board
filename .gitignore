@@ -6,6 +6,11 @@ node_modules/
 data/
 .env
 .claude/settings.local.json
+# machine-bound half of the project config: stand URLs, deploy commands, chat ids,
+# absolute paths outside the repo. Must be ignored BEFORE the file is ever filled in,
+# otherwise the production stand's address rides into git with the first commit.
+# The committed halves are .grace/project.md and .grace/local.example.md.
+.grace/local.md
 
 # OS / editor cruft
 .DS_Store
