@@ -814,6 +814,9 @@ function stagesHaveCycle(stages) {
 }
 // Derived status from the plan's stage columns (§2 lifecycle) — the cards are the truth.
 function planStatus(board, plan) {
+  // S5 §5.6: once the closing phase starts it OWNS the status — running → verifying → done|failed.
+  // Before that the stage columns are still the truth.
+  if (plan.closeStatus) return plan.closeStatus;
   const cards = (plan.cardIds || []).map((id) => board.cards.find((c) => c.id === id)).filter(Boolean);
   if (!cards.length) return "empty";
   if (cards.every((c) => c.column === TERMINAL)) return "done";
@@ -822,7 +825,10 @@ function planStatus(board, plan) {
   return "planning";
 }
 // Read projection for the rail: derived status + accumulated release manifest (§6.1).
-const planView = (board, plan) => ({ ...plan, status: planStatus(board, plan), result: { releaseManifest: planReleaseManifest(board, plan.id) } });
+// The stored result (frozen at close: acceptance, PR, merge, deploy) rides on top of the live
+// manifest — before closing there is no stored half, so this is the S4 projection unchanged.
+const planView = (board, plan) => ({ ...plan, status: planStatus(board, plan),
+  result: { releaseManifest: planReleaseManifest(board, plan.id), ...(plan.result || {}) } });
 
 // S5 · SUMMARY GATE preflight (roadmap §2 Фаза 1). Surfaces PLAN-LEVEL items the human
 // resolves ONCE before launch — deduped across stages — so individual stages don't re-ask:
@@ -849,6 +855,376 @@ function preflightPlan(board, project, cardIds) {
   return { blockers, floor, forks: [] };
 }
 // endregion FUNC_plans
+
+// region FUNC_planClose — closing a run: manifest → acceptance → PR → policy (design §5)
+// ## @purpose 6 plans out of 6 ended with `status: "running"`, `result: null`, four archived by
+// ##   hand — the result of a run simply evaporated. Closing is now an AUTOMATIC phase that
+// ##   starts itself when every stage reaches `ready`, and it ends with the one artefact a human
+// ##   can actually read: a PR carrying the release manifest, the acceptance evidence, the auto
+// ##   decisions and the list of tails. This CHANGES roadmap §4 («мерж делает человек»): the PR
+// ##   is always opened, the merge follows the policy, the deploy stays behind a floor.
+// ## @io (board) -> plan.closeStatus/closeStep transitions + up to one spawned child per tick
+// ## @invariants
+// ## - A single card (planId:null) never enters here. Closing is a PLAN-level phase.
+// ## - RED ACCEPTANCE → NO DEPLOY, under any policy, ever. The PR goes to draft, plan → failed.
+// ## - stand.is_production:true → the deploy needs a human REGARDLESS of autonomy (§5.1, the
+// ##   mechanical floor): policy `after-merge` is demoted to `ask`, never executed silently.
+// ## - Every external step (gh, deploy) is a PLAIN child process, not a model call: deterministic,
+// ##   free, and its stdout is the evidence. Only the acceptance itself needs judgement.
+// ## - Each step writes ONE file and the next tick reads it — the tick never blocks on a child.
+// ## - No `gh`/no remote is NOT a silent failure: the composed PR body stays on disk and its path
+// ##   is reported in plan.result.pr.error, so a human can open the PR by hand.
+// ## @modulemap
+// ## FUNC 3[calc]    => policyFor            — plan.policy → .grace/project.md → always/manual/off
+// ## FUNC 4[calc]    => acceptanceScenarios  — every stage's acceptance[] + manifest manualChecks
+// ## FUNC 5[io]      => launchPlanAcceptance — the ONE model run of the closing phase (§5.3)
+// ## FUNC 6[calc]    => prBody               — the 7-section PR body (§5.4)
+// ## FUNC 8[persist] => planCloseTick        — the state machine + the §5.5 branching table
+// GREP_SUMMARY: plan close, acceptance, release manifest, PR, merge, deploy policy, §5, gh
+// STRUCTURE: ▶ all stages ready → ⊕ acceptance run → ⚡ PR (draft if red) → ⎋ merge/deploy by policy
+
+const DEPLOY_POLICY_DEFAULT = { pr: "always", merge: "manual", deploy: "off" };
+const PR_MODES = ["always", "never"], MERGE_MODES = ["manual", "auto"], DEPLOY_MODES = ["off", "after-merge", "ask"];
+const GH_BIN = process.env.GRACE_GH_BIN || "gh";
+const ACCEPT_GRACE_MS = 60 * 1000;   // don't judge the acceptance run dead in its first minute
+
+// Release policy of a run: what was passed at assembly wins, then the project's
+// `deploy_policy`, then the built-in default (§5.1).
+function policyFor(board, plan) {
+  const cfg = readProjectConfig(resolveProjectDir(plan.project));
+  const fromCfg = (cfg && cfg.cfg && cfg.cfg.deploy_policy) || {};
+  const p = plan.policy || {};
+  const pick = (k, allowed) => [p[k], fromCfg[k], DEPLOY_POLICY_DEFAULT[k]].find((v) => allowed.includes(v));
+  return { pr: pick("pr", PR_MODES), merge: pick("merge", MERGE_MODES), deploy: pick("deploy", DEPLOY_MODES) };
+}
+const planDir = (plan) => path.join(resolveProjectDir(plan.project), ".grace-feature-dev", "plan-" + plan.id);
+const planCards = (board, plan) => (plan.cardIds || []).map((id) => board.cards.find((c) => c.id === id)).filter(Boolean);
+// Tails a run left behind (§5.4): deferred cards spawned by its stages. Presented as a package,
+// which is the point — 30 tails discovered one by one is what made a run look endless.
+const planTails = (board, plan) => {
+  const ids = new Set(plan.cardIds || []);
+  return board.cards.filter((c) => ids.has(c.spawnedFrom)).map((c) => ({ id: c.id, theme: c.theme, draft: !!c.draft, from: c.spawnedFrom }));
+};
+// What the acceptance actually checks: every stage's acceptance[] + the manifest's manualChecks.
+// This is why acceptance is mandatory for an agent-authored card (§4.1) — without it there is
+// nothing to verify and the run would close «на слово».
+function acceptanceScenarios(board, plan) {
+  const out = [];
+  for (const c of planCards(board, plan))
+    for (const a of (c.acceptance || [])) out.push({ from: c.theme || c.id, kind: "функционал", text: a });
+  const man = planReleaseManifest(board, plan.id).releaseManifest || {};
+  for (const m of (man.manualChecks || [])) out.push({ from: "манифест релиза", kind: "ручная проверка", text: itemStr(m) });
+  return out;
+}
+// The one model run of the closing phase (§5.3): a CLEAN checkout, the deterministic commands
+// from the project config, then the functional scenarios. Not a code review — «работает ли оно».
+function launchPlanAcceptance(board, plan) {
+  const projectDir = resolveProjectDir(plan.project);
+  const runDir = planDir(plan);
+  try { fs.mkdirSync(runDir, { recursive: true }); } catch {}
+  const cfg = readProjectConfig(projectDir);
+  const cmds = (cfg && cfg.cfg && cfg.cfg.commands) || {};
+  const scen = acceptanceScenarios(board, plan);
+  const cmdLine = (k, label) => cmds[k] ? `• ${label}: ${cmds[k]}` : `• ${label}: не задана в .grace/project.md → пропусти, отметь check со status:"skip"`;
+  const prompt = [
+    `ПРИЁМКА ПРОГОНА «${plan.goal || plan.id}» — проверь, что оно РАБОТАЕТ. Это НЕ код-ревью: код уже прошёл`,
+    `verify и review на каждом этапе. Твоя задача — предъявить работающий результат целиком.`, ``,
+    `1) ЧИСТЫЙ ЧЕКАУТ. Не трогай рабочий каталог проекта (в нём могут идти другие карточки):`,
+    `   git worktree add "${path.join(runDir, "wt")}" "${plan.integrationBranch}"`,
+    `   Дальше работай ТОЛЬКО в этом каталоге. В конце убери за собой: git worktree remove --force.`, ``,
+    `2) ДЕТЕРМИНИРОВАННАЯ ЧАСТЬ (без интерпретаций — только код возврата):`,
+    cmdLine("typecheck", "typecheck"), cmdLine("test", "test"), cmdLine("build", "build"), ``,
+    `3) ФУНКЦИОНАЛЬНАЯ ЧАСТЬ. Подними приложение${cmds.dev ? ` командой: ${cmds.dev}` : " (команда dev не задана — подними как принято в проекте)"}`,
+    `   и пройди сценарии ниже браузером/curl. Для КАЖДОГО собери доказательство: код ответа, кусок вывода,`,
+    `   путь к скриншоту. «Похоже, работает» без доказательства = status:"fail".`,
+    scen.length ? scen.map((s, i) => `   ${i + 1}) [${s.kind}] ${s.text}   ← из «${s.from}»`).join("\n")
+      : `   (сценариев нет — ни у одного этапа не заполнено acceptance. Отметь это отдельным check со status:"fail":`
+        + `\n    прогон нельзя принять «на слово».)`, ``,
+    `4) РЕЗУЛЬТАТ — строго в ${path.join(runDir, "acceptance.json")}, СТРОГО в этом формате:`,
+    `   {"checks":[{"id":"c1","title":"…","kind":"deterministic|functional","status":"pass|fail|skip",`,
+    `   "output":"хвост вывода/код ответа","evidence":"путь к скриншоту или пусто"}],`,
+    `   "passed":true|false,"failed":["id",…],"notes":"кратко о рисках"}`,
+    `   passed:true ТОЛЬКО если ни одного "fail". Пиши файл ДАЖЕ если всё упало — молчание = провал приёмки.`, ``,
+    `ЗАПРЕТЫ: не мержь, не деплой, не правь код и не коммить в интеграционную ветку. Приёмка только читает.`,
+  ].join("\n");
+  return spawnRun(projectDir, runDir, prompt, "plan-acceptance.log");
+}
+// A plain child process for the deterministic steps (gh / deploy): stdout+stderr into one file the
+// next tick reads. No model, no tokens, and the output IS the evidence.
+function spawnStep(cwd, cmd, outFile) {
+  try {
+    const out = fs.openSync(outFile, "w");
+    const env = { ...process.env, PATH: `${BIN_PATH_HINT}:${process.env.PATH || ""}` };
+    const child = spawn("/bin/sh", ["-lc", `${cmd}; echo "__EXIT__:$?"`], { cwd, env, detached: true, stdio: ["ignore", out, out] });
+    child.unref();
+    return { started: true, pid: child.pid };
+  } catch (e) { return { started: false, error: String(e.message || e) }; }
+}
+// Read a step's output file once the child has written its exit marker.
+function readStep(outFile) {
+  let text = "";
+  try { text = fs.readFileSync(outFile, "utf8"); } catch { return null; }
+  const m = text.match(/__EXIT__:(\d+)\s*$/);
+  if (!m) return null;                       // still running
+  return { code: Number(m[1]), text: text.replace(/__EXIT__:\d+\s*$/, "").trim() };
+}
+
+// The PR body (§5.4). Assembled from what the board already knows — this is the single
+// human-readable trace of a run, and it is written whether the merge is manual or auto.
+function prBody(board, plan, pol) {
+  const cards = planCards(board, plan);
+  const rm = planReleaseManifest(board, plan.id);
+  const acc = (plan.result && plan.result.acceptance) || null;
+  const tails = planTails(board, plan);
+  const L = [];
+  L.push(`## Цель прогона`, plan.goal || `Прогон ${plan.id}`, ``);
+  L.push(`Ветка: \`${plan.integrationBranch}\` · режим: ${plan.mode} · политика: pr=${pol.pr} merge=${pol.merge} deploy=${pol.deploy}`, ``);
+  L.push(`## Этапы (${cards.length})`);
+  for (const c of cards) L.push(`- **${c.theme || c.id}** — ${c.column}${c.branchLink ? ` · [ветка](${c.branchLink})` : ""}${c.finishNote ? `\n  ${String(c.finishNote).split("\n")[0]}` : ""}`);
+  L.push(``, `## Манифест релиза`);
+  for (const s of MANIFEST_SECTIONS) {
+    const items = (rm.releaseManifest && rm.releaseManifest[s]) || [];
+    L.push(`**${s}** — ${items.length ? "" : "_проверял, пусто_"}`);
+    for (const it of items) L.push(`- ${itemStr(it)}`);
+  }
+  const miss = rm.stages.filter((s) => (s.manifestMissing || []).length);
+  if (miss.length) L.push(``, `> ⚠ этапы с ПРОПУЩЕННЫМИ ключами манифеста (не «пусто», а «забыл»): ` + miss.map((s) => `${s.theme || s.id}: ${s.manifestMissing.join(", ")}`).join(" · "));
+  if ((rm.warnings || []).length) L.push(``, `> ⚠ конфликты слияния манифеста: ` + rm.warnings.join(" · "));
+  L.push(``, `## Приёмка`);
+  if (!acc) L.push(`_не проводилась_`);
+  else {
+    L.push(acc.passed ? `✅ **зелёная** — все проверки прошли` : `❌ **красная** — провалено: ${(acc.failed || []).join(", ") || "см. ниже"}`);
+    for (const c of (acc.checks || [])) L.push(`- ${c.status === "pass" ? "✅" : c.status === "skip" ? "⏭" : "❌"} [${c.kind || "?"}] ${c.title || c.id}${c.output ? ` — \`${String(c.output).slice(0, 200).replace(/\n/g, " ")}\`` : ""}${c.evidence ? ` · доказательство: ${c.evidence}` : ""}`);
+    if (acc.notes) L.push(``, `Риски по итогам приёмки: ${acc.notes}`);
+  }
+  const auto = cards.flatMap((c) => ((c.result && c.result.autoDecisions) || []).map((d) => ({ c, d })));
+  L.push(``, `## Решения, принятые без человека (AUTO)`);
+  if (!auto.length) L.push(`_нет — все развилки прошли через человека_`);
+  for (const { c, d } of auto) L.push(`- **${d.chosenTitle || d.choice}** — ${d.q}${d.ownText ? ` · _${d.ownText}_` : ""} (этап «${c.theme || c.id}»)`);
+  L.push(``, `## Хвосты (${tails.length})`);
+  if (!tails.length) L.push(`_нет_`);
+  for (const t of tails) L.push(`- ${t.theme}${t.draft ? " _(черновик — ждёт проверки человеком)_" : ""}`);
+  const floor = rm.floor || [];
+  L.push(``, `## Открытые риски`);
+  if (floor.length) for (const f of floor) L.push(`- ⚠ жёсткий пол: **${f.class}** — ${f.detail} (этап ${f.stage})`);
+  const blocked = cards.filter((c) => c.column === "blocked");
+  for (const c of blocked) L.push(`- ⚠ этап «${c.theme}» остался заблокированным: ${c.blockReason || ""}`);
+  if (!floor.length && !blocked.length) L.push(`_не обнаружены_`);
+  L.push(``, `---`, `_собрано доской автоматически при закрытии прогона \`${plan.id}\`_`);
+  return L.join("\n");
+}
+
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+function planNotice(plan, text, level) {
+  plan.result = plan.result || {};
+  plan.result.notice = { ts: new Date().toISOString(), level: level || "info", text };
+  try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: plan.result.notice.ts, event: "plan-notice", planId: plan.id, level: plan.result.notice.level, text }) + "\n"); } catch {}
+}
+function logPlan(plan, event, extra) {
+  try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event, planId: plan.id, ...extra }) + "\n"); } catch {}
+}
+// Coerce whatever the acceptance run wrote into the §5.3 shape. A malformed file is a FAILED
+// acceptance, never an assumed-green one — «passed» must be earned, not defaulted.
+function normalizeAcceptance(raw) {
+  const checks = Array.isArray(raw && raw.checks) ? raw.checks.map((c, i) => ({
+    id: String((c && c.id) || "c" + (i + 1)), title: String((c && c.title) || "проверка"),
+    kind: (c && c.kind) === "deterministic" ? "deterministic" : (c && c.kind) === "functional" ? "functional" : "functional",
+    status: ["pass", "fail", "skip"].includes(c && c.status) ? c.status : "fail",
+    output: c && c.output ? String(c.output).slice(0, 4000) : null,
+    evidence: c && c.evidence ? String(c.evidence).slice(0, 500) : null,
+  })) : [];
+  const failed = checks.filter((c) => c.status === "fail").map((c) => c.id);
+  return { ranAt: new Date().toISOString(), checks, failed,
+    passed: checks.length > 0 && failed.length === 0 && raw.passed !== false,
+    notes: raw && raw.notes ? String(raw.notes).slice(0, 2000) : null,
+    evidence: checks.filter((c) => c.evidence).map((c) => c.evidence) };
+}
+
+// The closing state machine. ONE step per plan per tick: every step either spawns a child and
+// parks, or reads that child's output file. The tick itself never waits on anything.
+function planCloseTick(board) {
+  let changed = false;
+  for (const plan of (board.plans || [])) {
+    if (plan.closeStep === "closed") continue;
+    const cards = planCards(board, plan);
+    if (!cards.length) continue;
+    const pol = policyFor(board, plan);
+    const dir = planDir(plan), projectDir = resolveProjectDir(plan.project);
+    const acc = () => (plan.result && plan.result.acceptance) || null;
+
+    // ── start: every stage reached `ready` → the closing phase begins by itself (§5.2) ──
+    if (!plan.closeStatus) {
+      if (plan.archived) continue;                       // a run dismissed by hand is not closed
+      if (!cards.every((c) => c.column === TERMINAL)) continue;
+      plan.closeStatus = "verifying";
+      plan.closeStep = "acceptance";
+      plan.policy = pol;
+      plan.result = { ...(plan.result || {}), releaseManifest: planReleaseManifest(board, plan.id),
+        tails: planTails(board, plan), closingStartedAt: new Date().toISOString() };
+      const launch = launchPlanAcceptance(board, plan);
+      plan.acceptanceRun = { pid: launch.pid || null, log: launch.log || null, launched: !!launch.launched,
+        error: launch.error || null, startedAt: new Date().toISOString() };
+      logPlan(plan, "plan-closing", { stages: cards.length, policy: pol, launched: !!launch.launched });
+      changed = true;
+      continue;
+    }
+    // Terminal statuses stop the machine — but `awaiting-merge` / `awaiting-deploy` are exactly
+    // the states that tell the human WHAT IS LEFT FOR HIM, so they are never collapsed to "closed".
+    if (plan.closeStatus === "done" || plan.closeStatus === "failed") {
+      if (plan.closeStep !== "closed" && !String(plan.closeStep || "").startsWith("awaiting")) { plan.closeStep = "closed"; changed = true; }
+      continue;
+    }
+
+    // ── acceptance (§5.3): wait for acceptance.json; a silent/dead run is a RED acceptance ──
+    if (plan.closeStep === "acceptance") {
+      let raw = null;
+      try { raw = JSON.parse(fs.readFileSync(path.join(dir, "acceptance.json"), "utf8")); } catch {}
+      if (raw && typeof raw === "object") {
+        plan.result.acceptance = normalizeAcceptance(raw);
+        plan.closeStep = "pr";
+        logPlan(plan, "plan-acceptance", { passed: plan.result.acceptance.passed, failed: plan.result.acceptance.failed.length });
+        changed = true;
+      } else {
+        const started = Date.parse((plan.acceptanceRun || {}).startedAt || "") || 0;
+        const dead = !plan.acceptanceRun || !plan.acceptanceRun.launched
+          || (!isAlive(plan.acceptanceRun.pid) && Date.now() - started > ACCEPT_GRACE_MS);
+        const tooLong = Date.now() - started > STALL_MS;
+        if (dead || tooLong) {
+          plan.result.acceptance = normalizeAcceptance({ passed: false, checks: [{ id: "run", title: "Ран приёмки не отчитался", kind: "deterministic", status: "fail",
+            output: tailLog((plan.acceptanceRun || {}).log || "", 40) || ((plan.acceptanceRun || {}).error || "") }],
+            notes: dead ? "процесс приёмки умер, не записав acceptance.json" : "приёмка превысила бюджет времени" });
+          plan.closeStep = "pr";
+          logPlan(plan, "plan-acceptance", { passed: false, reason: dead ? "dead" : "timeout" });
+          changed = true;
+        }
+      }
+      continue;
+    }
+
+    // ── PR — ВСЕГДА (§5.4). Red acceptance opens it as a draft: a run that did not pass must
+    //    still leave its trace, just not look mergeable.
+    if (plan.closeStep === "pr") {
+      try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+      const bodyFile = path.join(dir, "pr-body.md");
+      try { fs.writeFileSync(bodyFile, prBody(board, plan, pol)); } catch {}
+      plan.result.prBodyFile = bodyFile;
+      if (pol.pr === "never") {
+        plan.result.pr = { url: null, draft: false, ok: false, skipped: true, error: `pr=never — PR не создавался; тело собрано в ${bodyFile}` };
+        plan.closeStep = "post-pr"; changed = true; continue;
+      }
+      const draft = !(acc() && acc().passed);
+      const title = (plan.goal || `Прогон ${plan.id}`).slice(0, 160);
+      const cmd = `${GH_BIN} pr create --base main --head ${shq(plan.integrationBranch)} --title ${shq(title)} --body-file ${shq(bodyFile)}${draft ? " --draft" : ""}`;
+      const st = spawnStep(projectDir, cmd, path.join(dir, "pr.out"));
+      plan.prRun = { ...st, draft, startedAt: new Date().toISOString() };
+      plan.closeStep = "pr-wait"; changed = true;
+      logPlan(plan, "plan-pr", { draft, started: st.started });
+      continue;
+    }
+    if (plan.closeStep === "pr-wait") {
+      const r = readStep(path.join(dir, "pr.out"));
+      const started = Date.parse((plan.prRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.prRun || {}).started) continue;
+      const draft = !!(plan.prRun || {}).draft;
+      const url = r ? (r.text.match(/https?:\/\/\S+/) || [])[0] || null : null;
+      plan.result.pr = { url, draft, ok: !!(r && r.code === 0),
+        error: r && r.code === 0 ? null : `PR не создан (${r ? "gh код " + r.code : "gh не ответил"}): ${r ? r.text.slice(-400) : (plan.prRun || {}).error || ""} · тело PR лежит в ${plan.result.prBodyFile}` };
+      plan.closeStep = "post-pr"; changed = true;
+      logPlan(plan, "plan-pr-done", { ok: plan.result.pr.ok, draft, url });
+      continue;
+    }
+
+    // ── §5.5 branching table ────────────────────────────────────────────────────────────
+    if (plan.closeStep === "post-pr") {
+      const a = acc();
+      if (!a || !a.passed) {                       // красная приёмка · любой merge · любой deploy
+        plan.closeStatus = "failed"; plan.closeStep = "closed";
+        planNotice(plan, `Приёмка красная — PR оставлен черновиком, деплоя не было. Провалено: ${(a && a.failed || []).join(", ") || "см. PR"}`, "error");
+        logPlan(plan, "plan-failed", { failed: (a && a.failed) || [] });
+        changed = true; continue;
+      }
+      if (pol.merge === "manual") {                // зелёная · manual → единственная кнопка человека
+        plan.closeStatus = "done"; plan.closeStep = "awaiting-merge";
+        planNotice(plan, `Приёмка зелёная — готово к мержу.${plan.result.pr && plan.result.pr.url ? " PR: " + plan.result.pr.url : ""}`, "ok");
+        logPlan(plan, "plan-awaiting-merge", {});
+        changed = true; continue;
+      }
+      if (!(plan.result.pr && plan.result.pr.ok && plan.result.pr.url)) {
+        // merge:auto без PR мержить нечем — и мержить в обход PR нельзя: PR это единственный след
+        plan.closeStatus = "done"; plan.closeStep = "awaiting-merge";
+        planNotice(plan, `Приёмка зелёная, но PR не создан — автомерж невозможен, мерж за человеком. ${plan.result.pr ? plan.result.pr.error : ""}`, "warn");
+        changed = true; continue;
+      }
+      const st = spawnStep(projectDir, `${GH_BIN} pr merge ${shq(plan.result.pr.url)} --merge --delete-branch=false`, path.join(dir, "merge.out"));
+      plan.mergeRun = { ...st, startedAt: new Date().toISOString() };
+      plan.closeStep = "merge-wait"; changed = true;
+      logPlan(plan, "plan-merge", { started: st.started });
+      continue;
+    }
+    if (plan.closeStep === "merge-wait") {
+      const r = readStep(path.join(dir, "merge.out"));
+      const started = Date.parse((plan.mergeRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 5 * 60 * 1000 && (plan.mergeRun || {}).started) continue;
+      plan.result.merge = { ok: !!(r && r.code === 0), output: r ? r.text.slice(-600) : null,
+        error: r && r.code === 0 ? null : `мерж не прошёл (${r ? "код " + r.code : "gh не ответил"})` };
+      if (!plan.result.merge.ok) {
+        plan.closeStatus = "done"; plan.closeStep = "awaiting-merge";
+        planNotice(plan, `Автомерж не прошёл — мерж за человеком. ${plan.result.merge.error}`, "warn");
+        changed = true; continue;
+      }
+      plan.closeStep = "deploy"; changed = true;
+      logPlan(plan, "plan-merged", {});
+      continue;
+    }
+
+    // ── deploy: the mechanical floor sits BEFORE the policy, not after it ──────────────
+    if (plan.closeStep === "deploy") {
+      const cfg = readProjectConfig(projectDir);
+      const stand = (cfg && cfg.cfg && cfg.cfg.stand) || {};
+      const isProd = String(stand.is_production) === "true";
+      const deployCmd = stand.deploy_cmd || null;    // lives in .grace/local.md (not in git)
+      const finish = (text, level) => { plan.closeStatus = "done"; plan.closeStep = "closed"; planNotice(plan, text, level || "ok"); plan.archived = true; changed = true; };
+      if (pol.deploy === "off") { finish(`Прогон закрыт: смержено, деплой выключен политикой.`); continue; }
+      if (pol.deploy === "ask" || isProd) {
+        plan.closeStatus = "done"; plan.closeStep = "awaiting-deploy";
+        plan.result.deploy = { status: "awaiting-human", reason: isProd && pol.deploy !== "ask"
+          ? "stand.is_production: true — деплой требует человека независимо от autonomy (жёсткий пол §5.1)"
+          : "политика deploy=ask" };
+        planNotice(plan, `Смержено. Деплой ждёт человека: ${plan.result.deploy.reason}`, "warn");
+        logPlan(plan, "plan-deploy-hold", { reason: plan.result.deploy.reason });
+        changed = true; continue;
+      }
+      if (!deployCmd) {
+        plan.result.deploy = { status: "no-command", reason: "stand.deploy_cmd не задан в .grace/local.md" };
+        finish(`Смержено. Деплой не выполнен: команда выкатки не задана (.grace/local.md → stand.deploy_cmd).`, "warn");
+        continue;
+      }
+      const st = spawnStep(projectDir, deployCmd, path.join(dir, "deploy.out"));
+      plan.deployRun = { ...st, startedAt: new Date().toISOString() };
+      plan.result.deploy = { status: "running", cmd: deployCmd };
+      plan.closeStep = "deploy-wait"; changed = true;
+      logPlan(plan, "plan-deploy", { started: st.started });
+      continue;
+    }
+    if (plan.closeStep === "deploy-wait") {
+      const r = readStep(path.join(dir, "deploy.out"));
+      const started = Date.parse((plan.deployRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < STALL_MS && (plan.deployRun || {}).started) continue;
+      const ok = !!(r && r.code === 0);
+      plan.result.deploy = { status: ok ? "done" : "failed", output: r ? r.text.slice(-600) : null,
+        cmd: (plan.result.deploy || {}).cmd || null };
+      plan.closeStatus = "done"; plan.closeStep = "closed";
+      plan.archived = ok;
+      planNotice(plan, ok ? `Прогон закрыт: смержено и раскатано.`
+        : `Смержено, НО деплой упал — нужен человек (пост-деплой smoke и автооткат — отдельная карточка бэклога).`, ok ? "ok" : "error");
+      logPlan(plan, "plan-deployed", { ok });
+      changed = true;
+      continue;
+    }
+  }
+  return changed;
+}
+// endregion FUNC_planClose
 
 // ── dispatch: write a grace-feature-dev-compatible seed into the project ─────
 function dispatch(card) {
@@ -1604,6 +1980,9 @@ function syncFromPipeline() {
   // queued card. Runs last so it sees this pass's ready/blocked transitions (a card that
   // just reached `ready` frees the slot for its successor in the same tick).
   if (scheduleQueued(board)) changed = true;
+  // S5 §5.2: the closing phase runs itself once every stage of a plan is `ready`. Last, so it
+  // sees the transitions this pass produced (the final stage reaching `ready` closes the run).
+  if (planCloseTick(board)) changed = true;
   if (changed) writeBoard(board);
   flushWardenQueue();   // strictly after the write — see the note on WARDEN_QUEUE
 }
@@ -1739,9 +2118,18 @@ async function handleApi(req, res, urlPath) {
     const decisions = (Array.isArray(b.decisions) ? b.decisions : [])
       .filter((d) => d && d.q)
       .map((d) => ({ id: String(d.id || ""), q: String(d.q), choice: String(d.choice || ""), chosenTitle: String(d.chosenTitle || d.a || ""), ownText: d.ownText ? String(d.ownText) : null }));
+    // S5 §5.1: the release policy is set AT THE INPUT of the run — what came in the body wins,
+    // then .grace/project.md → deploy_policy, then always/manual/off.
+    const wanted = (b.policy && typeof b.policy === "object") ? b.policy : {};
+    const cfgPol = ((readProjectConfig(resolveProjectDir(project)) || {}).cfg || {}).deploy_policy || {};
+    const policy = {
+      pr: [wanted.pr, cfgPol.pr, DEPLOY_POLICY_DEFAULT.pr].find((v) => PR_MODES.includes(v)),
+      merge: [wanted.merge, cfgPol.merge, DEPLOY_POLICY_DEFAULT.merge].find((v) => MERGE_MODES.includes(v)),
+      deploy: [wanted.deploy, cfgPol.deploy, DEPLOY_POLICY_DEFAULT.deploy].find((v) => DEPLOY_MODES.includes(v)),
+    };
     const plan = {
       id, project, goal: String(b.goal || "").trim().slice(0, MAX_DESC) || null,
-      integrationBranch, mode, cardIds: ids, status: "running",
+      integrationBranch, mode, cardIds: ids, status: "running", policy,
       decisions, createdAt: new Date().toISOString(), result: null,
     };
     board.plans.push(plan);
@@ -1765,7 +2153,7 @@ async function handleApi(req, res, urlPath) {
       }
     }
     writeBoard(board);
-    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: plan.createdAt, event: "plan-create", planId: id, project, stages: ids.length, mode, branch: integrationBranch }) + "\n"); } catch {}
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: plan.createdAt, event: "plan-create", planId: id, project, stages: ids.length, mode, policy, branch: integrationBranch }) + "\n"); } catch {}
     return sendJSON(res, 201, { plan: planView(board, plan) });
   }
 
