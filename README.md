@@ -120,6 +120,10 @@ over it. See [`.env.example`](.env.example).
 | `GRACE_BIN_PATH` | derived | extra `PATH` for spawned runs, if `claude`/`node` aren't on it |
 | `GRACE_AUTORUN` | on | set `0` to disable auto-launch (dispatch then only seeds) |
 | `GRACE_STALL_MIN` | `120` | minutes a phase may stall before the watchdog steps in |
+| `GRACE_ASK_STALL_MIN` | `30` | minutes a card may sit in `asking` before the warden is called |
+| `GRACE_WARDEN_TIMEOUT_MIN` | `10` | how long a deferred block waits for the warden's answer |
+| `GRACE_WARDEN_BUDGET` | `5` | warden interventions per card per 24 h |
+| `GRACE_WARDEN_CMD` | — | zero-config warden hook (same as registering `{kind:"command"}`) |
 
 ## Stations (= the grace-feature-dev build phases)
 
@@ -191,6 +195,30 @@ and the time of the last phase change, and adds two layers of resilience (**LA4*
 
 From a dispatched card you can **⊟ log** (tail the run's log live) and **↻ relaunch**
 (manually re-spawn from the furthest-reached step, reusing saved answers/decisions).
+
+### The warden — the board calls an agent, the agent never polls the board
+
+Auto-heal answers "the run died"; it cannot answer **why**. A subscription token limit
+kills every retry just as fast, so the card lands in `blocked` and waits for a human —
+that alone cost 3.6 h of idle time in one run. So the supervisor stays a free timer and
+a model is invoked **only on an event**: the board is about to block a card · a card
+sits in `asking` with nothing to answer (its run died before writing the questions) ·
+a card is stalled. The agent (`~/.claude/agents/board-warden.md`) classifies the stop
+against a fixed table and acts through HTTP only — it never writes `board.json`:
+
+| Endpoint | What it does |
+|---|---|
+| `GET /api/health[?minutes=N]` | every card standing longer than N, with the evidence: station, pid alive, questions, log tail, **how many runs died in the last 60 s**, budget left |
+| `POST /api/tasks/:id/pause` \| `resume` | `paused` — not broken, waiting out an external limit; **keeps its station and its place in the queue** |
+| `POST /api/tasks/:id/note` | the diagnosis, shown on the card, so a human reads "why we stand" instead of a log |
+| `POST /api/hooks/warden` | register the handler: `{kind:"command",cmd}` locally, `{kind:"http",url}` on a VPS, `{kind:"off"}` to disable |
+
+While the warden holds a card the block is **deferred**; if the agent stays silent for
+`GRACE_WARDEN_TIMEOUT_MIN` the board keeps its original decision. Its actions are
+rationed — `GRACE_WARDEN_BUDGET` (default 5) state-changing actions per card per day —
+and it may not answer questions for you, move a card to `ready`, merge, deploy, edit a
+card, or fix the environment. **With no hook registered nothing changes**: the board
+blocks exactly as it did before.
 
 > ⚠️ **The launched run uses `--permission-mode bypassPermissions`** — it writes files
 > and runs commands autonomously with no prompts, scoped to the project dir
