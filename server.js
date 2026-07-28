@@ -94,7 +94,10 @@ const TERMINAL = "ready";
 const LEGACY_COLUMN = { clarifying: "asking", done: "ready", "ready-for-deploy": "ready" };
 const normalizeColumn = (col) => LEGACY_COLUMN[col] || col;
 
-const MAX_DESC = 2000;                 // task description hard cap (chars)
+const MAX_DESC = 50000;                // task description hard cap (chars). Was 2000 — too tight for a full
+                                       // task brief, and the excess was sliced off silently. A card in a column
+                                       // clamps the text to 2 lines (CSS), the drawer renders it in full, so a
+                                       // long description costs nothing visually.
 const MAX_UPLOAD = 8 * 1024 * 1024;    // 8 MB per attachment
 const MAX_BODY = 16 * 1024 * 1024;     // request-body hard cap (covers a base64 upload)
 
