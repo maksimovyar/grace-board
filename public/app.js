@@ -43,11 +43,33 @@ function askState(card) {
   return "arch-wait";
 }
 
-// ── render: strip + board ───────────────────────────────────────────────────
-function count(col) { return state.cards.filter((c) => c.column === col).length; }
-
+// ══ v4 Ш8 · четыре станции ═══════════════════════════════════════════════════
+// @purpose Восемь колонок на 1440px давали 2886px ширины — то есть половину доски приходилось
+//   доскроливать, чтобы узнать, есть ли там что-нибудь; а после Ш6 в колонках остались только
+//   одиночные карточки, и восемь почти пустых станций перестали что-либо значить. Четыре
+//   группы отвечают на вопрос «где оно едет» без прокрутки, фаза уезжает НА карточку.
+// @rationale Q: почему у blocked нет своей станции? A: одиночная остановка это строка в зоне
+//   «Требует меня» (Ш4) — там её и решают. Отдельная колонка ради красной лампы стоила бы
+//   пятой доли ширины и вернула бы горизонтальный скролл, ради которого всё затевалось.
+// STRUCTURE: ▶ GROUPS → ⊕ groupCards → ⚡ stationHTML(группа) → ⎋ grid без overflow-x
+const GROUPS = [
+  { key: "backlog", name: "Backlog", no: "01", cols: ["backlog"] },
+  { key: "todo", name: "В очереди", no: "02", cols: ["todo"] },
+  { key: "work", name: "В работе", no: "03", cols: ["asking", "implementing", "verifying", "reviewing", "blocked"] },
+  { key: "ready", name: "Готово", no: "04", cols: ["ready"] },
+];
+const groupOf = (col) => GROUPS.find((g) => g.cols.includes(col)) || GROUPS[0];
+const groupCards = (g) => liveCards().filter((c) => !c.planId && g.cols.includes(c.column));
+// Лампа группы горит по самой громкой карточке в ней: остановка важнее работы, работа важнее тишины.
+function groupLamp(g, cards) {
+  if (cards.some((c) => c.column === "blocked")) return "var(--s-blocked)";
+  const live = cards.find((c) => WORKING.has(c.column) || c.column === "asking");
+  return live ? lampColor(live.column) : lampColor(g.cols[0]);
+}
 function stripHTML() {
-  return FLOW.map((col) => `<span class="strip__cell"><span class="strip__lamp" style="color:${lampColor(col)}"></span>${esc(STATIONS[col].name)} <span class="strip__n">${count(col)}</span></span>`).join("");
+  return GROUPS.map((g) => { const n = groupCards(g).length;
+    return `<span class="strip__cell"><span class="strip__lamp" style="color:${groupLamp(g, groupCards(g))}"></span>${esc(g.name)} <span class="strip__n">${n}</span></span>`;
+  }).join("");
 }
 
 // S3 §4.2: who wrote this card decides how strictly the board checks it. `human` is the
@@ -218,25 +240,24 @@ function cardHTML(card) {
 // v4 Ш3: архивная карточка — законченная жизнь, а не удалённая задача. Из колонок она уходит
 // (иначе Ready копится десятками), но остаётся в прогоне и в данных.
 const liveCards = () => state.cards.filter((c) => !c.archived);
-function stationHTML(col) {
-  const st = STATIONS[col];
-  // v4 Ш6: этап прогона живёт в треке и ТОЛЬКО там. В колонках — одиночные карточки, чей путь
-  // доработка не меняет: рычаг, дроп-зоны, POST /api/tasks работают как прежде.
-  const cards = liveCards().filter((c) => c.column === col && !c.planId);
-  const empty = col === "backlog"
-    ? "Добавь задачу и перетащи\nеё через рычаг запуска ⟶"
-    : "—";
+// v4 Ш6: этап прогона живёт в треке и ТОЛЬКО там. В колонках — одиночные карточки, чей путь
+// доработка не меняет: рычаг, дроп-зоны, POST /api/tasks работают как прежде.
+function stationHTML(key) {
+  const g = GROUPS.find((x) => x.key === key);
+  const cards = groupCards(g);
+  const empty = key === "backlog" ? "Добавь задачу и перетащи\nеё через рычаг запуска ⟶" : "—";
   const inner = cards.length ? cards.map(cardHTML).join("") : `<div class="well__empty">${empty}</div>`;
-  const mod = col === "backlog" ? "station--backlog" : (col === "blocked" ? "station--blocked" : "");
+  // Дроп-цель группы — её ПЕРВАЯ колонка: у «В работе» это asking, то есть ровно то, куда
+  // карточка попадает при обычном запуске. Так перетаскивание сохраняет прежний смысл.
   return `
-    <section class="station ${mod}" data-col="${col}">
+    <section class="station station--${key}" data-col="${key}">
       <header class="station__head">
-        <span class="station__no">${st.no}</span>
-        <span class="station__lamp" style="color:${st.c}"></span>
-        <span class="station__name">${esc(st.name)}</span>
+        <span class="station__no">${g.no}</span>
+        <span class="station__lamp" style="color:${groupLamp(g, cards)}"></span>
+        <span class="station__name">${esc(g.name)}</span>
         <span class="station__count">${cards.length}</span>
       </header>
-      <div class="well" data-drop="${col}">${inner}</div>
+      <div class="well" data-drop="${g.cols[0]}">${inner}</div>
     </section>`;
 }
 
@@ -822,8 +843,7 @@ function render() {
   stripEl.innerHTML = stripHTML();
   const parts = [stationHTML("backlog")];
   parts.push(`<div class="lever" data-drop="todo" id="lever" title="перетащи карточку через рычаг — команда возьмёт задачу"><span class="lever__knob"></span><span class="lever__label">launch</span></div>`);
-  for (const col of ["todo", "asking", "implementing", "verifying", "reviewing", "ready"]) parts.push(stationHTML(col));
-  parts.push(stationHTML("blocked"));
+  for (const key of ["todo", "work", "ready"]) parts.push(stationHTML(key));
   boardEl.innerHTML = parts.join("");
   igniteId = null;
   wireDnD();

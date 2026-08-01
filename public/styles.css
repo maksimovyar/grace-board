@@ -61,10 +61,13 @@ body{
 /* ── board ── */
 /* min-height: станции не сплющиваются под высокими рельсами — вместо этого страница скроллится.
    padding-bottom оставляет воздух под плавающей плашкой .hint. */
-.board{flex:1;display:flex;align-items:stretch;gap:0;padding:22px 24px 76px;overflow-x:auto;overflow-y:hidden;min-height:min(460px,58vh)}
-/* max-height держит станцию в пределах экрана — иначе с длинной колонкой (двадцать карточек в
-   «Ready for deploy») .well растянулся бы под контент и перестал скроллиться внутри себя. */
-.station{flex:0 0 286px;display:flex;flex-direction:column;min-height:0;max-height:calc(100dvh - 210px)}
+/* v4 Ш8: grid вместо ряда фиксированных станций — четыре колонки делят ширину, а не требуют её.
+   overflow-x снят: горизонтальной прокрутки на доске больше нет by design. */
+.board{flex:1;display:grid;grid-template-columns:1fr 60px 1fr 1.25fr 1fr;gap:0;align-items:stretch;
+  padding:22px 24px 40px;min-width:0;min-height:min(460px,58vh)}
+/* min-width:0 обязателен: без него grid-колонка распухает под min-content своих карточек
+   (замерено на прототипе: 286px → 449px, scrollWidth 2466 → 2886) и скролл возвращается. */
+.station{display:flex;flex-direction:column;min-width:0;min-height:0;max-height:calc(100dvh - 210px)}
 .station+.station{margin-left:16px}
 .station__head{display:flex;align-items:center;gap:9px;padding:0 4px 11px}
 .station__no{font-family:var(--mono);font-size:11px;color:var(--ink-faint)}
@@ -76,8 +79,9 @@ body{
   transition:background .15s ease,border-color .15s ease,box-shadow .15s ease}
 .well.is-over{border-color:var(--line-2);box-shadow:inset 0 0 0 2px rgba(47,115,194,.25);background:#dbe2ec}
 .station--backlog .well{background:linear-gradient(var(--bg-2),var(--well));border:1px solid var(--line)}
-.station--blocked{flex:0 0 250px}
-.station--blocked .well{background:rgba(211,63,53,.05);border:1px solid rgba(211,63,53,.2)}
+/* v4 Ш8: у остановки нет своей станции — карточка стоит в «В работе», подсвеченная красным,
+   а решают её строкой в зоне «Требует меня». */
+.station--work .well:has(.card[data-col="blocked"]){background:rgba(211,63,53,.04)}
 .well__empty{font-family:var(--mono);font-size:11.5px;color:var(--ink-faint);text-align:center;padding:24px 10px;line-height:1.6;white-space:pre-line}
 
 /* the launch LEVER — the signature device + a live drop target */
