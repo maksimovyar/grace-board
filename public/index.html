@@ -17,40 +17,66 @@
     <span class="console__mark" aria-hidden="true"></span>
     <div>
       <h1 class="console__title">grace<span>·</span>board</h1>
-      <p class="console__sub">диспетчерская · команда работает сама</p>
+      <p class="console__sub">пульт прогонов · команда работает сама</p>
     </div>
   </div>
-  <nav class="strip" id="strip" aria-label="станции"></nav>
-  <!-- v4 Ш9 · поиск (клавиша /), фильтр по проекту, плотность -->
-  <div class="tools">
-    <input class="tools__find" id="findBox" type="search" placeholder="поиск  /" aria-label="поиск по карточкам" />
+  <!-- сводка вместо ленты счётчиков по станциям: числа, которые решают, идти к доске или нет -->
+  <div class="pulse" id="pulse"></div>
+  <div class="console__tools">
+    <div class="find"><input id="findBox" type="search" placeholder="Найти этап или прогон" aria-label="поиск по карточкам" /><kbd>/</kbd></div>
     <select class="tools__proj" id="projBox" aria-label="фильтр по проекту"><option value="">все проекты</option></select>
-    <div class="seg seg--dense" id="densSeg"><button type="button" class="seg__opt is-on" data-dens="dense">плотно</button><button type="button" class="seg__opt" data-dens="comfy">просторно</button></div>
+    <div class="seg" id="densSeg" title="плотность сетки"><button type="button" class="seg__opt is-on" data-dens="dense">Плотно</button><button type="button" class="seg__opt" data-dens="comfy">Просторно</button></div>
+    <div class="seg" id="autoSegSlot" title="режим автономии по умолчанию"></div>
+    <!-- v4 Ш0 · стоп-кран: три положения, у каждого сказано, что доиграет и чего это стоит -->
+    <div class="brake" id="brake">
+      <button class="brake__btn" id="brakeBtn" type="button" aria-haspopup="menu" aria-expanded="false">⏸ Остановить</button>
+      <div class="brake__menu" id="brakeMenu" role="menu"></div>
+    </div>
+    <button class="btn btn--run" id="openLaunch" type="button">⚡ Прогон</button>
+    <button class="btn btn--solid" id="openComposer" type="button">+ Задача</button>
   </div>
-  <!-- v4 Ш4 · счётчик считает ТОЛЬКО зону «Требует меня» -->
-  <span class="pulse__k pulse__k--calm" id="pulseYou">тебя не ждут</span>
-  <!-- v4 Ш0 · стоп-кран: три положения, у каждого сказано, что доиграет и чего это стоит -->
-  <div class="brake" id="brake">
-    <button class="brake__btn" id="brakeBtn" type="button" aria-haspopup="menu" aria-expanded="false">⏸ Остановить</button>
-    <div class="brake__menu" id="brakeMenu" role="menu"></div>
-  </div>
-  <button class="btn btn--run" id="openLaunch" type="button">⚡ Прогон</button>
-  <button class="btn btn--solid" id="openComposer" type="button">+ Новая задача</button>
 </header>
 
 <!-- взведённое удержание: что доигрывает и сколько осталось (v4 Ш0) -->
 <div id="holdHost"></div>
 
-<!-- v4 Ш4 · «Требует меня»: сюда попадает только то, что СТОИТ и снять может ТОЛЬКО человек -->
-<div id="attnHost"></div>
+<!-- Палуба: четыре зоны, каждая со своим заголовком. Ширина ограничена и центрирована —
+     на широком экране колонка текста в 2000px не читается, а зоны теряют границы. -->
+<main class="deck">
+  <section>
+    <div class="zone__head">
+      <span class="zone__name">Требует меня</span>
+      <span class="zone__note">сюда попадает только то, что стоит и ждёт именно тебя</span>
+      <span class="zone__act" id="attnNote"></span>
+    </div>
+    <div id="attnHost"></div>
+  </section>
 
-<!-- plan-rail(s) — запущенные прогоны над колонками (§2, S4); app.js наполняет из board.plans -->
-<div class="railhost" id="railHost"></div>
+  <section>
+    <div class="zone__head">
+      <span class="zone__name">Прогоны</span>
+      <span class="zone__note" id="runsNote"></span>
+      <button class="zone__act" type="button" id="collapseAll">свернуть все</button>
+    </div>
+    <div class="railhost" id="railHost"></div>
+  </section>
 
-<main class="board" id="board" aria-label="kanban board"></main>
+  <section>
+    <div class="zone__head">
+      <span class="zone__name">Одиночные задачи</span>
+      <span class="zone__note">вне прогонов · путь через рычаг не изменился</span>
+    </div>
+    <div class="board" id="board" aria-label="kanban board"></div>
+  </section>
 
-<!-- v4 Ш5 · полка закрытого: прогоны, по которым доска больше ничего не сделает сама -->
-<div id="shelfHost"></div>
+  <section>
+    <div class="zone__head">
+      <span class="zone__name">Закрытое</span>
+      <span class="zone__note" id="shelfNote"></span>
+    </div>
+    <div id="shelfHost"></div>
+  </section>
+</main>
 
 <!-- ══ LAUNCH WIZARD — мастер запуска большой фичи (Plan Run, S4·S5) ═══════════ -->
 <div class="launch" id="launch" hidden>
