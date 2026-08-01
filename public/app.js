@@ -95,8 +95,9 @@ function cardTags(card) {
   if (manifestHasItems(card.deploy))
     t.push(`<span class="tag tag--rel" title="манифест релиза — открой карточку">⛁ релиз</span>`);
   // S3 · AUTO trail (§5.3): forks resolved without a human · hard-floor held for a human.
+  // v4 Ш7: чип — кнопка. Число решений без журнала не говорит, с ЧЕМ ты согласился молчанием.
   const autoN = (card.result && card.result.autoDecisions || []).length;
-  if (autoN) t.push(`<span class="tag tag--auto" title="авто-решений без человека">🤖 ${autoN}</span>`);
+  if (autoN) t.push(`<button class="tag tag--auto" type="button" data-autolog="${esc(card.id)}" title="журнал решений, принятых без тебя">🤖 решено без тебя: ${autoN}</button>`);
   if ((card.autoFloorHeld || []).length) t.push(`<span class="tag tag--floor" title="AUTO остановлен полом — решает человек">⚠ пол · ждёт</span>`);
   const floorN = (card.result && card.result.floor || []).length;
   if (floorN) t.push(`<span class="tag tag--floor" title="жёсткий пол — нужна подпись человека на PR">⚠ пол: ${floorN}</span>`);
@@ -130,7 +131,8 @@ function resultHTML(card) {
   const blHref = r.branchLink && safeUrl(r.branchLink);
   if (r.branchLink) rows.push(`<div class="res__row"><span class="res__k">⎇ ветка</span><span class="res__v">${blHref ? `<a href="${esc(blHref)}" target="_blank" rel="noopener">${esc(r.branchLink)}</a>` : esc(r.branchLink)}</span></div>`);
   if (r.finishNote) rows.push(`<div class="res__row"><span class="res__k">итог</span><span class="res__v">${esc(r.finishNote)}</span></div>`);
-  if ((r.autoDecisions || []).length) rows.push(`<div class="res__row"><span class="res__k">🤖 авто</span><span class="res__v">${r.autoDecisions.map((d) => esc(d.chosenTitle || d.q || "решение")).join(" · ")}</span></div>`);
+  // v4 Ш7: сами решения ушли в журнал (autoLogHTML) — здесь остаётся только счётчик-указатель.
+  if ((r.autoDecisions || []).length) rows.push(`<div class="res__row"><span class="res__k">🤖 авто</span><span class="res__v">${r.autoDecisions.length} — журнал ниже</span></div>`);
   if (r.blockReason) rows.push(`<div class="res__row res__row--block"><span class="res__k">⚠ причина</span><span class="res__v">${esc(r.blockReason)}</span></div>`);
   if ((r.floor || []).length) rows.push(`<div class="res__row res__row--block"><span class="res__k">⚠ пол</span><span class="res__v">${r.floor.map((f) => esc(`${f.class}: ${f.detail}`)).join("<br>")}<div class="res__floornote">жёсткий пол §5.3 — требует подписи человека на финальном PR</div></span></div>`);
   let manifest = "";
@@ -275,6 +277,55 @@ function dagNodeClass(card) {
   if (card.dispatchedAt) return "live";     // asking / implementing / verifying / reviewing
   return "wait";                             // queued or not-yet-dispatched todo
 }
+// ══ v4 Ш7 · полоса цикла и AUTO-журнал ═══════════════════════════════════════
+// @purpose card.history и lastColumnChangeAt лежат на карточке с самого начала и ни разу не были
+//   показаны человеку — поэтому «давно ли оно там» приходилось выяснять по логам. Полоса цикла
+//   показывает пройденный путь с ФАКТИЧЕСКИМИ длительностями: она не прогноз, а факт. Считается
+//   целиком на клиенте, серверных правок не требует.
+// STRUCTURE: ▶ phaseSpans(history) → ⊕ cycleHTML → ⚡ autoLogHTML(вопрос→выбор→обоснование)
+const CYCLE = [["asking", "вопросы"], ["implementing", "пишет код"], ["verifying", "проверяет"],
+  ["reviewing", "ревью"], ["ready", "готово"]];
+const mins = (m) => (m < 60 ? `${Math.round(m)} мин` : `${(m / 60).toFixed(1).replace(".0", "")} ч`);
+// Сколько карточка провела в каждой колонке. Одна и та же колонка может встретиться дважды
+// (verify упал → снова implementing), поэтому длительности складываются, а не перезаписываются.
+function phaseSpans(card) {
+  const h = (card.history || []).filter((e) => e && e.ts && e.column);
+  const spans = {};
+  for (let i = 0; i < h.length; i++) {
+    const end = i + 1 < h.length ? Date.parse(h[i + 1].ts) : Date.now();
+    const m = (end - Date.parse(h[i].ts)) / 60000;
+    if (m > 0) spans[h[i].column] = (spans[h[i].column] || 0) + m;
+  }
+  return spans;
+}
+function cycleHTML(card) {
+  const spans = phaseSpans(card);
+  const cur = FLOW.indexOf(card.column);
+  const body = CYCLE.map(([col, word]) => {
+    const k = card.column === col ? "now" : (cur > FLOW.indexOf(col) ? "done" : "next");
+    const t = spans[col] ? `<b>${mins(spans[col])}</b>` : "";
+    return `<span class="cyc cyc--${k}"><span class="cyc__ic">${k === "now" ? "●" : k === "done" ? "✓" : "○"}</span>${word}${t}</span>`;
+  }).join(`<span class="cyc__arr">→</span>`);
+  // Остановка — не фаза цикла: она пририсовывается сбоку, чтобы не притворяться шагом работы.
+  const stop = card.column === "blocked"
+    ? `<span class="cyc__arr">→</span><span class="cyc cyc--stop"><span class="cyc__ic">!</span>стоит${spans.blocked ? `<b>${mins(spans.blocked)}</b>` : ""}</span>` : "";
+  return `<div class="cycle">${body}${stop}</div>`;
+}
+// Журнал решений, принятых без человека: вопрос → что выбрано → почему. Раньше это была одна
+// строка с перечислением заголовков, по которой нельзя было понять, с чем именно ты согласился.
+function autoLogHTML(card) {
+  const list = [...((card.result && card.result.autoDecisions) || []), ...(card.archDecisions || [])]
+    .filter((d, i, all) => d && all.findIndex((x) => (x.id || x.q) === (d.id || d.q)) === i);
+  if (!list.length) return "";
+  return `<div><div class="dt__label">🤖 Решено без тебя · ${list.length}</div>
+    <div class="autolog">${list.map((d) => `<div class="autolog__row">
+      <div class="autolog__q">${esc(d.q || "развилка")}</div>
+      <div class="autolog__a">→ ${esc(d.chosenTitle || d.choice || "авто-выбор")}</div>
+      ${d.ownText ? `<div class="autolog__why">${esc(d.ownText)}</div>` : ""}
+    </div>`).join("")}</div>
+    <div class="autolog__note">решено без остановки прогона · порог эскалации не сработал</div></div>`;
+}
+
 // ══ v4 Ш6 · прогон как трек ══════════════════════════════════════════════════
 // @purpose Раньше карточка прогона жила В ДВУХ местах сразу: узлом на рельсе и карточкой в
 //   колонке. Один и тот же этап читался дважды, а восемь колонок при этом были почти пусты.
@@ -362,6 +413,7 @@ function headHTML(card, n, plan, k) {
       <button class="head__more" type="button" data-open-card="${esc(card.id)}">подробнее →</button>
     </div>
     <div class="head__t">${esc(card.theme || card.id)}</div>
+    ${cycleHTML(card)}
     ${cardTags(card)}
     ${askLabel ? `<button class="head__ask${ask === "arch-wait" ? " head__ask--wait" : ""}" type="button" ${ask === "arch-wait" ? "disabled" : `data-ask="${esc(card.id)}"`}>${esc(askLabel)}</button>` : ""}
   </div>`;
@@ -739,6 +791,7 @@ function renderRails() {
     card.column === "asking" ? openAsk(card.id) : openDetail(card.id);
   }));
   host.querySelectorAll("[data-ask]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); openAsk(b.dataset.ask); }));
+  host.querySelectorAll("[data-autolog]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); openDetail(b.dataset.autolog); }));
   host.querySelectorAll("[data-planreopen]").forEach((b) => b.addEventListener("click", () => onPlanReopen(b.dataset.planreopen)));
   host.querySelectorAll("[data-planclose]").forEach((b) => b.addEventListener("click", () => onPlanClose(b.dataset.planclose)));
 }
@@ -778,6 +831,7 @@ function render() {
   boardEl.querySelectorAll("[data-log]").forEach((b) => b.addEventListener("click", (e) => openLog(e.currentTarget.dataset.log)));
   boardEl.querySelectorAll("[data-relaunch]").forEach((b) => b.addEventListener("click", onRelaunch));
   boardEl.querySelectorAll("[data-ask]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); openAsk(e.currentTarget.dataset.ask); }));
+  boardEl.querySelectorAll("[data-autolog]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); openDetail(e.currentTarget.dataset.autolog); }));
   boardEl.querySelectorAll(".card").forEach((el) => el.addEventListener("click", (e) => {
     if (e.target.closest("[data-stop],button,a,input,textarea")) return;
     const card = cardById(el.dataset.id); if (!card) return;
@@ -908,6 +962,7 @@ function openDetail(id) {
     ${attViewHTML(card)}
     ${card.column === "blocked" && card.blockReason ? `<div class="card__blocked">⚠ ${esc(card.blockReason)}</div>` : ""}
     ${resultHTML(card)}
+    ${autoLogHTML(card)}
     ${note}
     <div class="sheet__actions">
       <button class="btn btn--danger" type="button" data-del-detail>Отменить задачу</button>
