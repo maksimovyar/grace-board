@@ -69,6 +69,21 @@
       <label style="display:flex;flex-direction:column;gap:6px">
         <span class="lk">Цель прогона · контекст для финального PR <span style="text-transform:none;color:var(--ink-faint)">(необязательно)</span></span>
         <textarea class="lin" id="lGoal" rows="2" placeholder="Одной фразой: зачем этот прогон…"></textarea></label>
+      <!-- v4 Ш2 · политика релиза: движок умеет автомерж и стенд с самого начала, но мастер их
+           не спрашивал — и все шесть прогонов уехали с дефолтом, о котором никто не знал -->
+      <span class="lk">Политика релиза · что доска сделает в конце сама</span>
+      <div class="pol">
+        <div class="pol__row"><span class="pol__k">PR</span>
+          <div class="seg" id="polPr"><button type="button" class="seg__opt is-on" data-pol="always">Собирать</button><button type="button" class="seg__opt" data-pol="never">Не собирать</button></div></div>
+        <div class="pol__row"><span class="pol__k">Мерж</span>
+          <div class="seg" id="polMerge"><button type="button" class="seg__opt is-on" data-pol="manual">Руками</button><button type="button" class="seg__opt" data-pol="auto">Автомерж</button></div></div>
+        <div class="pol__row"><span class="pol__k">Стенд</span>
+          <div class="seg" id="polDeploy"><button type="button" class="seg__opt is-on" data-pol="off">Не трогать</button><button type="button" class="seg__opt" data-pol="after-merge">Раскатать после мержа</button><button type="button" class="seg__opt" data-pol="ask">Спросить</button></div></div>
+      </div>
+      <div class="verdict" id="lVerdict">
+        <span class="verdict__ic">📄</span>
+        <span class="verdict__b"></span>
+      </div>
       <div class="verdict">
         <span class="verdict__ic">🧩</span>
         <span class="verdict__b"><b>Прогон собирается из задач доски.</b> На следующем шаге — незавершённые карточки
