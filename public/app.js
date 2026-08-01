@@ -869,7 +869,56 @@ let wizStep = 1, wizMode = "ask", wizPicks = [];   // wizPicks: ordered [{cardId
 const assemblable = (project) => state.cards.filter((c) => c.project === project && (c.column === "backlog" || c.column === "todo") && !c.dispatchedAt && !c.planId);
 const pickIndex = (id) => wizPicks.findIndex((p) => p.cardId === id);
 function syncProjName() { const v = document.getElementById("lProject").value; document.querySelectorAll("#lProjName,#lProjName2").forEach((e) => (e.textContent = v || "проекта")); }
-function setWizMode(v) { wizMode = v; document.querySelectorAll("#lMode .seg__opt").forEach((o) => o.classList.toggle("is-on", o.dataset.auto === v)); }
+function setWizMode(v) { wizMode = v; document.querySelectorAll("#lMode .seg__opt").forEach((o) => o.classList.toggle("is-on", o.dataset.auto === v)); renderVerdict(); }
+
+// ══ v4 Ш2 · политика релиза ══════════════════════════════════════════════════
+// @purpose Движок с самого начала умеет и автомерж, и раскатку на стенд, но мастер об этом не
+//   спрашивал — поэтому все шесть прогонов уехали с дефолтом {always, manual, off}, о котором
+//   человек не знал. Переключатели без вердикта тоже не годятся: три поля дают двенадцать
+//   комбинаций, и половина из них молча не сработает. Вердикт обязан называть исключения.
+let wizPol = { pr: "always", merge: "manual", deploy: "off" };
+function setPol(k, v) {
+  wizPol[k] = v;
+  const id = { pr: "polPr", merge: "polMerge", deploy: "polDeploy" }[k];
+  document.querySelectorAll(`#${id} .seg__opt`).forEach((o) => o.classList.toggle("is-on", o.dataset.pol === v));
+  renderVerdict();
+}
+// Одним предложением: чем прогон закончится и сколько раз остановит — плюс три исключения,
+// каждое из которых наблюдалось вживую как «почему оно не сделало то, что я выбрал».
+function policyVerdict() {
+  const p = wizPol, out = [];
+  out.push(p.pr === "never" ? "PR не собирается — результат останется в интеграционной ветке."
+    : p.merge === "manual" ? "Доска соберёт PR и на этом <b>закроет прогон</b>: мерж за тобой, ждать доска не будет."
+    : "Доска соберёт PR и <b>смержит сама</b>.");
+  // Деплой живёт после мержа, поэтому без автомержа он не наступит НИКОГДА — и обещать при этом
+  // «раскатаем» или «спросим» значит противоречить себе в одной строке (так делает прототип).
+  // Здесь выбранное про стенд озвучивается только тогда, когда оно вообще может случиться.
+  const deployDead = p.merge === "manual" && p.deploy !== "off";
+  if (deployDead) out.push("<em>Деплой не сработает: без автомержа мержить нечего.</em>");
+  else if (p.merge === "auto" && p.deploy === "after-merge") out.push("После мержа — раскатка на стенд.");
+  else if (p.deploy === "ask") out.push("Деплой <em>спросит тебя</em>.");
+  out.push(wizMode === "ask" ? "По ходу остановится на вопросах <b>на каждом этапе</b>."
+    : "По ходу вопросы решит сама — остановит только жёсткий пол.");
+  if (p.deploy !== "off" && !deployDead) out.push("Если стенд помечен боевым (<code>stand.is_production</code>), деплой всё равно спросит человека — это жёсткий пол.");
+  out.push(p.pr === "never" ? "Красная приёмка отменяет всё: мержа и деплоя не будет."
+    : "Красная приёмка отменяет всё: PR останется черновиком, мержа и деплоя не будет.");
+  return out.join(" ");
+}
+function renderVerdict() {
+  const box = document.getElementById("lVerdict");
+  if (!box) return;
+  const p = wizPol;
+  box.querySelector(".verdict__ic").textContent =
+    (p.merge === "auto" && p.deploy === "after-merge") ? "🚀" : p.merge === "auto" ? "🔀" : "📄";
+  box.querySelector(".verdict__b").innerHTML = policyVerdict();
+}
+// Дефолты показываем ТЕ ЖЕ, что применит сервер (.grace/project.md → deploy_policy), иначе
+// человек увидит одно, а поедет другое.
+async function loadProjectPolicy(project) {
+  let p = { pr: "always", merge: "manual", deploy: "off" };
+  if (project) { try { p = (await api(`/api/projects/${encodeURIComponent(project)}/policy`)).policy || p; } catch { /* дефолт */ } }
+  setPol("pr", p.pr); setPol("merge", p.merge); setPol("deploy", p.deploy);
+}
 function openLaunch() {
   closeAll();
   wizPicks = []; setWizMode(state.autonomy === "auto" ? "auto" : "ask");
@@ -877,7 +926,7 @@ function openLaunch() {
   const sel = document.getElementById("lProject");
   sel.innerHTML = projects.length ? projects.map((p) => `<option>${esc(p)}</option>`).join("") : `<option value="">— нет свободных карточек —</option>`;
   document.getElementById("lGoal").value = "";
-  syncProjName(); wizGoto(1);
+  syncProjName(); loadProjectPolicy(sel.value); wizGoto(1);
   launchEl.hidden = false;
 }
 function wizGoto(n) {
@@ -959,7 +1008,7 @@ async function fireLaunch(btn) {
   const decisions = collectGateDecisions();
   btn.disabled = true; btn.textContent = "Запускаю…";
   try {
-    const { plan } = await api("/api/plans", { method: "POST", body: JSON.stringify({ project, goal: document.getElementById("lGoal").value.trim(), mode: wizMode, stages, decisions }) });
+    const { plan } = await api("/api/plans", { method: "POST", body: JSON.stringify({ project, goal: document.getElementById("lGoal").value.trim(), mode: wizMode, stages, decisions, policy: wizPol }) });
     launchEl.hidden = true;
     toast(`⚡ Прогон запущен · <strong>${esc(plan.integrationBranch)}</strong>`);
     loadBoard();
@@ -969,7 +1018,9 @@ document.getElementById("openLaunch").addEventListener("click", openLaunch);
 launchEl.querySelectorAll("[data-lclose]").forEach((b) => b.addEventListener("click", () => (launchEl.hidden = true)));
 launchEl.querySelectorAll("[data-go]").forEach((b) => b.addEventListener("click", () => wizGoto(+b.dataset.go)));
 document.querySelectorAll("#lMode .seg__opt").forEach((o) => o.addEventListener("click", () => setWizMode(o.dataset.auto)));
-document.getElementById("lProject").addEventListener("change", () => { wizPicks = []; syncProjName(); if (wizStep === 2) renderDraft(); });
+for (const [k, id] of [["pr", "polPr"], ["merge", "polMerge"], ["deploy", "polDeploy"]])
+  document.querySelectorAll(`#${id} .seg__opt`).forEach((o) => o.addEventListener("click", () => setPol(k, o.dataset.pol)));
+document.getElementById("lProject").addEventListener("change", (e) => { wizPicks = []; syncProjName(); loadProjectPolicy(e.target.value); if (wizStep === 2) renderDraft(); });
 document.getElementById("toBoard").addEventListener("click", () => { launchEl.hidden = true; openComposer(null); });
 document.getElementById("fire").addEventListener("click", (e) => fireLaunch(e.currentTarget));
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !launchEl.hidden) launchEl.hidden = true; });

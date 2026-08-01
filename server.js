@@ -2489,6 +2489,17 @@ async function handleApi(req, res, urlPath) {
     return sendJSON(res, 200, { autonomy: board.autonomy || GLOBAL_AUTONOMY, hold: holdMode(board), stopped });
   }
 
+  // GET /api/projects/:project/policy -> дефолтная политика релиза ЭТОГО проекта (v4 Ш2).
+  // Мастер обязан показать ровно то, что применит сервер: .grace/project.md → deploy_policy,
+  // иначе человек видит одно, а прогон уезжает с другим.
+  const mpol = urlPath.match(/^\/api\/projects\/([^/]+)\/policy$/);
+  if (mpol && req.method === "GET") {
+    const project = decodeURIComponent(mpol[1]);
+    const dir = resolveProjectDir(project);
+    if (!isInsideRoot(dir)) return sendJSON(res, 400, { error: "project outside root" });
+    return sendJSON(res, 200, { project, policy: policyFor(readBoard(), { project, policy: null }) });
+  }
+
   // GET /api/plans/:planId/manifest -> plan.result.releaseManifest (§6.1): accumulated,
   // per-section, DAG-ordered over the plan's stage cards. Read-only; feeds the plan-rail (S4).
   const mpm = urlPath.match(/^\/api\/plans\/([^/]+)\/manifest$/);
