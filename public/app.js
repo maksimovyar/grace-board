@@ -22,7 +22,7 @@ let igniteId = null;
 
 // ── helpers ────────────────────────────────────────────────────────────────
 const boardEl = document.getElementById("board");
-const stripEl = document.getElementById("strip");
+// v4: лента из восьми счётчиков по станциям заменена сводкой в шапке (renderPulse).
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 function safeUrl(u) { try { const p = new URL(u); return (p.protocol === "http:" || p.protocol === "https:") ? p.href : null; } catch { return null; } }
 function fmtSize(b) { return b >= 1048576 ? (b / 1048576).toFixed(1) + " МБ" : Math.max(1, Math.round(b / 1024)) + " КБ"; }
@@ -66,10 +66,20 @@ function groupLamp(g, cards) {
   const live = cards.find((c) => WORKING.has(c.column) || c.column === "asking");
   return live ? lampColor(live.column) : lampColor(g.cols[0]);
 }
-function stripHTML() {
-  return GROUPS.map((g) => { const n = groupCards(g).length;
-    return `<span class="strip__cell"><span class="strip__lamp" style="color:${groupLamp(g, groupCards(g))}"></span>${esc(g.name)} <span class="strip__n">${n}</span></span>`;
-  }).join("");
+// Сводка в шапке считает ВСЮ доску, а не только одиночные карточки: «в работе 1» должно
+// значить «на доске сейчас один живой этап», иначе шапка показывает нули при кипящем прогоне.
+function renderPulse(attN) {
+  const host = document.getElementById("pulse");
+  if (!host) return;
+  const c = liveCards();
+  const lamp = (v) => `<span class="pulse__lamp" style="color:${v};background:${v}"></span>`;
+  const k = (cls, lampVar, text) => `<span class="pulse__k${cls}">${lamp(lampVar)}${text}</span>`;
+  host.innerHTML =
+    (attN ? k(" pulse__k--you", "var(--s-asking)", `ждут тебя <b>${attN}</b>`)
+          : k(" pulse__k--calm", "var(--s-ready)", "тебя не ждут"))
+    + k("", "var(--s-implementing)", `в работе <b>${c.filter((x) => AGENT_COLUMNS.has(x.column)).length}</b>`)
+    + k("", "var(--s-todo)", `в очереди <b>${c.filter((x) => x.column === "todo").length}</b>`)
+    + k(" pulse__k--muted", "var(--s-ready)", `закрыто <b>${c.filter((x) => x.column === "ready").length}</b>`);
 }
 
 // S3 §4.2: who wrote this card decides how strictly the board checks it. `human` is the
@@ -280,16 +290,15 @@ function stationHTML(key) {
 // index.html markup is S4's territory; S3 builds the control in JS so its files[] stay
 // server.js + app.js + styles.css. board.autonomy is the global default (card override wins).
 let autoSegEl = null;
+// v4: тумблер садится в готовый слот шапки, а не вставляется рядом с кнопкой — иначе он
+// расталкивает инструменты и шапка перестаёт держаться в одну строку.
 function ensureAutonomyToggle() {
   if (autoSegEl) return;
-  const consoleEl = document.querySelector(".console");
-  const openC = document.getElementById("openComposer");
-  if (!consoleEl || !openC) return;
-  autoSegEl = document.createElement("div");
-  autoSegEl.className = "auto-seg";
-  autoSegEl.title = "глобальный режим автономии (оверрайд на карточке)";
-  autoSegEl.innerHTML = `<span class="auto-seg__label">Режим</span><div class="seg" id="autoSeg"><button type="button" class="seg__opt" data-auto="ask">Ask</button><button type="button" class="seg__opt" data-auto="auto">Auto</button></div>`;
-  consoleEl.insertBefore(autoSegEl, openC);
+  const slot = document.getElementById("autoSegSlot");
+  if (!slot) return;
+  autoSegEl = slot;
+  autoSegEl.id = "autoSeg";
+  autoSegEl.innerHTML = `<button type="button" class="seg__opt" data-auto="ask">Ask</button><button type="button" class="seg__opt" data-auto="auto">Auto</button>`;
   autoSegEl.querySelectorAll(".seg__opt").forEach((o) => o.addEventListener("click", () => setAutonomy(o.dataset.auto)));
 }
 function paintAutonomy() {
@@ -446,12 +455,21 @@ function headHTML(card, n, plan, k) {
       <span class="head__id">S${n}</span>
       <span class="head__phase" style="background:${color}">${esc(phase)}</span>
       <span class="head__age${card.lastColumnChangeAt && Date.now() - Date.parse(card.lastColumnChangeAt) > 30 * 60000 ? " is-stale" : ""}">на станции ${esc(age)}${card.lastColumnChangeAt && Date.now() - Date.parse(card.lastColumnChangeAt) > 30 * 60000 ? " — дольше обычного" : ""}</span>
-      <button class="head__more" type="button" data-open-card="${esc(card.id)}">подробнее →</button>
     </div>
     <div class="head__t">${esc(card.theme || card.id)}</div>
     ${cycleHTML(card)}
     ${cardTags(card)}
     ${askLabel ? `<button class="head__ask${ask === "arch-wait" ? " head__ask--wait" : ""}" type="button" ${ask === "arch-wait" ? "disabled" : `data-ask="${esc(card.id)}"`}>${esc(askLabel)}</button>` : ""}
+    <!-- действия идущего этапа — здесь, а не в drawer'е: это ровно то, за чем к живой карточке
+         и приходят, и каждое лишнее «подробнее →» стоит клика и потери контекста -->
+    <div class="head__acts">
+      <button class="head__act" type="button" data-log="${esc(card.id)}">⌸ лог</button>
+      <button class="head__act" type="button" data-open-card="${esc(card.id)}">открыть задачу</button>
+      <button class="head__act" type="button" data-relaunch="${esc(card.id)}">↻ перезапуск</button>
+      ${card.paused
+        ? `<button class="head__act" type="button" data-resume="${esc(card.id)}">▶ снять паузу</button>`
+        : `<button class="head__act" type="button" data-pause="${esc(card.id)}">⏸ пауза</button>`}
+    </div>
   </div>`;
 }
 function runHTML(plan) {
@@ -467,11 +485,12 @@ function runHTML(plan) {
       <div class="run__meta">
         <span class="tag tag--proj" title="проект">▣ ${esc(plan.project || "—")}</span>
         <span class="tag">${done} / ${total}</span>
-        <span class="tag">${plan.mode === "auto" ? "auto" : "ask"}</span>
-        <span class="tag">⎇ ${esc(plan.integrationBranch || "—")}</span>
-        ${pol.pr ? `<span class="tag" title="политика релиза">pr:${esc(pol.pr)} · merge:${esc(pol.merge)} · deploy:${esc(pol.deploy)}</span>` : ""}
+        <span class="tag" title="${plan.mode === "auto" ? "вопросы решает сама, остановит только жёсткий пол" : "остановится на вопросах на каждом этапе"}">${plan.mode === "auto" ? "auto" : "ask"}</span>
+        <!-- политика уехала в подсказку ветки: в шапке трека важно «что это и куда едет»,
+             а «чем закончится» человек читает в мастере при запуске и на полке при закрытии -->
+        <span class="tag" title="${pol.pr ? `политика релиза · pr:${esc(pol.pr)} · merge:${esc(pol.merge)} · deploy:${esc(pol.deploy)}` : "интеграционная ветка"}">⎇ ${esc(plan.integrationBranch || "—")}</span>
       </div>
-      <button class="run__toggle" type="button" data-runtoggle="${esc(plan.id)}">${open ? "свернуть" : "развернуть"}</button>
+      <button class="run__toggle" type="button" data-runtoggle="${esc(plan.id)}" title="${open ? "свернуть" : "развернуть"}" aria-label="${open ? "свернуть" : "развернуть"}">${open ? "⌃" : "⌄"}</button>
       <button class="rail__close" type="button" data-planclose="${esc(plan.id)}" title="убрать прогон с доски">✕</button>
     </div>
     ${trackHTML(plan, cards)}
@@ -705,23 +724,24 @@ function nextStopText() {
   return "остановок впереди нет";
 }
 function renderAttn() {
-  const host = document.getElementById("attnHost");
+  const host = document.getElementById("attnHost"), note = document.getElementById("attnNote");
   if (!host) return 0;
   const rows = attention();
+  if (note) note.textContent = rows.length ? `${rows.length} — конвейер стоит и без тебя не поедет` : "";
   if (!rows.length) {
     const view = holdView();
     const mood = view === "off" ? "Конвейер идёт сам." : view === "now" ? "Конвейер остановлен тобой." : "Конвейер доигрывает и встанет.";
+    // Одной строкой: слева вердикт, справа — где встанет в следующий раз.
     host.innerHTML = `<div class="attn calm"><div class="attn__row attn__row--calm"><span class="attn__ic">✓</span>
-      <div class="attn__txt"><span class="attn__t"><b>Никто не ждёт.</b> ${mood}</span>
-      <span class="attn__s">${esc(nextStopText())}</span></div></div>
-      <div class="attn__note">сюда попадает только то, что стоит и ждёт именно тебя</div></div>`;
+      <span class="attn__t"><b>Никто не ждёт.</b> ${mood}</span>
+      <span class="attn__next">${esc(nextStopText())}</span></div></div>`;
     return 0;
   }
   host.innerHTML = `<div class="attn">${rows.map((r) => `<div class="attn__row attn__row--${r.k}">
       <span class="attn__ic">${r.ic}</span>
       <div class="attn__txt"><span class="attn__t">${esc(r.t)}</span><span class="attn__s">${esc(r.s)}</span></div>
       <button class="attn__go" type="button" ${r.card ? `data-attncard="${esc(r.card)}"` : `data-attnplan="${esc(r.plan)}"`}>${r.go} →</button>
-    </div>`).join("")}<div class="attn__note">${rows.length} — конвейер стоит и без тебя не поедет</div></div>`;
+    </div>`).join("")}</div>`;
   host.querySelectorAll("[data-attncard]").forEach((b) => b.addEventListener("click", () => {
     const card = cardById(b.dataset.attncard);
     if (card && card.column === "asking") openAsk(card.id); else if (card) openLog(card.id);
@@ -733,13 +753,6 @@ function renderAttn() {
     if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
   }));
   return rows.length;
-}
-// Счётчик в шапке считает ТОЛЬКО эту зону — иначе он перестаёт быть сигналом «иди работай».
-function renderPulse(n) {
-  const el = document.getElementById("pulseYou");
-  if (!el) return;
-  el.className = "pulse__k " + (n ? "pulse__k--you" : "pulse__k--calm");
-  el.innerHTML = n ? `ждут тебя <b>${n}</b>` : "тебя не ждут";
 }
 
 // ══ v4 Ш5 · полка закрытого ══════════════════════════════════════════════════
@@ -754,43 +767,61 @@ const CLOSE_WORD = {
   closed: ["✓", "закрыт", "смержено и раскатано по политике"],
   failed: ["✕", "провален", "приёмка красная — PR оставлен черновиком, деплоя не было"],
 };
+// Строка полки — ОДНА строка: закрытых прогонов копится десяток, и каждый, занимающий три
+// строки, отодвигает работающие вниз. Детали («почему» + состав) раскрываются по клику.
 function shelfRowHTML(plan) {
   const st = closeState(plan);
   const [ic, word, why] = CLOSE_WORD[st] || ["·", st, ""];
   const cards = (plan.cardIds || []).map(cardById).filter(Boolean);
   const onBoard = cards.filter((c) => !c.archived).length;
   const a = (plan.result || {}).acceptance, pr = (plan.result || {}).pr;
+  const closedAt = (plan.result || {}).closingStartedAt || plan.closedAt || null;
   const chips = [`<span class="tag tag--${st === "failed" ? "bad" : "ok"}">${ic} ${esc(word)}</span>`];
   if (a) chips.push(`<span class="tag tag--${a.passed ? "ok" : "bad"}" title="${esc((a.checks || []).map((c) => `${c.status}: ${c.title}`).join("\n"))}">приёмка ${(a.checks || []).filter((c) => c.status === "pass").length}/${(a.checks || []).length}</span>`);
   // Черновик называется черновиком: PR по красной приёмке не смержить, и это видно сразу.
-  if (pr && pr.url) chips.push(`<a class="tag${pr.draft ? " tag--bad" : ""}" href="${esc(safeUrl(pr.url) || "#")}" target="_blank" rel="noopener">PR${pr.draft ? " · черновик" : ""} →</a>`);
+  if (pr && pr.url) chips.push(`<a class="tag${pr.draft ? " tag--bad" : ""}" href="${esc(safeUrl(pr.url) || "#")}" target="_blank" rel="noopener">PR${(pr.url.match(/\/(\d+)$/) || [])[1] ? " " + pr.url.match(/\/(\d+)$/)[1] : ""}${pr.draft ? " · черновик" : ""} →</a>`);
   else if (pr && pr.error) chips.push(`<span class="tag tag--bad" title="${esc(pr.error)}">PR не создан</span>`);
   chips.push(`<span class="tag">${onBoard ? `${onBoard} на доске` : "карточек нет"}</span>`);
-  return `<div class="done${st === "failed" ? " done--failed" : ""}">
+  if (closedAt) chips.push(`<span class="tag">${esc(ago(closedAt))} назад</span>`);
+  return `<div class="done${st === "failed" ? " done--failed" : ""}" data-planrow="${esc(plan.id)}">
     <div class="done__head">
       <span class="done__ic">${ic}</span>
       <span class="done__t">${esc(plan.goal || "Прогон " + plan.id)}</span>
       <div class="done__meta">${chips.join("")}</div>
-      ${onBoard ? `<button class="done__act" type="button" data-planclose="${esc(plan.id)}">Убрать с доски</button>` : ""}
-      ${st === "failed" ? `<button class="done__act" type="button" data-planreopen="${esc(plan.id)}" title="если прогон провалила не работа, а лимит подписки">↻ переиграть приёмку</button>` : ""}
+      <div class="done__acts">
+        ${onBoard ? `<button class="done__act" type="button" data-planclose="${esc(plan.id)}">Убрать с доски</button>` : ""}
+        ${st === "failed" ? `<button class="done__act" type="button" data-planreopen="${esc(plan.id)}" title="если прогон провалила не работа, а лимит подписки">↻ переиграть приёмку</button>` : ""}
+      </div>
     </div>
     <!-- notice приходит от сервера и всегда конкретнее общей формулировки исхода; выводить
          оба значит написать одно и то же дважды подряд -->
-    <div class="done__body">${esc(((plan.result || {}).notice || {}).text || why)}</div>
+    <div class="done__body">
+      <div class="done__why">${esc(((plan.result || {}).notice || {}).text || why)}</div>
+      ${cards.map((c, i) => `<div class="done__row"><span>S${i + 1}</span><span class="done__rt">${esc(c.theme || c.id)}</span><span>${c.archived ? "в архиве" : esc((STATIONS[c.column] || {}).name || c.column)}</span></div>`).join("")}
+    </div>
   </div>`;
 }
+let openShelf = new Set();
 function renderShelf() {
-  const host = document.getElementById("shelfHost");
+  const host = document.getElementById("shelfHost"), note = document.getElementById("shelfNote");
   if (!host) return;
   const shelved = (state.plans || []).filter((p) => CLOSED_STATES.has(closeState(p)));
-  if (!shelved.length) { host.innerHTML = ""; return; }
   const red = shelved.filter((p) => closeState(p) === "failed").length;
   const held = shelved.reduce((n, p) => n + (p.cardIds || []).map(cardById).filter((c) => c && !c.archived).length, 0);
-  host.innerHTML = `<section class="shelf">
-    <div class="shelf__head">Закрытые прогоны</div>
-    ${shelved.map(shelfRowHTML).join("")}
-    <div class="shelf__note">${plural(shelved.length, "закрытый прогон", "закрытых прогона", "закрытых прогонов")}${red ? `, из них ${red} с красной приёмкой` : ""} · держат ${plural(held, "карточку", "карточки", "карточек")} на доске</div>
-  </section>`;
+  if (note) note.textContent = shelved.length
+    ? `${plural(shelved.length, "закрытый прогон", "закрытых прогона", "закрытых прогонов")}${red ? `, из них ${red} с красной приёмкой` : ""} · держат ${plural(held, "карточку", "карточки", "карточек")} в Ready`
+    : "пока ничего не закрыто";
+  if (!shelved.length) { host.innerHTML = ""; return; }
+  host.innerHTML = `<div class="shelf">${shelved.map(shelfRowHTML).join("")}</div>`;
+  host.querySelectorAll("[data-planrow]").forEach((el) => {
+    if (openShelf.has(el.dataset.planrow)) el.setAttribute("data-open", "1");
+    el.querySelector(".done__head").addEventListener("click", (e) => {
+      if (e.target.closest("button,a")) return;
+      const id = el.dataset.planrow;
+      openShelf.has(id) ? openShelf.delete(id) : openShelf.add(id);
+      el.toggleAttribute("data-open");
+    });
+  });
   host.querySelectorAll("[data-planclose]").forEach((b) => b.addEventListener("click", () => onPlanClose(b.dataset.planclose)));
   host.querySelectorAll("[data-planreopen]").forEach((b) => b.addEventListener("click", () => onPlanReopen(b.dataset.planreopen)));
 }
@@ -814,9 +845,14 @@ function renderRails() {
     && (!(findQ || projQ) || (p.cardIds || []).map(cardById).some((c) => c && matches(c)) || matches({ theme: p.goal, project: p.project, id: p.id })));
   syncOpenRuns(plans);
   const stages = plans.reduce((n, p) => n + (p.cardIds || []).length, 0);
-  host.innerHTML = quotaBannerHTML() + (plans.length ? `<div class="runs">${plans.map(runHTML).join("")}
-    <div class="runs__note">${plural(plans.length, "живой прогон", "живых прогона", "живых прогонов")} · ${plural(stages, "этап", "этапа", "этапов")} · строго последовательно (WIP=1 на проект)</div>
-  </div>` : "");
+  const note = document.getElementById("runsNote");
+  if (note) note.textContent = plans.length
+    ? `${plural(plans.length, "живой", "живых", "живых")} · ${plural(stages, "этап", "этапа", "этапов")} · строго последовательно (WIP=1 на проект)`
+    : "ни одного запущенного прогона";
+  host.innerHTML = quotaBannerHTML() + (plans.length ? `<div class="runs">${plans.map(runHTML).join("")}</div>`
+    : `<div class="soloempty">⚡ <b>Прогонов нет</b> — собери прогон из карточек доски, и он поедет сам.
+       <button class="btn btn--ghost" type="button" data-openlaunch>⚡ Прогон</button></div>`);
+  host.querySelectorAll("[data-openlaunch]").forEach((b) => b.addEventListener("click", openLaunch));
   host.querySelectorAll("[data-runtoggle]").forEach((b) => b.addEventListener("click", () => {
     runsTouched = true;
     const id = b.dataset.runtoggle;
@@ -830,6 +866,10 @@ function renderRails() {
   }));
   host.querySelectorAll("[data-ask]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); openAsk(b.dataset.ask); }));
   host.querySelectorAll("[data-autolog]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); openDetail(b.dataset.autolog); }));
+  host.querySelectorAll("[data-log]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); openLog(b.dataset.log); }));
+  host.querySelectorAll("[data-relaunch]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); onRelaunch(e); }));
+  host.querySelectorAll("[data-pause]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); onPauseCard(b.dataset.pause, true); }));
+  host.querySelectorAll("[data-resume]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); onPauseCard(b.dataset.resume, false); }));
   host.querySelectorAll("[data-planreopen]").forEach((b) => b.addEventListener("click", () => onPlanReopen(b.dataset.planreopen)));
   host.querySelectorAll("[data-planclose]").forEach((b) => b.addEventListener("click", () => onPlanClose(b.dataset.planclose)));
 }
@@ -856,6 +896,14 @@ function bindTools() {
   find.addEventListener("input", () => { findQ = find.value.trim().toLowerCase(); render(); });
   proj.addEventListener("change", () => { projQ = proj.value; render(); });
   dens.querySelectorAll(".seg__opt").forEach((o) => o.addEventListener("click", () => setDensity(o.dataset.dens)));
+  const collapse = document.getElementById("collapseAll");
+  if (collapse) collapse.addEventListener("click", () => {
+    runsTouched = true;
+    // «свернуть все» переключается: второй клик разворачивает — иначе кнопка одноразовая.
+    openRuns = openRuns.size ? new Set() : new Set((state.plans || []).map((p) => p.id));
+    collapse.textContent = openRuns.size ? "свернуть все" : "развернуть все";
+    render();
+  });
   // «/» — фокус в поиск, Escape — сброс. Ни то, ни другое не должно срабатывать во время ввода.
   document.addEventListener("keydown", (e) => {
     if (e.key === "/" && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) { e.preventDefault(); find.focus(); find.select(); }
@@ -890,6 +938,16 @@ async function onPlanClose(planId) {
     loadBoard();
   } catch (err) { toast("Не удалось убрать: " + err.message); }
 }
+// Пауза одной карточки — та же ручка, которой пользуется страж. Отличается от стоп-крана:
+// стоп-кран держит ВСЮ доску, эта пауза — один этап, остальное продолжает ехать.
+async function onPauseCard(id, pause) {
+  try {
+    await api(`/api/tasks/${id}/${pause ? "pause" : "resume"}`, { method: "POST",
+      body: JSON.stringify(pause ? { reason: "пауза с доски", by: "human" } : { by: "human" }) });
+    toast(pause ? "Этап на паузе · место в очереди сохранено" : "Пауза снята");
+    loadBoard();
+  } catch (err) { toast("Не удалось: " + err.message); }
+}
 // v4 Ш1.1: единственный выход из терминального `failed`, когда прогон провалила не работа, а лимит.
 async function onPlanReopen(planId) {
   try { await api(`/api/plans/${planId}/reopen`, { method: "POST" }); toast("Приёмка переигрывается"); loadBoard(); }
@@ -914,7 +972,19 @@ function paint() {
   bindBrake(); renderHold();
   renderPulse(renderAttn());
   renderRails(); renderShelf();
-  stripEl.innerHTML = stripHTML();
+  // Четыре пустые колонки в пол-экрана — самая дорогая пустота на доске: когда все карточки
+  // принадлежат прогонам (а это норма), они занимают место и не сообщают ничего.
+  const solo = liveCards().filter((c) => !c.planId);
+  if (!solo.length) {
+    boardEl.classList.add("board--empty");
+    boardEl.innerHTML = `<div class="soloempty">🧩 <b>Одиночных задач нет</b> — ${
+      findQ || projQ ? "под фильтр ничего не попало." : `все ${plural(liveCards().length, "карточка принадлежит", "карточки принадлежат", "карточек принадлежат")} прогонам.`
+    } Заведи задачу: она встанет в Backlog и поедет через рычаг, как раньше.
+      <button class="btn btn--ghost" type="button" data-newtask>+ Задача</button></div>`;
+    boardEl.querySelectorAll("[data-newtask]").forEach((b) => b.addEventListener("click", () => openComposer(null)));
+    return;
+  }
+  boardEl.classList.remove("board--empty");
   const parts = [stationHTML("backlog")];
   parts.push(`<div class="lever" data-drop="todo" id="lever" title="перетащи карточку через рычаг — команда возьмёт задачу"><span class="lever__knob"></span><span class="lever__label">launch</span></div>`);
   for (const key of ["todo", "work", "ready"]) parts.push(stationHTML(key));

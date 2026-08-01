@@ -67,8 +67,8 @@ body{
    padding-bottom оставляет воздух под плавающей плашкой .hint. */
 /* v4 Ш8: grid вместо ряда фиксированных станций — четыре колонки делят ширину, а не требуют её.
    overflow-x снят: горизонтальной прокрутки на доске больше нет by design. */
-.board{flex:1;display:grid;grid-template-columns:1fr 60px 1fr 1.25fr 1fr;gap:0;align-items:stretch;
-  padding:22px 24px 40px;min-width:0;min-height:min(460px,58vh)}
+.board{display:grid;grid-template-columns:1fr 54px 1fr 1.25fr 1fr;gap:0;align-items:stretch;
+  min-width:0;min-height:min(380px,46vh)}
 /* min-width:0 обязателен: без него grid-колонка распухает под min-content своих карточек
    (замерено на прототипе: 286px → 449px, scrollWidth 2466 → 2886) и скролл возвращается. */
 .station{display:flex;flex-direction:column;min-width:0;min-height:0;max-height:calc(100dvh - 210px)}
@@ -315,14 +315,40 @@ body{
 .btn--run:hover{filter:brightness(1.07);transform:translateY(-1px)}
 .btn--run[disabled]{opacity:.55;filter:none;transform:none;cursor:default}
 
+/* ══ v4 · палуба: четыре зоны, каждая со своим заголовком ════════════════════
+   Ширина ограничена и центрирована: на широком экране строка в 2000px не читается,
+   а зоны перестают выглядеть отдельными сущностями. */
+.deck{max-width:1440px;margin:0 auto;padding:16px 24px 40px;display:flex;flex-direction:column;gap:18px;min-width:0}
+.zone__head{display:flex;align-items:baseline;gap:10px;margin:0 0 8px;padding:0 2px}
+.zone__name{font-family:var(--display);font-weight:700;font-size:13px;letter-spacing:.02em;color:var(--ink);flex:none}
+.zone__note{font-family:var(--mono);font-size:var(--fs-mono);color:var(--ink-faint);min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.zone__act{margin-left:auto;font-family:var(--mono);font-size:var(--fs-mono);color:var(--s-todo);
+  background:none;border:none;cursor:pointer;padding:2px 4px;border-radius:5px;flex:none}
+button.zone__act:hover{background:var(--surface-2);color:var(--ember)}
+/* сводка вместо ленты счётчиков по станциям */
+.pulse{display:flex;align-items:center;gap:12px;margin-left:4px;flex-wrap:wrap;min-width:0}
+.pulse__lamp{width:8px;height:8px;border-radius:50%;box-shadow:0 0 7px currentColor;flex:none}
+@media (max-width:1500px){ .pulse__k--muted{display:none} }
+/* когда одиночных задач нет — одна строка вместо четырёх пустых колонок в пол-экрана */
+.soloempty{display:flex;align-items:center;gap:11px;background:var(--surface);border:1px dashed var(--line-2);
+  border-radius:var(--radius);padding:11px 14px;font-size:var(--fs);color:var(--ink-soft)}
+.soloempty b{color:var(--ink);font-family:var(--display)}
+.soloempty button{margin-left:auto;flex:none}
+.board--empty{display:block;padding:0;min-height:0}
+
 /* ══ v4 Ш9 · инструменты, плотность, обратимое удаление ══════════════════════ */
-.tools{display:flex;align-items:center;gap:7px;flex:none}
-.tools__find{font-family:var(--mono);font-size:11px;color:var(--ink);background:var(--surface);
-  border:1px solid var(--line-2);border-radius:999px;padding:6px 12px;width:132px;outline:none}
-.tools__find:focus{border-color:var(--ink-faint);width:190px}
+.console__tools{margin-left:auto;display:flex;align-items:center;gap:9px;flex:none}
+.find{position:relative;flex:none}
+.find input{font-family:var(--sans);font-size:13px;color:var(--ink);background:var(--surface);border:1px solid var(--line-2);
+  border-radius:9px;padding:8px 11px 8px 30px;width:190px;transition:width .15s ease}
+.find input:focus{outline:2px solid var(--s-todo);outline-offset:1px;border-color:transparent;width:250px}
+.find::before{content:"⌕";position:absolute;left:10px;top:7px;color:var(--ink-faint);font-size:14px}
+.find kbd{position:absolute;right:8px;top:8px;font-family:var(--mono);font-size:9px;color:var(--ink-faint);
+  border:1px solid var(--line);border-radius:4px;padding:1px 4px;background:var(--surface-2)}
+.find input:focus~kbd{display:none}
 .tools__proj{font-family:var(--mono);font-size:11px;color:var(--ink-soft);background:var(--surface);
-  border:1px solid var(--line-2);border-radius:999px;padding:6px 10px;cursor:pointer;max-width:150px}
-.seg--dense .seg__opt{font-size:10px;padding:5px 9px}
+  border:1px solid var(--line-2);border-radius:9px;padding:8px 10px;cursor:pointer;max-width:150px;flex:none}
 .hint{display:flex;align-items:center;gap:10px}
 .hint__x{background:none;border:none;color:var(--ink-faint);font-size:12px;cursor:pointer;line-height:1}
 .hint__x:hover{color:var(--ink)}
@@ -337,28 +363,34 @@ body{
 .tag--bad{color:var(--s-blocked);background:rgba(211,63,53,.08);border-color:rgba(211,63,53,.32)}
 a.tag{text-decoration:none}
 a.tag:hover{border-color:var(--ink-soft)}
-.shelf{margin:2px 24px 22px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
-.shelf__head{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;
-  color:var(--ink-faint);padding:9px 15px;background:var(--surface-2);border-bottom:1px solid var(--line)}
-.done{padding:11px 15px;border-left:3px solid var(--s-ready)}
-.done+.done{border-top:1px solid var(--line)}
+.shelf{display:flex;flex-direction:column;gap:6px}
+
+.done{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--s-ready);
+  border-radius:var(--radius);overflow:hidden}
+
 .done--failed{border-left-color:var(--s-blocked)}
-.done__head{display:flex;align-items:center;gap:11px;flex-wrap:wrap}
+.done__head{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:11px;
+  padding:9px 13px;cursor:pointer}
 .done__ic{font-size:14px;line-height:1;flex:none;color:var(--s-ready)}
 .done--failed .done__ic{color:var(--s-blocked)}
-.done__t{font-family:var(--display);font-weight:600;font-size:13.5px;color:var(--ink);letter-spacing:-.01em}
-.done__meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:1;min-width:0}
+.done__t{font-size:var(--fs);color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.done__meta{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;overflow:hidden}
 .done__act{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
   border:1px solid var(--line-2);border-radius:9px;padding:6px 11px;cursor:pointer;white-space:nowrap;flex:none}
 .done__act:hover{border-color:var(--ink-soft);color:var(--ink)}
-.done__body{font-size:12px;line-height:1.5;color:var(--ink-faint);margin-top:5px}
-.shelf__note{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);padding:8px 15px;
-  background:var(--surface-2);border-top:1px solid var(--line)}
+.done__acts{display:flex;gap:7px;flex:none}
+.done__body{display:none;border-top:1px dashed var(--line);padding:8px 13px 11px}
+.done[data-open] .done__body{display:block}
+.done__why{font-size:12px;line-height:1.5;color:var(--ink-faint);margin-bottom:6px}
+.done__row{display:grid;grid-template-columns:30px minmax(0,1fr) auto;gap:9px;align-items:center;height:24px;
+  font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+.done__rt{font-family:var(--sans);font-size:12px;color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
 
 /* ══ v4 Ш4 · зона «Требует меня» ═════════════════════════════════════════════
    Имя .attn, а НЕ .att из прототипа: .att уже занят списком вложений карточки
    (см. выше), и одноимённый класс сломал бы его молча. */
-.attn{display:flex;flex-direction:column;gap:1px;margin:0 24px 14px;background:var(--surface);
+.attn{display:flex;flex-direction:column;gap:1px;background:var(--surface);
   border:1px solid var(--line-2);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}
 .attn.calm{border-color:rgba(46,158,80,.3);background:rgba(46,158,80,.07)}
 .attn__row{display:flex;align-items:center;gap:12px;padding:11px 15px;border-left:3px solid var(--line-2);background:var(--surface)}
@@ -368,6 +400,8 @@ a.tag:hover{border-color:var(--ink-soft)}
 .attn__row--block,.attn__row--merge{border-left-color:var(--s-blocked)}
 .attn__row--floor{border-left-color:var(--amber)}
 .attn__row--calm{border-left-color:var(--s-ready);background:transparent}
+.attn__next{margin-left:auto;font-family:var(--mono);font-size:var(--fs-mono);color:var(--ink-faint);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:none;max-width:52%}
 .attn__ic{font-size:15px;line-height:1;flex:none;width:18px;text-align:center}
 .attn__row--ask .attn__ic{animation:blip 1.9s ease-in-out infinite}
 @keyframes blip{0%,100%{opacity:1}50%{opacity:.42}}
@@ -379,13 +413,17 @@ a.tag:hover{border-color:var(--ink-soft)}
 .attn__go{font-family:var(--display);font-weight:600;font-size:12px;color:#fff;background:var(--s-asking);
   border:none;border-radius:9px;padding:7px 12px;cursor:pointer;flex:none;white-space:nowrap}
 .attn__go:hover{filter:brightness(1.07)}
-.attn__note{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);padding:7px 15px;background:var(--surface-2)}
-.attn.calm .attn__note{background:transparent}
-.pulse__k{font-family:var(--mono);font-size:11px;border-radius:999px;padding:5px 11px;border:1px solid var(--line-2);
-  white-space:nowrap;flex:none}
-.pulse__k b{font-family:var(--display);font-size:12.5px}
-.pulse__k--you{color:#8a5e08;background:rgba(230,161,30,.14);border-color:rgba(230,161,30,.45)}
-.pulse__k--calm{color:#1f7a42;background:rgba(46,158,80,.1);border-color:rgba(46,158,80,.32)}
+
+/* Обычные счётчики — просто лампа и число: рамка есть только у того, что решает,
+   идти к доске или нет, иначе главный сигнал теряется среди одинаковых пилюль. */
+.pulse__k{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;
+  color:var(--ink-soft);white-space:nowrap;flex:none}
+.pulse__k b{font-family:var(--display);font-size:13px;font-weight:700;color:var(--ink)}
+.pulse__k--you{color:#8a5e08;background:rgba(230,161,30,.14);border:1px solid rgba(230,161,30,.45);
+  border-radius:999px;padding:4px 12px}
+.pulse__k--you b{color:#8a5e08}
+.pulse__k--calm{color:#1f7a42;background:rgba(46,158,80,.1);border:1px solid rgba(46,158,80,.35);
+  border-radius:999px;padding:4px 12px}
 
 /* ══ v4 Ш0 · стоп-кран ═══════════════════════════════════════════════════════
    Тон синий, а не красный: пауза ≠ поломка. Красным на этой доске обозначено то,
@@ -405,7 +443,7 @@ a.tag:hover{border-color:var(--ink-soft)}
 .brake__opt b{display:block;font-family:var(--display);font-weight:600;font-size:13px;margin-bottom:2px}
 .brake__opt span{display:block;font-size:11.5px;line-height:1.45;color:var(--ink-soft)}
 .brake__opt--now b{color:var(--s-blocked)}
-.holdbar{display:flex;align-items:center;gap:13px;margin:0 24px 14px;padding:11px 16px;border-radius:var(--radius);
+.holdbar{display:flex;align-items:center;gap:13px;max-width:1440px;margin:14px auto 0;padding:11px 16px;border-radius:var(--radius);
   border:1px solid rgba(47,115,194,.45);background:linear-gradient(180deg,rgba(47,115,194,.11),rgba(47,115,194,.05))}
 .holdbar__ic{font-size:16px;line-height:1;flex:none}
 .holdbar__b{display:flex;flex-direction:column;gap:3px;flex:1;min-width:0}
@@ -422,8 +460,8 @@ a.tag:hover{border-color:var(--ink-soft)}
 .railhost:empty{display:none}
 
 /* ══ v4 Ш6 · прогон как трек ═════════════════════════════════════════════════ */
-.runs{display:flex;flex-direction:column;gap:var(--gap);margin:0 24px 14px}
-.runs__note{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);padding-left:2px}
+.runs{display:flex;flex-direction:column;gap:var(--gap)}
+
 .run{background:linear-gradient(180deg,var(--surface),var(--surface-2));border:1.5px solid var(--line-2);
   border-left:4px solid var(--s-verifying);border-radius:var(--radius);box-shadow:var(--shadow);padding:calc(var(--pad) - 3px) var(--pad)}
 .run--auto{border-left-color:var(--s-ready)}
@@ -435,11 +473,11 @@ a.tag:hover{border-color:var(--ink-soft)}
   color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34ch}
 .run__meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:1;min-width:0}
 .tag--proj{color:var(--ink);background:var(--surface-2);border-color:var(--line-2);font-weight:600}
-.run__toggle{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
-  border:1px solid var(--line-2);border-radius:9px;padding:6px 11px;cursor:pointer;flex:none}
+.run__toggle{font-family:var(--mono);font-size:13px;line-height:1;color:var(--ink-soft);background:var(--surface);
+  border:1px solid var(--line-2);border-radius:9px;padding:6px 10px;cursor:pointer;flex:none}
 .run__toggle:hover{border-color:var(--ink-soft);color:var(--ink)}
 /* трек: узлы соединены линией, флажок стоит НАД узлом и не двигает раскладку */
-.track{display:flex;align-items:center;gap:0;margin-top:10px;flex-wrap:wrap}
+.track{display:flex;align-items:center;gap:0;margin-top:10px;min-width:0}
 .node{position:relative;display:inline-flex;align-items:center;gap:5px;flex:none}
 .node__dot{width:17px;height:17px;border-radius:50%;border:1.5px solid var(--line-2);background:var(--surface);
   display:inline-flex;align-items:center;justify-content:center;font-size:9.5px;color:var(--ink-faint);line-height:1}
@@ -452,7 +490,7 @@ a.tag:hover{border-color:var(--ink-soft)}
 .node--starting .node__dot{border-color:var(--s-todo);background:var(--s-todo)}
 .node--blocked .node__dot{background:var(--s-blocked);border-color:var(--s-blocked);color:#fff}
 .node__flag{position:absolute;top:-13px;left:1px;font-size:9.5px;line-height:1;opacity:.75}
-.seg-line{flex:1 1 14px;min-width:14px;max-width:52px;height:1.5px;background:var(--line-2);margin:0 5px}
+.seg-line{flex:1 1 auto;min-width:14px;height:1.5px;background:var(--line-2);margin:0 7px}
 .seg-line--done{background:var(--s-ready)}
 .track__verdict{font-family:var(--mono);font-size:10.5px;margin-left:auto;padding-left:12px;flex:none}
 .track__verdict--stop{color:#8a5e08}
@@ -479,8 +517,10 @@ a.tag:hover{border-color:var(--ink-soft)}
   color:#fff;border-radius:5px;padding:2px 8px}
 .head__age{font-family:var(--mono);font-size:10px;color:var(--ink-faint);flex:1;min-width:0}
 .head__age.is-stale{color:#8a5e08}
-.head__more{font-family:var(--mono);font-size:10px;color:var(--ink-faint);background:none;border:none;cursor:pointer;flex:none}
-.head__more:hover{color:var(--ink)}
+.head__acts{display:flex;gap:6px;flex-wrap:wrap}
+.head__act{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
+  border:1px solid var(--line-2);border-radius:8px;padding:5px 10px;cursor:pointer}
+.head__act:hover{border-color:var(--ink-soft);color:var(--ink)}
 .head__t{font-family:var(--display);font-weight:600;font-size:calc(var(--fs) + .5px);color:var(--ink);letter-spacing:-.01em}
 .head__ask{font-family:var(--display);font-weight:600;font-size:12.5px;color:#fff;background:var(--s-asking);
   border:none;border-radius:9px;padding:8px 12px;cursor:pointer;text-align:left}
@@ -491,13 +531,14 @@ a.tag:hover{border-color:var(--ink-soft)}
 
 /* ══ v4 Ш7 · полоса цикла и AUTO-журнал ══════════════════════════════════════ */
 .cycle{display:flex;align-items:center;gap:5px;flex-wrap:wrap;font-family:var(--mono);font-size:10px}
-.cyc{display:inline-flex;align-items:center;gap:4px;color:var(--ink-faint);white-space:nowrap}
+.cyc{display:inline-flex;align-items:center;gap:4px;color:var(--ink-faint);white-space:nowrap;
+  border:1px solid transparent;border-radius:999px;padding:2px 8px}
 .cyc b{font-family:var(--display);font-size:10.5px;font-weight:700;color:var(--ink-soft)}
 .cyc__ic{font-size:9px;line-height:1}
 .cyc__arr{color:var(--line-2)}
-.cyc--done{color:var(--ink-soft)}
+.cyc--done{color:var(--ink-soft);border-color:var(--line);background:var(--surface-2)}
 .cyc--done .cyc__ic{color:var(--s-ready)}
-.cyc--now{color:var(--ink);font-weight:700}
+.cyc--now{color:var(--ink);font-weight:700;border-color:rgba(216,91,34,.4);background:rgba(216,91,34,.07)}
 .cyc--now .cyc__ic{color:var(--s-implementing);animation:blip 1.5s ease-in-out infinite}
 .cyc--stop{color:var(--s-blocked)}
 button.tag--auto{cursor:pointer;font:inherit;font-family:var(--mono);font-size:10.5px}
@@ -510,7 +551,7 @@ button.tag--auto:hover{border-color:var(--ink-soft)}
 .autolog__why{font-size:11.5px;color:var(--ink-faint);line-height:1.45;margin-top:3px}
 .autolog__note{font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:5px}
 /* S6 · плашка лимита подписки: доска стоит по часам, а не по поломке */
-.qbanner{display:flex;align-items:center;gap:13px;margin:0 24px 14px;padding:12px 16px;border-radius:var(--radius);
+.qbanner{display:flex;align-items:center;gap:13px;margin:0 0 10px;padding:12px 16px;border-radius:var(--radius);
   border:1px solid rgba(230,161,30,.45);background:linear-gradient(180deg,rgba(230,161,30,.12),rgba(230,161,30,.06))}
 .qbanner__mark{font-size:17px;line-height:1;flex:none}
 .qbanner__body{display:flex;flex-direction:column;gap:3px;flex:1;min-width:0}
