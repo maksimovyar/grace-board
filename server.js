@@ -1029,6 +1029,11 @@ const DEPLOY_POLICY_DEFAULT = { pr: "always", merge: "manual", deploy: "off" };
 const PR_MODES = ["always", "never"], MERGE_MODES = ["manual", "auto"], DEPLOY_MODES = ["off", "after-merge", "ask"];
 const GH_BIN = process.env.GRACE_GH_BIN || "gh";
 const ACCEPT_GRACE_MS = 60 * 1000;   // don't judge the acceptance run dead in its first minute
+// v4 Ш1: closing steps that must NOT be collapsed into "closed". Two of them say what is still
+// owed by the human (`awaiting-*`), two say HOW the run ended (`pr-ready` = closed, the merge is
+// yours by policy · `merge-failed` = the board promised to merge and could not). Collapsing any
+// of them loses the only difference the human acts on.
+const CLOSE_KEEP_STEPS = new Set(["awaiting-merge", "awaiting-deploy", "pr-ready", "merge-failed"]);
 
 // Release policy of a run: what was passed at assembly wins, then the project's
 // `deploy_policy`, then the built-in default (§5.1).
@@ -1109,6 +1114,25 @@ function readStep(outFile) {
   const m = text.match(/__EXIT__:(\d+)\s*$/);
   if (!m) return null;                       // still running
   return { code: Number(m[1]), text: text.replace(/__EXIT__:\d+\s*$/, "").trim() };
+}
+
+// v4 Ш1.1: «лимит — это часы, а не поломка» — распространено с карточек на фазу закрытия.
+// Наблюдено вживую: прогон довёл семь этапов до ready и получил closeStatus:"failed" с одной
+// проверкой «Ран приёмки не отчитался: You've hit your limit» — то есть был помечен проваленным
+// из-за подписки, а не из-за кода, причём терминально. Здесь окно лимита пишется в тот же
+// board.quota, что и для карточек: planCloseTick уже стоит под `quotaOpen`, поэтому фаза просто
+// ждёт и переигрывает шаг после сброса. `retryStep` — то, что надо занулить, чтобы шаг собрался
+// заново, а не был перечитан из старого вывода.
+function planQuotaHold(board, plan, stop, where, retryStep) {
+  const ts = new Date().toISOString();
+  if (!board.quota || Date.parse(board.quota.until || 0) < Date.parse(stop.until))
+    board.quota = { since: (board.quota && quotaOpen(board)) ? board.quota.since : ts, until: stop.until,
+      exact: stop.exact, raw: stop.raw, planId: plan.id };
+  if (retryStep) plan[retryStep] = null;   // вызывающий уже вернул closeStep на шаг, который переиграется
+  planNotice(plan, `Лимит подписки Claude на шаге «${where}» — это не провал прогона. Сделанное сохранено, `
+    + `шаг переиграется сам после сброса в ${hhmm(stop.until)}. Из лога: ${stop.raw}`, "warn");
+  logPlan(plan, "plan-quota-hold", { step: where, until: stop.until, exact: stop.exact });
+  try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts, event: "plan-quota-hold", planId: plan.id, step: where, until: stop.until }) + "\n"); } catch {}
 }
 
 // The PR body (§5.4). Assembled from what the board already knows — this is the single
@@ -1218,15 +1242,25 @@ function planCloseTick(board) {
       changed = true;
       continue;
     }
-    // Terminal statuses stop the machine — but `awaiting-merge` / `awaiting-deploy` are exactly
-    // the states that tell the human WHAT IS LEFT FOR HIM, so they are never collapsed to "closed".
+    // Terminal statuses stop the machine — but the steps in CLOSE_KEEP_STEPS carry the one thing
+    // the human acts on (what is still owed, or how the run actually ended), so they survive.
     if (plan.closeStatus === "done" || plan.closeStatus === "failed") {
-      if (plan.closeStep !== "closed" && !String(plan.closeStep || "").startsWith("awaiting")) { plan.closeStep = "closed"; changed = true; }
+      if (plan.closeStep !== "closed" && !CLOSE_KEEP_STEPS.has(plan.closeStep)) { plan.closeStep = "closed"; changed = true; }
       continue;
     }
 
     // ── acceptance (§5.3): wait for acceptance.json; a silent/dead run is a RED acceptance ──
     if (plan.closeStep === "acceptance") {
+      // v4 Ш1.1: приёмка без рана — это приёмка, которую сняли лимитом (или ручкой /reopen).
+      // Запускаем заново; окно лимита уже закрылось, иначе тик сюда не дошёл бы.
+      if (!plan.acceptanceRun) {
+        try { fs.unlinkSync(path.join(dir, "acceptance.json")); } catch {}
+        const relaunch = launchPlanAcceptance(board, plan);
+        plan.acceptanceRun = { pid: relaunch.pid || null, log: relaunch.log || null, launched: !!relaunch.launched,
+          error: relaunch.error || null, startedAt: new Date().toISOString() };
+        logPlan(plan, "plan-acceptance-relaunch", { launched: !!relaunch.launched });
+        changed = true; continue;
+      }
       let raw = null;
       try { raw = JSON.parse(fs.readFileSync(path.join(dir, "acceptance.json"), "utf8")); } catch {}
       if (raw && typeof raw === "object") {
@@ -1239,6 +1273,12 @@ function planCloseTick(board) {
         const dead = !plan.acceptanceRun || !plan.acceptanceRun.launched
           || (!isAlive(plan.acceptanceRun.pid) && Date.now() - started > ACCEPT_GRACE_MS);
         const tooLong = Date.now() - started > STALL_MS;
+        // Прежде чем назвать молчание провалом — прочитать, ПОЧЕМУ ран замолчал. Лимит подписки
+        // выглядит точно так же, как сдохший ран, и красит прогон красным ни за что.
+        if (dead || tooLong) {
+          const stop = detectQuotaStop((plan.acceptanceRun || {}).log, Date.now(), 0);
+          if (stop) { planQuotaHold(board, plan, stop, "приёмка", "acceptanceRun"); changed = true; continue; }
+        }
         if (dead || tooLong) {
           plan.result.acceptance = normalizeAcceptance({ passed: false, checks: [{ id: "run", title: "Ран приёмки не отчитался", kind: "deterministic", status: "fail",
             output: tailLog((plan.acceptanceRun || {}).log || "", 40) || ((plan.acceptanceRun || {}).error || "") }],
@@ -1275,6 +1315,10 @@ function planCloseTick(board) {
       const r = readStep(path.join(dir, "pr.out"));
       const started = Date.parse((plan.prRun || {}).startedAt || "") || 0;
       if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.prRun || {}).started) continue;
+      // v4 Ш1.1: шаг детерминированный (`gh`), но команду задаёт проект — если внутри окажется
+      // модельный вызов, его отказ по лимиту не должен читаться как «PR не создан».
+      if (r) { const stop = parseQuotaStop(r.text, Date.now());
+        if (stop) { plan.closeStep = "pr"; planQuotaHold(board, plan, stop, "создание PR", "prRun"); changed = true; continue; } }
       const draft = !!(plan.prRun || {}).draft;
       const url = r ? (r.text.match(/https?:\/\/\S+/) || [])[0] || null : null;
       plan.result.pr = { url, draft, ok: !!(r && r.code === 0),
@@ -1293,16 +1337,21 @@ function planCloseTick(board) {
         logPlan(plan, "plan-failed", { failed: (a && a.failed) || [] });
         changed = true; continue;
       }
-      if (pol.merge === "manual") {                // зелёная · manual → единственная кнопка человека
-        plan.closeStatus = "done"; plan.closeStep = "awaiting-merge";
-        planNotice(plan, `Приёмка зелёная — готово к мержу.${plan.result.pr && plan.result.pr.url ? " PR: " + plan.result.pr.url : ""}`, "ok");
-        logPlan(plan, "plan-awaiting-merge", {});
+      // v4 Ш1 · зелёная · manual → ФИНАЛ, а не ожидание. Доска сделала всё, что обещала: собрала
+      // PR. Мерж — политика прогона, а не задолженность доски, поэтому она не ждёт, не опрашивает
+      // GitHub и не показывает гейт. Ждать имеет смысл только там, где доска обещала сама и не смогла.
+      if (pol.merge === "manual") {
+        plan.closeStatus = "done"; plan.closeStep = "pr-ready";
+        planNotice(plan, `Прогон закрыт: PR собран, мерж за тобой (политика прогона).${plan.result.pr && plan.result.pr.url ? " PR: " + plan.result.pr.url : ""}`, "ok");
+        logPlan(plan, "plan-pr-ready", {});
         changed = true; continue;
       }
       if (!(plan.result.pr && plan.result.pr.ok && plan.result.pr.url)) {
-        // merge:auto без PR мержить нечем — и мержить в обход PR нельзя: PR это единственный след
-        plan.closeStatus = "done"; plan.closeStep = "awaiting-merge";
-        planNotice(plan, `Приёмка зелёная, но PR не создан — автомерж невозможен, мерж за человеком. ${plan.result.pr ? plan.result.pr.error : ""}`, "warn");
+        // merge:auto без PR мержить нечем — и мержить в обход PR нельзя: PR это единственный след.
+        // Это уже задолженность доски: обещала смержить сама и не может.
+        plan.closeStatus = "done"; plan.closeStep = "merge-failed";
+        planNotice(plan, `Автомерж не прошёл: PR не создан, мержить нечего. ${plan.result.pr ? plan.result.pr.error : ""}`, "warn");
+        logPlan(plan, "plan-merge-failed", { reason: "no-pr" });
         changed = true; continue;
       }
       const st = spawnStep(projectDir, `${GH_BIN} pr merge ${shq(plan.result.pr.url)} --merge --delete-branch=false`, path.join(dir, "merge.out"));
@@ -1315,11 +1364,14 @@ function planCloseTick(board) {
       const r = readStep(path.join(dir, "merge.out"));
       const started = Date.parse((plan.mergeRun || {}).startedAt || "") || 0;
       if (!r && Date.now() - started < 5 * 60 * 1000 && (plan.mergeRun || {}).started) continue;
+      if (r) { const stop = parseQuotaStop(r.text, Date.now());
+        if (stop) { plan.closeStep = "post-pr"; planQuotaHold(board, plan, stop, "мерж", "mergeRun"); changed = true; continue; } }
       plan.result.merge = { ok: !!(r && r.code === 0), output: r ? r.text.slice(-600) : null,
         error: r && r.code === 0 ? null : `мерж не прошёл (${r ? "код " + r.code : "gh не ответил"})` };
       if (!plan.result.merge.ok) {
-        plan.closeStatus = "done"; plan.closeStep = "awaiting-merge";
-        planNotice(plan, `Автомерж не прошёл — мерж за человеком. ${plan.result.merge.error}`, "warn");
+        plan.closeStatus = "done"; plan.closeStep = "merge-failed";
+        planNotice(plan, `Автомерж не прошёл: ${plan.result.merge.error}. Мерж за человеком.`, "warn");
+        logPlan(plan, "plan-merge-failed", { reason: "gh" });
         changed = true; continue;
       }
       plan.closeStep = "deploy"; changed = true;
@@ -1360,6 +1412,9 @@ function planCloseTick(board) {
       const r = readStep(path.join(dir, "deploy.out"));
       const started = Date.parse((plan.deployRun || {}).startedAt || "") || 0;
       if (!r && Date.now() - started < STALL_MS && (plan.deployRun || {}).started) continue;
+      // Команда выкатки — произвольная строка из .grace/local.md: она вполне может звать модель.
+      if (r) { const stop = parseQuotaStop(r.text, Date.now());
+        if (stop) { plan.closeStep = "deploy"; planQuotaHold(board, plan, stop, "деплой", "deployRun"); changed = true; continue; } }
       const ok = !!(r && r.code === 0);
       plan.result.deploy = { status: ok ? "done" : "failed", output: r ? r.text.slice(-600) : null,
         cmd: (plan.result.deploy || {}).cmd || null };
@@ -2434,6 +2489,26 @@ async function handleApi(req, res, urlPath) {
     writeBoard(board);
     try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "plan-archive", planId: plan.id }) + "\n"); } catch {}
     return sendJSON(res, 200, { ok: true });
+  }
+
+  // POST /api/plans/:id/reopen -> переиграть приёмку проваленного прогона (v4 Ш1.1). Без этой
+  // ручки единственный выход из терминального `failed` — собрать прогон заново, а «провален»
+  // он мог оказаться из-за лимита подписки, пойманного до того, как лимит начали распознавать.
+  const mreopen = urlPath.match(/^\/api\/plans\/([^/]+)\/reopen$/);
+  if (mreopen && req.method === "POST") {
+    const board = readBoard();
+    const plan = planById(board, decodeURIComponent(mreopen[1]));
+    if (!plan) return sendJSON(res, 404, { error: "plan not found" });
+    if (plan.closeStatus !== "failed") return sendJSON(res, 409, { error: "переиграть можно только проваленный прогон" });
+    plan.closeStatus = "verifying";
+    plan.closeStep = "acceptance";
+    plan.acceptanceRun = null;                 // тик перезапустит приёмку сам
+    plan.archived = false;
+    if (plan.result) plan.result.acceptance = null;
+    planNotice(plan, "Приёмка переигрывается по просьбе человека — прогон снова в закрытии.", "warn");
+    writeBoard(board);
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "plan-reopen", planId: plan.id }) + "\n"); } catch {}
+    return sendJSON(res, 200, { plan: planView(board, plan) });
   }
 
   // POST /api/plans/preflight -> S5 summary-gate items for a candidate plan (blockers/floor/forks)

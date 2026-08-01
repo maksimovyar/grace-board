@@ -296,7 +296,7 @@ function railHTML(plan) {
       </div>
       <div class="rail__actions">
         <button class="rail__filter${filterOn ? " is-on" : ""}" type="button" data-planfilter="${esc(plan.id)}">⛁ только этот прогон</button>
-        <button class="rail__pr" type="button" data-planpr="${esc(plan.id)}">Финальный PR в main →</button>
+        ${closeState(plan) === "failed" ? `<button class="rail__reopen" type="button" data-planreopen="${esc(plan.id)}" title="переиграть приёмку — например, если прогон провалил лимит подписки, а не код">↻ переиграть приёмку</button>` : ""}
         <button class="rail__close" type="button" data-planclose="${esc(plan.id)}" title="закрыть прогон (карточки останутся)">✕</button>
       </div>
     </div>
@@ -308,7 +308,26 @@ function railHTML(plan) {
 // rail looks exactly as it did in S4.
 const CLOSE_STEP_RU = { acceptance: "идёт приёмка прогона", pr: "собираю PR", "pr-wait": "создаю PR",
   "post-pr": "разбираю результат", "merge-wait": "мержу", deploy: "деплой", "deploy-wait": "деплой идёт",
-  "awaiting-merge": "ждёт твоей кнопки «мерж»", "awaiting-deploy": "деплой ждёт человека", closed: "закрыт" };
+  "pr-ready": "закрыт · PR собран, мерж за тобой", "merge-failed": "автомерж не прошёл — мерж за человеком",
+  "awaiting-deploy": "деплой ждёт человека", closed: "закрыт",
+  // читается только у прогонов, собранных до v4 — closeState() разводит его по политике
+  "awaiting-merge": "закрыт · мерж за тобой" };
+// v4 Ш1 · ЕДИНАЯ трактовка закрытия для всей доски. `awaiting-merge` раньше означал три разные
+// вещи сразу, поэтому старые прогоны разводятся здесь правилом чтения, а не миграцией данных:
+// merge:manual — доска сделала всё, что обещала (PR собран) → это финал, а не ожидание;
+// merge:auto — доска обещала смержить сама и не смогла → это долг доски, он и идёт в зону.
+function closeState(plan) {
+  if (!plan.closeStatus) return "running";
+  if (plan.closeStatus === "failed") return "failed";
+  if (plan.closeStep === "awaiting-merge") return (plan.policy || {}).merge === "manual" ? "pr-ready" : "merge-failed";
+  if (plan.closeStep === "pr-ready") return "pr-ready";
+  if (plan.closeStep === "merge-failed") return "merge-failed";
+  if (plan.closeStep === "awaiting-deploy") return "deploy-hold";
+  if (plan.closeStep === "closed") return "closed";
+  return "running";
+}
+// Прогон закрыт — доска по нему больше ничего не сделает сама. Полка (Ш5), не колонки.
+const CLOSED_STATES = new Set(["pr-ready", "closed", "failed"]);
 function closeHTML(plan) {
   if (!plan.closeStatus) return "";
   const r = plan.result || {}, a = r.acceptance, pr = r.pr, note = r.notice;
@@ -344,7 +363,7 @@ function renderRails() {
   const plans = (state.plans || []).filter((p) => !p.archived && (p.cardIds || []).some((id) => cardById(id)));
   host.innerHTML = quotaBannerHTML() + plans.map(railHTML).join("");
   host.querySelectorAll("[data-planfilter]").forEach((b) => b.addEventListener("click", () => { planFilter = planFilter === b.dataset.planfilter ? null : b.dataset.planfilter; render(); }));
-  host.querySelectorAll("[data-planpr]").forEach((b) => b.addEventListener("click", () => onPlanPR(b.dataset.planpr)));
+  host.querySelectorAll("[data-planreopen]").forEach((b) => b.addEventListener("click", () => onPlanReopen(b.dataset.planreopen)));
   host.querySelectorAll("[data-planclose]").forEach((b) => b.addEventListener("click", () => onPlanClose(b.dataset.planclose)));
 }
 async function onPlanClose(planId) {
@@ -352,13 +371,10 @@ async function onPlanClose(planId) {
   try { await api(`/api/plans/${planId}`, { method: "DELETE" }); if (planFilter === planId) planFilter = null; toast("Прогон закрыт"); loadBoard(); }
   catch (err) { toast("Не удалось закрыть: " + err.message); }
 }
-async function onPlanPR(planId) {
-  const plan = (state.plans || []).find((p) => p.id === planId);
-  try {
-    const m = await api(`/api/plans/${planId}/manifest`);
-    const floor = (m.floor || []).length ? ` · ⚠ пол: ${m.floor.length}` : "";
-    toast(`Интеграционная ветка <strong>${esc(plan ? plan.integrationBranch : planId)}</strong> · ${m.stageCount} этап.${floor} · мерж в main — гейт человека`);
-  } catch (err) { toast("Не удалось: " + err.message); }
+// v4 Ш1.1: единственный выход из терминального `failed`, когда прогон провалила не работа, а лимит.
+async function onPlanReopen(planId) {
+  try { await api(`/api/plans/${planId}/reopen`, { method: "POST" }); toast("Приёмка переигрывается"); loadBoard(); }
+  catch (err) { toast("Не удалось переиграть: " + err.message); }
 }
 
 function render() {
