@@ -131,6 +131,8 @@ over it. See [`.env.example`](.env.example).
 | `GRACE_WARDEN_TIMEOUT_MIN` | `10` | how long a deferred block waits for the warden's answer |
 | `GRACE_WARDEN_BUDGET` | `5` | warden interventions per card per 24 h |
 | `GRACE_WARDEN_CMD` | — | zero-config warden hook (same as registering `{kind:"command"}`) |
+| `GRACE_QUOTA_FALLBACK_MIN` | `30` | how long to wait when a run hits the limit but logs no reset time |
+| `GRACE_QUOTA_MAX_WAIT_MIN` | `360` | sanity cap on a parsed reset time (a stale log line can't sleep a day) |
 | `GRACE_GH_BIN` | `gh` | GitHub CLI used to open/merge the final PR of a run |
 
 ## Stations (= the grace-feature-dev build phases)
@@ -203,6 +205,34 @@ and the time of the last phase change, and adds two layers of resilience (**LA4*
 
 From a dispatched card you can **⊟ log** (tail the run's log live) and **↻ relaunch**
 (manually re-spawn from the furthest-reached step, reusing saved answers/decisions).
+
+### Hitting the subscription limit is a clock, not a crash
+
+The 5-hour window can run out mid-run, and it kills every run of the account within
+seconds. Read as "the run broke", that is the worst possible failure: auto-heal spends
+its one retry inside the dead window, the card lands in `blocked` behind "открой лог и
+перезапусти", the WIP=1 slot stays occupied and the whole plan stands still long after
+the limit has reset. So the board reads the limit **out of the run's own log** and
+treats it as a wait with a deadline:
+
+- **The reset time is read, never assumed** — `You've hit your limit · resets 6:10pm
+  (Europe/Moscow)` becomes an absolute instant (zone included). No time in the log →
+  a short `GRACE_QUOTA_FALLBACK_MIN` probe, never a blind five-hour sleep. Only the
+  current run's output is parsed (logs are appended across relaunches), so a stale
+  limit line cannot pause a card that died for a real reason.
+- **A quota stop costs nothing** — no `autoHealCount`, no `blocked`. The card keeps its
+  station, its place in the queue and its work, and carries a note saying what happened
+  and when it comes back.
+- **Board-wide** — a limit hits the account, so while the window is open nothing new is
+  dispatched and no run enters its closing phase; the queue holds its order instead of
+  feeding the limit fresh corpses.
+- **It resumes itself** — when the clock runs out every waiting card re-enters through
+  the normal resume path, from the furthest green checkpoint. Pressing **↻ relaunch**
+  by hand also closes the window (a human run proves the account works again).
+
+Events land in the dispatch log as `quota-pause` · `quota-resume` · `quota-clear`, and
+the board says it in one line above the columns: *«Лимит подписки Claude — прогоны на
+паузе, сделанное не потеряно, доска поднимет их сама в 18:10»*.
 
 ### The warden — the board calls an agent, the agent never polls the board
 
