@@ -307,6 +307,38 @@ body{
 .btn--run:hover{filter:brightness(1.07);transform:translateY(-1px)}
 .btn--run[disabled]{opacity:.55;filter:none;transform:none;cursor:default}
 
+/* ══ v4 Ш4 · зона «Требует меня» ═════════════════════════════════════════════
+   Имя .attn, а НЕ .att из прототипа: .att уже занят списком вложений карточки
+   (см. выше), и одноимённый класс сломал бы его молча. */
+.attn{display:flex;flex-direction:column;gap:1px;margin:0 24px 14px;background:var(--surface);
+  border:1px solid var(--line-2);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}
+.attn.calm{border-color:rgba(46,158,80,.3);background:rgba(46,158,80,.07)}
+.attn__row{display:flex;align-items:center;gap:12px;padding:11px 15px;border-left:3px solid var(--line-2);background:var(--surface)}
+.attn__row+.attn__row{border-top:1px solid var(--line)}
+.attn__row--ask{border-left-color:var(--s-asking)}
+.attn__row--arch{border-left-color:var(--s-reviewing)}
+.attn__row--block,.attn__row--merge{border-left-color:var(--s-blocked)}
+.attn__row--floor{border-left-color:var(--amber)}
+.attn__row--calm{border-left-color:var(--s-ready);background:transparent}
+.attn__ic{font-size:15px;line-height:1;flex:none;width:18px;text-align:center}
+.attn__row--ask .attn__ic{animation:blip 1.9s ease-in-out infinite}
+@keyframes blip{0%,100%{opacity:1}50%{opacity:.42}}
+.attn__txt{display:flex;flex-direction:column;gap:2px;flex:1;min-width:0}
+.attn__t{font-family:var(--display);font-weight:600;font-size:13.5px;color:var(--ink);letter-spacing:-.01em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.attn__t b{font-weight:700}
+.attn__s{font-size:12px;line-height:1.45;color:var(--ink-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.attn__go{font-family:var(--display);font-weight:600;font-size:12px;color:#fff;background:var(--s-asking);
+  border:none;border-radius:9px;padding:7px 12px;cursor:pointer;flex:none;white-space:nowrap}
+.attn__go:hover{filter:brightness(1.07)}
+.attn__note{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);padding:7px 15px;background:var(--surface-2)}
+.attn.calm .attn__note{background:transparent}
+.pulse__k{font-family:var(--mono);font-size:11px;border-radius:999px;padding:5px 11px;border:1px solid var(--line-2);
+  white-space:nowrap;flex:none}
+.pulse__k b{font-family:var(--display);font-size:12.5px}
+.pulse__k--you{color:#8a5e08;background:rgba(230,161,30,.14);border-color:rgba(230,161,30,.45)}
+.pulse__k--calm{color:#1f7a42;background:rgba(46,158,80,.1);border-color:rgba(46,158,80,.32)}
+
 /* ══ v4 Ш0 · стоп-кран ═══════════════════════════════════════════════════════
    Тон синий, а не красный: пауза ≠ поломка. Красным на этой доске обозначено то,
    что сломалось (--s-blocked), и удержание не должно читаться так же. Единственный

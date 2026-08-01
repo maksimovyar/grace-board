@@ -21,6 +21,8 @@
     </div>
   </div>
   <nav class="strip" id="strip" aria-label="станции"></nav>
+  <!-- v4 Ш4 · счётчик считает ТОЛЬКО зону «Требует меня» -->
+  <span class="pulse__k pulse__k--calm" id="pulseYou">тебя не ждут</span>
   <!-- v4 Ш0 · стоп-кран: три положения, у каждого сказано, что доиграет и чего это стоит -->
   <div class="brake" id="brake">
     <button class="brake__btn" id="brakeBtn" type="button" aria-haspopup="menu" aria-expanded="false">⏸ Остановить</button>
@@ -32,6 +34,9 @@
 
 <!-- взведённое удержание: что доигрывает и сколько осталось (v4 Ш0) -->
 <div id="holdHost"></div>
+
+<!-- v4 Ш4 · «Требует меня»: сюда попадает только то, что СТОИТ и снять может ТОЛЬКО человек -->
+<div id="attnHost"></div>
 
 <!-- plan-rail(s) — запущенные прогоны над колонками (§2, S4); app.js наполняет из board.plans -->
 <div class="railhost" id="railHost"></div>

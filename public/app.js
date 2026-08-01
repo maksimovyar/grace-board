@@ -474,6 +474,96 @@ function bindBrake() {
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
 }
 
+// ══ v4 Ш4 · зона «Требует меня» ══════════════════════════════════════════════
+// @purpose Главный экран автономного конвейера отвечает на ОДИН вопрос: нужен ли я сейчас.
+//   Правило попадания сюда — два условия сразу: работа СТОИТ и снять остановку может ТОЛЬКО
+//   человек. Поэтому здесь нет лимита подписки (ждёт часы, не меня), нет вопросов стража
+//   (решает агент), нет закрытых прогонов (они ничего не держат) и нет черновиков (они
+//   ничего не стоят). Всё это видно в других местах — но не здесь, иначе счётчик перестанет
+//   значить «иди работай» и превратится в фон, который перестают замечать.
+// STRUCTURE: ▶ attention() → ⊕ строки по источникам → ⚡ renderAttn → ⎋ счётчик в шапке
+const AGO_STEPS = [[60, "мин"], [24, "ч"], [365, "дн"]];
+function ago(iso) {
+  if (!iso) return "";
+  let v = (Date.now() - Date.parse(iso)) / 60000;
+  if (!(v >= 0)) return "";
+  if (v < 1) return "меньше минуты";
+  for (const [div, unit] of AGO_STEPS) { if (v < div) return `${Math.round(v)} ${unit}`; v /= div; }
+  return `${Math.round(v)} лет`;
+}
+const plural = (n, one, few, many) => { const m = n % 100, d = n % 10;
+  return n + " " + (m >= 11 && m <= 14 ? many : d === 1 ? one : d >= 2 && d <= 4 ? few : many); };
+function attention() {
+  const rows = [];
+  for (const c of liveCards()) {
+    const stood = c.lastColumnChangeAt ? ` · стоит ${ago(c.lastColumnChangeAt)}` : "";
+    // Функционал и архитектура — РАЗНЫЕ строки: разные вопросы и разная цена ошибки.
+    if (c.column === "asking" && (c.questions || []).length && askState(c) === "func")
+      rows.push({ k: "ask", ic: "🔔", t: c.theme || c.id, s: `${plural((c.questions || []).length, "вопрос", "вопроса", "вопросов")} по функционалу${stood}`, go: "Ответить", card: c.id });
+    else if (c.column === "asking" && askState(c) === "arch-pick")
+      rows.push({ k: "arch", ic: "🧩", t: c.theme || c.id, s: `архитектор предлагает ${plural((c.archQuestions || []).length, "решение", "решения", "решений")}${stood}`, go: "Разобрать", card: c.id });
+    // Пауза по лимиту ждёт часы, а не человека — она в баннере, не здесь.
+    if (c.column === "blocked" && !c.paused)
+      rows.push({ k: "block", ic: "⛔", t: c.theme || c.id, s: `${c.blockReason || "прогон остановлен"}${stood}`, go: "Открыть лог", card: c.id });
+    if ((c.autoFloorHeld || []).length || (c.result && c.result.floor || []).length)
+      rows.push({ k: "floor", ic: "⚠", t: c.theme || c.id, s: "жёсткий пол — нужна подпись человека", go: "Разобрать", card: c.id });
+  }
+  for (const p of (state.plans || [])) {
+    if (p.archived) continue;
+    const st = closeState(p);
+    if (st === "merge-failed")
+      rows.push({ k: "merge", ic: "⛔", t: p.goal || "Прогон " + p.id, plan: p.id,
+        s: `автомерж не прошёл · ${p.result && p.result.pr && p.result.pr.url ? "PR собран" : "PR не создан"} — доска дальше не пойдёт`, go: "Разобрать" });
+    if (st === "deploy-hold")
+      rows.push({ k: "floor", ic: "⚠", t: p.goal || "Прогон " + p.id, plan: p.id,
+        s: "смержено · деплой за человеком (жёсткий пол: боевой стенд)", go: "Раскатать" });
+  }
+  return rows;
+}
+// Ближайшая остановка впереди: в режиме Ask каждый незапущенный этап однажды спросит.
+function nextStopText() {
+  for (const p of (state.plans || [])) {
+    if (p.archived || closeState(p) !== "running" || p.mode !== "ask") continue;
+    const wait = (p.cardIds || []).map(cardById).filter((c) => c && c.column !== "ready" && c.column !== "asking");
+    if (wait.length) return `ближайшая остановка — вопросы на «${wait[0].theme || wait[0].id}»`;
+  }
+  return "остановок впереди нет";
+}
+function renderAttn() {
+  const host = document.getElementById("attnHost");
+  if (!host) return 0;
+  const rows = attention();
+  if (!rows.length) {
+    const view = holdView();
+    const mood = view === "off" ? "Конвейер идёт сам." : view === "now" ? "Конвейер остановлен тобой." : "Конвейер доигрывает и встанет.";
+    host.innerHTML = `<div class="attn calm"><div class="attn__row attn__row--calm"><span class="attn__ic">✓</span>
+      <div class="attn__txt"><span class="attn__t"><b>Никто не ждёт.</b> ${mood}</span>
+      <span class="attn__s">${esc(nextStopText())}</span></div></div>
+      <div class="attn__note">сюда попадает только то, что стоит и ждёт именно тебя</div></div>`;
+    return 0;
+  }
+  host.innerHTML = `<div class="attn">${rows.map((r) => `<div class="attn__row attn__row--${r.k}">
+      <span class="attn__ic">${r.ic}</span>
+      <div class="attn__txt"><span class="attn__t">${esc(r.t)}</span><span class="attn__s">${esc(r.s)}</span></div>
+      <button class="attn__go" type="button" ${r.card ? `data-attncard="${esc(r.card)}"` : `data-attnplan="${esc(r.plan)}"`}>${r.go} →</button>
+    </div>`).join("")}<div class="attn__note">${rows.length} — конвейер стоит и без тебя не поедет</div></div>`;
+  host.querySelectorAll("[data-attncard]").forEach((b) => b.addEventListener("click", () => {
+    const card = cardById(b.dataset.attncard);
+    if (card && card.column === "asking") openAsk(card.id); else if (card) openLog(card.id);
+  }));
+  host.querySelectorAll("[data-attnplan]").forEach((b) => b.addEventListener("click", () => {
+    planFilter = b.dataset.attnplan; render();
+  }));
+  return rows.length;
+}
+// Счётчик в шапке считает ТОЛЬКО эту зону — иначе он перестаёт быть сигналом «иди работай».
+function renderPulse(n) {
+  const el = document.getElementById("pulseYou");
+  if (!el) return;
+  el.className = "pulse__k " + (n ? "pulse__k--you" : "pulse__k--calm");
+  el.innerHTML = n ? `ждут тебя <b>${n}</b>` : "тебя не ждут";
+}
+
 function renderRails() {
   const host = document.getElementById("railHost");
   if (!host) return;
@@ -505,6 +595,7 @@ async function onPlanReopen(planId) {
 function render() {
   ensureAutonomyToggle(); paintAutonomy();
   bindBrake(); renderHold();
+  renderPulse(renderAttn());
   renderRails();
   stripEl.innerHTML = stripHTML();
   const parts = [stationHTML("backlog")];
