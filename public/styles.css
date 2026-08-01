@@ -350,9 +350,11 @@ body{
 .close__note--warn{color:#8a5e08}
 .close__note--ok{color:#1f7a42}
 .rail__actions{display:flex;align-items:center;gap:8px;margin-top:2px}
-.rail__pr{font-family:var(--display);font-weight:600;font-size:12.5px;color:#fff;background:var(--s-verifying);
+/* v4 Ш1: кнопка «Финальный PR в main →» снята — при merge:manual PR это финал, доска ничего не
+   ждёт. На её месте появляется только то, что действительно что-то делает: переигровка приёмки. */
+.rail__reopen{font-family:var(--display);font-weight:600;font-size:12.5px;color:#fff;background:var(--s-verifying);
   border:none;border-radius:9px;padding:8px 13px;cursor:pointer;white-space:nowrap}
-.rail__pr:hover{filter:brightness(1.07)}
+.rail__reopen:hover{filter:brightness(1.07)}
 .rail__filter{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
   border:1px solid var(--line-2);border-radius:9px;padding:7px 11px;cursor:pointer}
 .rail__filter:hover,.rail__filter.is-on{border-color:var(--ink-soft);color:var(--ink)}
