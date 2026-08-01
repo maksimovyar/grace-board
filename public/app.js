@@ -212,9 +212,12 @@ function cardHTML(card) {
     </article>`;
 }
 
+// v4 Ш3: архивная карточка — законченная жизнь, а не удалённая задача. Из колонок она уходит
+// (иначе Ready копится десятками), но остаётся в прогоне и в данных.
+const liveCards = () => state.cards.filter((c) => !c.archived);
 function stationHTML(col) {
   const st = STATIONS[col];
-  const cards = state.cards.filter((c) => c.column === col && (!planFilter || c.planId === planFilter));
+  const cards = liveCards().filter((c) => c.column === col && (!planFilter || c.planId === planFilter));
   const empty = col === "backlog"
     ? "Добавь задачу и перетащи\nеё через рычаг запуска ⟶"
     : "—";
@@ -366,10 +369,18 @@ function renderRails() {
   host.querySelectorAll("[data-planreopen]").forEach((b) => b.addEventListener("click", () => onPlanReopen(b.dataset.planreopen)));
   host.querySelectorAll("[data-planclose]").forEach((b) => b.addEventListener("click", () => onPlanClose(b.dataset.planclose)));
 }
+// v4 Ш3: «убрать с доски» = снять рельс И увести законченные карточки прогона в архив. Идущие
+// этапы остаются: убирать с доски работу, которая ещё едет, значит спрятать живой прогон.
 async function onPlanClose(planId) {
-  if (!confirm("Закрыть прогон? Плашка исчезнет, карточки останутся на доске.")) return;
-  try { await api(`/api/plans/${planId}`, { method: "DELETE" }); if (planFilter === planId) planFilter = null; toast("Прогон закрыт"); loadBoard(); }
-  catch (err) { toast("Не удалось закрыть: " + err.message); }
+  const cards = (state.plans || []).find((p) => p.id === planId);
+  const done = (cards ? cards.cardIds || [] : []).map(cardById).filter((c) => c && c.column === "ready" && !c.archived).length;
+  if (!confirm(`Убрать прогон с доски?${done ? ` Готовых карточек уйдёт в архив: ${done}.` : ""} Прогон, PR и история останутся.`)) return;
+  try {
+    const r = await api(`/api/plans/${planId}?withCards=1`, { method: "DELETE" });
+    if (planFilter === planId) planFilter = null;
+    toast(`Убрано с доски${(r.archived || []).length ? `: <strong>${r.archived.length} карточек</strong>` : ""} · прогон и PR остались в истории`);
+    loadBoard();
+  } catch (err) { toast("Не удалось убрать: " + err.message); }
 }
 // v4 Ш1.1: единственный выход из терминального `failed`, когда прогон провалила не работа, а лимит.
 async function onPlanReopen(planId) {
