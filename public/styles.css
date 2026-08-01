@@ -17,7 +17,11 @@
   --display:"Bricolage Grotesque",system-ui,sans-serif;
   --sans:"Hanken Grotesk",system-ui,sans-serif;
   --mono:"JetBrains Mono",ui-monospace,monospace;
+  /* v4 Ш9 · плотность: пять переменных вместо второго набора классов. Значения по умолчанию —
+     «плотно»; body[data-d="comfy"] ниже раздвигает те же самые правила. */
+  --row:30px; --pad:14px; --gap:10px; --fs:13.5px; --fs-mono:10.5px;
 }
+body[data-d="comfy"]{--row:38px; --pad:18px; --gap:14px; --fs:14.5px; --fs-mono:11px}
 *{box-sizing:border-box}
 /* S6 · доска перестала скроллиться, когда над колонками появились plan-rail'ы: body с жёсткой
    height:100% не может вырасти под контент, поэтому вертикального скролла у страницы нет в
@@ -311,6 +315,21 @@ body{
 .btn--run:hover{filter:brightness(1.07);transform:translateY(-1px)}
 .btn--run[disabled]{opacity:.55;filter:none;transform:none;cursor:default}
 
+/* ══ v4 Ш9 · инструменты, плотность, обратимое удаление ══════════════════════ */
+.tools{display:flex;align-items:center;gap:7px;flex:none}
+.tools__find{font-family:var(--mono);font-size:11px;color:var(--ink);background:var(--surface);
+  border:1px solid var(--line-2);border-radius:999px;padding:6px 12px;width:132px;outline:none}
+.tools__find:focus{border-color:var(--ink-faint);width:190px}
+.tools__proj{font-family:var(--mono);font-size:11px;color:var(--ink-soft);background:var(--surface);
+  border:1px solid var(--line-2);border-radius:999px;padding:6px 10px;cursor:pointer;max-width:150px}
+.seg--dense .seg__opt{font-size:10px;padding:5px 9px}
+.hint{display:flex;align-items:center;gap:10px}
+.hint__x{background:none;border:none;color:var(--ink-faint);font-size:12px;cursor:pointer;line-height:1}
+.hint__x:hover{color:var(--ink)}
+.toast__undo{font-family:var(--display);font-weight:600;font-size:12px;color:var(--ember);background:none;
+  border:1px solid var(--ember);border-radius:8px;padding:3px 10px;margin-left:10px;cursor:pointer}
+.toast__undo:hover{background:rgba(216,91,34,.1)}
+
 /* ══ v4 Ш5 · полка закрытого ══════════════════════════════════════════════════
    Реюз .tag (третью систему чипов из прототипа не заводим — на доске уже есть
    .tag и .rail__chip), плюс два модификатора исхода. */
@@ -353,7 +372,7 @@ a.tag:hover{border-color:var(--ink-soft)}
 .attn__row--ask .attn__ic{animation:blip 1.9s ease-in-out infinite}
 @keyframes blip{0%,100%{opacity:1}50%{opacity:.42}}
 .attn__txt{display:flex;flex-direction:column;gap:2px;flex:1;min-width:0}
-.attn__t{font-family:var(--display);font-weight:600;font-size:13.5px;color:var(--ink);letter-spacing:-.01em;
+.attn__t{font-family:var(--display);font-weight:600;font-size:var(--fs);color:var(--ink);letter-spacing:-.01em;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .attn__t b{font-weight:700}
 .attn__s{font-size:12px;line-height:1.45;color:var(--ink-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -403,10 +422,10 @@ a.tag:hover{border-color:var(--ink-soft)}
 .railhost:empty{display:none}
 
 /* ══ v4 Ш6 · прогон как трек ═════════════════════════════════════════════════ */
-.runs{display:flex;flex-direction:column;gap:10px;margin:0 24px 14px}
+.runs{display:flex;flex-direction:column;gap:var(--gap);margin:0 24px 14px}
 .runs__note{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);padding-left:2px}
 .run{background:linear-gradient(180deg,var(--surface),var(--surface-2));border:1.5px solid var(--line-2);
-  border-left:4px solid var(--s-verifying);border-radius:var(--radius);box-shadow:var(--shadow);padding:11px 16px}
+  border-left:4px solid var(--s-verifying);border-radius:var(--radius);box-shadow:var(--shadow);padding:calc(var(--pad) - 3px) var(--pad)}
 .run--auto{border-left-color:var(--s-ready)}
 .run__head{display:flex;align-items:center;gap:11px;flex-wrap:wrap}
 .run__badge{font-family:var(--mono);font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
@@ -441,15 +460,15 @@ a.tag:hover{border-color:var(--ink-soft)}
 /* очередь: строка этапа ровно одной высоты, тема сжимается, причина ожидания справа */
 .run__body{display:flex;flex-direction:column;gap:2px;margin-top:11px}
 .stage{display:grid;grid-template-columns:22px 30px minmax(0,1fr) auto;align-items:center;gap:8px;
-  height:30px;padding:0 4px;border-radius:var(--radius-sm);cursor:pointer}
+  height:var(--row);padding:0 4px;border-radius:var(--radius-sm);cursor:pointer}
 .stage:hover{background:var(--surface-2)}
 .stage__m{font-size:11px;color:var(--ink-faint);text-align:center}
 .stage--done .stage__m{color:var(--s-ready)}
 .stage--blocked .stage__m{color:var(--s-blocked)}
 .stage__n{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
-.stage__t{font-size:12.5px;color:var(--ink-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stage__t{font-size:calc(var(--fs) - 1px);color:var(--ink-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .stage--done .stage__t{color:var(--ink-faint)}
-.stage__r{font-family:var(--mono);font-size:10px;color:var(--ink-faint);white-space:nowrap}
+.stage__r{font-family:var(--mono);font-size:calc(var(--fs-mono) - .5px);color:var(--ink-faint);white-space:nowrap}
 /* голова — единственная развёрнутая карточка прогона */
 .stage--live{border:1.5px solid rgba(216,91,34,.35);border-left:3px solid var(--s-implementing);
   border-radius:var(--radius-sm);padding:10px 12px;background:var(--surface);box-shadow:0 0 0 3px rgba(216,91,34,.06);
@@ -462,7 +481,7 @@ a.tag:hover{border-color:var(--ink-soft)}
 .head__age.is-stale{color:#8a5e08}
 .head__more{font-family:var(--mono);font-size:10px;color:var(--ink-faint);background:none;border:none;cursor:pointer;flex:none}
 .head__more:hover{color:var(--ink)}
-.head__t{font-family:var(--display);font-weight:600;font-size:14px;color:var(--ink);letter-spacing:-.01em}
+.head__t{font-family:var(--display);font-weight:600;font-size:calc(var(--fs) + .5px);color:var(--ink);letter-spacing:-.01em}
 .head__ask{font-family:var(--display);font-weight:600;font-size:12.5px;color:#fff;background:var(--s-asking);
   border:none;border-radius:9px;padding:8px 12px;cursor:pointer;text-align:left}
 .head__ask--wait{background:var(--surface-2);color:var(--ink-faint);cursor:default}

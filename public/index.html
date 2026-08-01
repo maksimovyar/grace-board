@@ -21,6 +21,12 @@
     </div>
   </div>
   <nav class="strip" id="strip" aria-label="станции"></nav>
+  <!-- v4 Ш9 · поиск (клавиша /), фильтр по проекту, плотность -->
+  <div class="tools">
+    <input class="tools__find" id="findBox" type="search" placeholder="поиск  /" aria-label="поиск по карточкам" />
+    <select class="tools__proj" id="projBox" aria-label="фильтр по проекту"><option value="">все проекты</option></select>
+    <div class="seg seg--dense" id="densSeg"><button type="button" class="seg__opt is-on" data-dens="dense">плотно</button><button type="button" class="seg__opt" data-dens="comfy">просторно</button></div>
+  </div>
   <!-- v4 Ш4 · счётчик считает ТОЛЬКО зону «Требует меня» -->
   <span class="pulse__k pulse__k--calm" id="pulseYou">тебя не ждут</span>
   <!-- v4 Ш0 · стоп-кран: три положения, у каждого сказано, что доиграет и чего это стоит -->
@@ -131,7 +137,9 @@
   </div>
 </div>
 
-<div class="hint">Перетаскивай <b>карточки</b> между станциями · нажми карточку — откроется задача · <b>+ Новая задача</b></div>
+<!-- v4 Ш9: подсказка для новичка, а не мебель. Показывается один раз и закрывается насовсем. -->
+<div class="hint" id="hint" hidden>Перетаскивай <b>карточки</b> между станциями · нажми карточку — откроется задача · <b>+ Новая задача</b>
+  <button class="hint__x" type="button" id="hintX" aria-label="Больше не показывать">✕</button></div>
 
 <!-- ── DETAIL DRAWER (Backlog / прочее — без вопросов) ─────────────── -->
 <div class="sheet" id="detail" hidden>
