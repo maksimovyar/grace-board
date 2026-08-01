@@ -394,9 +394,77 @@ a.tag:hover{border-color:var(--ink-soft)}
 .holdbar__act:hover{border-color:#255a97;color:#255a97}
 
 /* plan-rail — запущенная большая фича над колонками */
-/* Несколько прогонов сразу съедали весь экран — рельсы получают свой скролл, станции остаются видны. */
+/* v4 Ш6: свой скролл у рельсов больше не нужен — прогон сворачивается в одну строку, а этапы
+   не дублируются в колонках. Вложенная область прокрутки была платой за это дублирование. */
 .railhost:empty{display:none}
-.railhost{max-height:32vh;overflow-y:auto;overscroll-behavior:contain}
+
+/* ══ v4 Ш6 · прогон как трек ═════════════════════════════════════════════════ */
+.runs{display:flex;flex-direction:column;gap:10px;margin:0 24px 14px}
+.runs__note{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);padding-left:2px}
+.run{background:linear-gradient(180deg,var(--surface),var(--surface-2));border:1.5px solid var(--line-2);
+  border-left:4px solid var(--s-verifying);border-radius:var(--radius);box-shadow:var(--shadow);padding:11px 16px}
+.run--auto{border-left-color:var(--s-ready)}
+.run__head{display:flex;align-items:center;gap:11px;flex-wrap:wrap}
+.run__badge{font-family:var(--mono);font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+  color:#fff;background:var(--s-verifying);border-radius:5px;padding:2px 8px;flex:none}
+.run--auto .run__badge{background:var(--s-ready)}
+.run__title{font-family:var(--display);font-weight:700;font-size:15px;letter-spacing:-.015em;margin:0;
+  color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34ch}
+.run__meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:1;min-width:0}
+.tag--proj{color:var(--ink);background:var(--surface-2);border-color:var(--line-2);font-weight:600}
+.run__toggle{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
+  border:1px solid var(--line-2);border-radius:9px;padding:6px 11px;cursor:pointer;flex:none}
+.run__toggle:hover{border-color:var(--ink-soft);color:var(--ink)}
+/* трек: узлы соединены линией, флажок стоит НАД узлом и не двигает раскладку */
+.track{display:flex;align-items:center;gap:0;margin-top:10px;flex-wrap:wrap}
+.node{position:relative;display:inline-flex;align-items:center;gap:5px;flex:none}
+.node__dot{width:17px;height:17px;border-radius:50%;border:1.5px solid var(--line-2);background:var(--surface);
+  display:inline-flex;align-items:center;justify-content:center;font-size:9.5px;color:var(--ink-faint);line-height:1}
+.node__n{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+.node--done .node__dot{background:var(--s-ready);border-color:var(--s-ready);color:#fff}
+.node--done .node__n{color:var(--ink-soft)}
+.node--live .node__dot{background:var(--s-implementing);border-color:var(--s-implementing);color:#fff;
+  box-shadow:0 0 0 3px rgba(216,91,34,.16)}
+.node--live .node__n{color:var(--ink);font-weight:700}
+.node--starting .node__dot{border-color:var(--s-todo);background:var(--s-todo)}
+.node--blocked .node__dot{background:var(--s-blocked);border-color:var(--s-blocked);color:#fff}
+.node__flag{position:absolute;top:-13px;left:1px;font-size:9.5px;line-height:1;opacity:.75}
+.seg-line{flex:1 1 14px;min-width:14px;max-width:52px;height:1.5px;background:var(--line-2);margin:0 5px}
+.seg-line--done{background:var(--s-ready)}
+.track__verdict{font-family:var(--mono);font-size:10.5px;margin-left:auto;padding-left:12px;flex:none}
+.track__verdict--stop{color:#8a5e08}
+.track__verdict--free{color:#1f7a42}
+/* очередь: строка этапа ровно одной высоты, тема сжимается, причина ожидания справа */
+.run__body{display:flex;flex-direction:column;gap:2px;margin-top:11px}
+.stage{display:grid;grid-template-columns:22px 30px minmax(0,1fr) auto;align-items:center;gap:8px;
+  height:30px;padding:0 4px;border-radius:var(--radius-sm);cursor:pointer}
+.stage:hover{background:var(--surface-2)}
+.stage__m{font-size:11px;color:var(--ink-faint);text-align:center}
+.stage--done .stage__m{color:var(--s-ready)}
+.stage--blocked .stage__m{color:var(--s-blocked)}
+.stage__n{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+.stage__t{font-size:12.5px;color:var(--ink-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stage--done .stage__t{color:var(--ink-faint)}
+.stage__r{font-family:var(--mono);font-size:10px;color:var(--ink-faint);white-space:nowrap}
+/* голова — единственная развёрнутая карточка прогона */
+.stage--live{border:1.5px solid rgba(216,91,34,.35);border-left:3px solid var(--s-implementing);
+  border-radius:var(--radius-sm);padding:10px 12px;background:var(--surface);box-shadow:0 0 0 3px rgba(216,91,34,.06);
+  display:flex;flex-direction:column;gap:7px;cursor:pointer}
+.head__top{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.head__id{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+.head__phase{font-family:var(--mono);font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
+  color:#fff;border-radius:5px;padding:2px 8px}
+.head__age{font-family:var(--mono);font-size:10px;color:var(--ink-faint);flex:1;min-width:0}
+.head__age.is-stale{color:#8a5e08}
+.head__more{font-family:var(--mono);font-size:10px;color:var(--ink-faint);background:none;border:none;cursor:pointer;flex:none}
+.head__more:hover{color:var(--ink)}
+.head__t{font-family:var(--display);font-weight:600;font-size:14px;color:var(--ink);letter-spacing:-.01em}
+.head__ask{font-family:var(--display);font-weight:600;font-size:12.5px;color:#fff;background:var(--s-asking);
+  border:none;border-radius:9px;padding:8px 12px;cursor:pointer;text-align:left}
+.head__ask--wait{background:var(--surface-2);color:var(--ink-faint);cursor:default}
+.between{font-size:12px;color:var(--ink-soft);background:var(--surface-2);border:1px dashed var(--line-2);
+  border-radius:var(--radius-sm);padding:9px 12px}
+.between b{color:var(--ink)}
 /* S6 · плашка лимита подписки: доска стоит по часам, а не по поломке */
 .qbanner{display:flex;align-items:center;gap:13px;margin:0 24px 14px;padding:12px 16px;border-radius:var(--radius);
   border:1px solid rgba(230,161,30,.45);background:linear-gradient(180deg,rgba(230,161,30,.12),rgba(230,161,30,.06))}

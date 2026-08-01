@@ -17,7 +17,8 @@ const WORKING = new Set(["implementing", "verifying", "reviewing"]); // agent-he
 
 let state = { cards: [], updatedAt: null };
 let igniteId = null;
-let planFilter = null;   // S4: when set, the board shows only this plan's stages (rail «только этот прогон»)
+// v4 Ш6: фильтр «только этот прогон» снят вместе с дублированием — этапы прогона больше не
+// попадают в колонки, фильтровать в них нечего.
 
 // ── helpers ────────────────────────────────────────────────────────────────
 const boardEl = document.getElementById("board");
@@ -217,7 +218,9 @@ function cardHTML(card) {
 const liveCards = () => state.cards.filter((c) => !c.archived);
 function stationHTML(col) {
   const st = STATIONS[col];
-  const cards = liveCards().filter((c) => c.column === col && (!planFilter || c.planId === planFilter));
+  // v4 Ш6: этап прогона живёт в треке и ТОЛЬКО там. В колонках — одиночные карточки, чей путь
+  // доработка не меняет: рычаг, дроп-зоны, POST /api/tasks работают как прежде.
+  const cards = liveCards().filter((c) => c.column === col && !c.planId);
   const empty = col === "backlog"
     ? "Добавь задачу и перетащи\nеё через рычаг запуска ⟶"
     : "—";
@@ -272,38 +275,122 @@ function dagNodeClass(card) {
   if (card.dispatchedAt) return "live";     // asking / implementing / verifying / reviewing
   return "wait";                             // queued or not-yet-dispatched todo
 }
-function railHTML(plan) {
-  const cards = (plan.cardIds || []).map((id) => cardById(id)).filter(Boolean);
-  const total = cards.length;
-  const done = cards.filter((c) => c.column === "ready").length;
-  const autoN = cards.reduce((n, c) => n + ((c.result && c.result.autoDecisions || []).length), 0);
+// ══ v4 Ш6 · прогон как трек ══════════════════════════════════════════════════
+// @purpose Раньше карточка прогона жила В ДВУХ местах сразу: узлом на рельсе и карточкой в
+//   колонке. Один и тот же этап читался дважды, а восемь колонок при этом были почти пусты.
+//   Теперь прогон — это трек: голова (единственная активная карточка) развёрнута, очередь
+//   идёт строками, в колонках остаются ТОЛЬКО одиночные карточки. Проект — первым чипом:
+//   при нескольких проектах это первый вопрос «а это вообще про что», раньше цели и ветки.
+// STRUCTURE: ▶ nodeKind → ⊕ trackHTML(узлы+флажки+вердикт) → ⚡ stageHTML(голова|строка) → ⎋ runHTML
+function nodeKind(c) {
+  if (!c) return "wait";
+  if (c.column === "blocked") return "blocked";
+  if (c.column === "ready") return "done";
+  if (c.dispatchedAt && c.column === "todo") return "starting";   // отправлена, но станция ещё не сменилась
+  if (c.dispatchedAt) return "live";
+  return "wait";
+}
+// Сколько раз прогон ещё остановит человека. В Ask спросит каждый незакрытый этап; в Auto —
+// только жёсткий пол, остальное агент решит сам.
+function planStops(plan) {
+  const cards = (plan.cardIds || []).map(cardById).filter(Boolean);
+  return plan.mode === "auto"
+    ? cards.filter((c) => (c.autoFloorHeld || []).length || (c.result && c.result.floor || []).length).length
+    : cards.filter((c) => c.column !== "ready").length;
+}
+const times = (n) => plural(n, "раз", "раза", "раз");
+// Незакрытые зависимости этапа — их видно раньше любых других причин ожидания.
+function blockers(card) {
+  const plan = planOfCard(card);
+  if (!plan) return [];
+  return (card.dependsOn || []).map((id) => cardById(id)).filter((d) => d && d.column !== "ready")
+    .map((d) => `S${(plan.cardIds || []).indexOf(d.id) + 1}`);
+}
+function trackHTML(plan, cards) {
   const nodes = cards.map((c, i) => {
-    const cls = dagNodeClass(c);
-    const dot = cls === "done" ? "✓" : cls === "live" ? "●" : cls === "blocked" ? "!" : "○";
-    return `${i ? '<span class="dag__arrow">→</span>' : ""}<span class="dag__node dag__node--${cls}" title="${esc(c.theme || "")}"><span class="dag__dot">${dot}</span>S${i + 1}</span>`;
+    const k = nodeKind(c);
+    const dot = k === "done" ? "✓" : k === "live" ? "●" : k === "blocked" ? "!" : "";
+    // Флажок = «здесь прогон однажды остановится и спросит», а не «здесь проблема».
+    const flag = k === "wait" && plan.mode !== "auto"
+      ? `<span class="node__flag" title="в режиме Ask этот этап остановится на вопросах">🚩</span>` : "";
+    return `${i ? `<span class="seg-line${nodeKind(cards[i - 1]) === "done" ? " seg-line--done" : ""}"></span>` : ""}
+      <span class="node node--${k}" title="${esc(c.theme || "")}">${flag}<span class="node__dot">${dot}</span><span class="node__n">S${i + 1}</span></span>`;
   }).join("");
-  const filterOn = planFilter === plan.id;
-  const pol = plan.policy || {};
-  return `<section class="rail" data-plan-rail="${esc(plan.id)}">
-    <div class="rail__top">
-      <span class="rail__badge">⚡ прогон</span>
-      <div class="rail__goal">
-        <h2 class="rail__title">${esc(plan.goal || "Прогон " + plan.id)}</h2>
-        <div class="rail__meta">
-          <span class="rail__chip rail__chip--branch">⎇ ${esc(plan.integrationBranch)}</span>
-          <span class="rail__chip rail__chip--auto">режим: ${plan.mode === "auto" ? "Auto" : "Ask"}</span>
-          <span class="rail__chip">🧩 ${total} этап.</span>
-          <span class="rail__chip">🤖 авто-решений: ${autoN}</span>
-          ${pol.pr ? `<span class="rail__chip" title="политика релиза (§5.1)">pr:${esc(pol.pr)} · merge:${esc(pol.merge)} · deploy:${esc(pol.deploy)}</span>` : ""}
-        </div>
-      </div>
-      <div class="rail__actions">
-        <button class="rail__filter${filterOn ? " is-on" : ""}" type="button" data-planfilter="${esc(plan.id)}">⛁ только этот прогон</button>
-        ${closeState(plan) === "failed" ? `<button class="rail__reopen" type="button" data-planreopen="${esc(plan.id)}" title="переиграть приёмку — например, если прогон провалил лимит подписки, а не код">↻ переиграть приёмку</button>` : ""}
-        <button class="rail__close" type="button" data-planclose="${esc(plan.id)}" title="закрыть прогон (карточки останутся)">✕</button>
-      </div>
+  const stops = planStops(plan);
+  return `<div class="track">${nodes}
+    <span class="track__verdict track__verdict--${stops ? "stop" : "free"}">${stops ? `🚩 остановит тебя ${times(stops)}` : "✓ пройдёт сама"}</span>
+  </div>`;
+}
+// Правая колонка строки очереди. Порядок важен: зависимость важнее удержания, удержание
+// важнее «слот занят» — человек должен читать ПЕРВУЮ настоящую причину, а не последнюю.
+function stageRight(card) {
+  if (card.column === "ready") return `готово · ${ago(card.lastColumnChangeAt)} назад`;
+  const b = blockers(card);
+  if (b.length) return `🔒 ждёт ${b[0]}${b.length > 1 ? ` +${b.length - 1}` : ""}`;
+  if (holdView() !== "off" && card.queued) return "⏸ не стартует · удержание";
+  if (card.queued) return "⏳ слот проекта занят";
+  if (card.paused) return card.pausedKind === "quota" ? "⏳ ждёт сброса лимита" : "⏸ остановлено человеком";
+  return "—";
+}
+function stageHTML(card, n, plan) {
+  const k = nodeKind(card);
+  if (k === "live" || k === "starting") return headHTML(card, n, plan, k);
+  const mark = k === "done" ? "✓" : k === "blocked" ? "!" : "○";
+  return `<div class="stage stage--${k}" data-id="${esc(card.id)}" data-open-card="${esc(card.id)}">
+    <span class="stage__m">${mark}</span><span class="stage__n">S${n}</span>
+    <span class="stage__t">${esc(card.theme || card.id)}</span>
+    <span class="stage__r">${esc(stageRight(card))}</span>
+  </div>`;
+}
+// Голова прогона — единственная развёрнутая карточка. Всё, что человек спросит про идущий
+// этап («что делает», «давно ли», «нужен ли я»), должно читаться отсюда без клика.
+function headHTML(card, n, plan, k) {
+  const st = STATIONS[card.column] || STATIONS.todo;
+  // «запускается» — не станция, а состояние: карточка отправлена, пайплайн ещё не отчитался.
+  const phase = k === "starting" ? "запускается" : st.name;
+  const color = k === "starting" ? "var(--s-todo)" : st.c;
+  const age = card.lastColumnChangeAt ? ago(card.lastColumnChangeAt) : "";
+  const ask = card.column === "asking" ? askState(card) : null;
+  const askLabel = ask === "func" ? `${plural((card.questions || []).length, "вопрос", "вопроса", "вопросов")} по функционалу · ответь`
+    : ask === "arch-pick" ? `Блок 1 готов · ${plural((card.archQuestions || []).length, "решение", "решения", "решений")} по архитектуре`
+    : ask === "arch-wait" ? "агент формулирует вопросы…" : null;
+  return `<div class="stage--live" data-id="${esc(card.id)}">
+    <div class="head__top">
+      <span class="head__id">S${n}</span>
+      <span class="head__phase" style="background:${color}">${esc(phase)}</span>
+      <span class="head__age${card.lastColumnChangeAt && Date.now() - Date.parse(card.lastColumnChangeAt) > 30 * 60000 ? " is-stale" : ""}">на станции ${esc(age)}${card.lastColumnChangeAt && Date.now() - Date.parse(card.lastColumnChangeAt) > 30 * 60000 ? " — дольше обычного" : ""}</span>
+      <button class="head__more" type="button" data-open-card="${esc(card.id)}">подробнее →</button>
     </div>
-    <div class="dag">${nodes}<span class="dag__count">${done} / ${total} · строго последовательно (WIP=1)</span></div>
+    <div class="head__t">${esc(card.theme || card.id)}</div>
+    ${cardTags(card)}
+    ${askLabel ? `<button class="head__ask${ask === "arch-wait" ? " head__ask--wait" : ""}" type="button" ${ask === "arch-wait" ? "disabled" : `data-ask="${esc(card.id)}"`}>${esc(askLabel)}</button>` : ""}
+  </div>`;
+}
+function runHTML(plan) {
+  const cards = (plan.cardIds || []).map((id) => cardById(id)).filter(Boolean);
+  const total = cards.length, done = cards.filter((c) => c.column === "ready").length;
+  const open = openRuns.has(plan.id);
+  const pol = plan.policy || {};
+  const live = cards.filter((c) => nodeKind(c) === "live" || nodeKind(c) === "starting");
+  return `<section class="run${plan.mode === "auto" ? " run--auto" : ""}" data-plan-rail="${esc(plan.id)}" ${open ? 'data-open="1"' : ""}>
+    <div class="run__head">
+      <span class="run__badge">⚡ прогон</span>
+      <h2 class="run__title">${esc(plan.goal || "Прогон " + plan.id)}</h2>
+      <div class="run__meta">
+        <span class="tag tag--proj" title="проект">▣ ${esc(plan.project || "—")}</span>
+        <span class="tag">${done} / ${total}</span>
+        <span class="tag">${plan.mode === "auto" ? "auto" : "ask"}</span>
+        <span class="tag">⎇ ${esc(plan.integrationBranch || "—")}</span>
+        ${pol.pr ? `<span class="tag" title="политика релиза">pr:${esc(pol.pr)} · merge:${esc(pol.merge)} · deploy:${esc(pol.deploy)}</span>` : ""}
+      </div>
+      <button class="run__toggle" type="button" data-runtoggle="${esc(plan.id)}">${open ? "свернуть" : "развернуть"}</button>
+      <button class="rail__close" type="button" data-planclose="${esc(plan.id)}" title="убрать прогон с доски">✕</button>
+    </div>
+    ${trackHTML(plan, cards)}
+    ${open ? `<div class="run__body">
+      ${cards.map((c, i) => stageHTML(c, i + 1, plan)).join("")}
+      ${!live.length && done < total ? `<div class="between">⏱ <b>Между этапами.</b> Готово ${done} из ${total}, следующий этап планировщик подхватит сам — ждать человека не нужно.</div>` : ""}
+    </div>` : ""}
     ${closeHTML(plan)}
   </section>`;
 }
@@ -552,7 +639,10 @@ function renderAttn() {
     if (card && card.column === "asking") openAsk(card.id); else if (card) openLog(card.id);
   }));
   host.querySelectorAll("[data-attnplan]").forEach((b) => b.addEventListener("click", () => {
-    planFilter = b.dataset.attnplan; render();
+    // Прогон живёт в треке, а не в колонках, поэтому «разобрать» = развернуть его и подвести глаз.
+    runsTouched = true; openRuns.add(b.dataset.attnplan); render();
+    const el = document.querySelector(`[data-plan-rail="${b.dataset.attnplan}"]`);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
   }));
   return rows.length;
 }
@@ -617,6 +707,14 @@ function renderShelf() {
   host.querySelectorAll("[data-planreopen]").forEach((b) => b.addEventListener("click", () => onPlanReopen(b.dataset.planreopen)));
 }
 
+// Развёрнут прогон, у которого есть живая карточка, либо единственный на доске: разворачивать
+// нечего, когда нечего показывать, и незачем прятать то единственное, что происходит.
+let openRuns = new Set(), runsTouched = false;
+function syncOpenRuns(plans) {
+  if (runsTouched) return;
+  openRuns = new Set(plans.filter((p, _, all) => all.length === 1
+    || (p.cardIds || []).map(cardById).some((c) => c && (nodeKind(c) === "live" || nodeKind(c) === "starting"))).map((p) => p.id));
+}
 function renderRails() {
   const host = document.getElementById("railHost");
   if (!host) return;
@@ -624,8 +722,23 @@ function renderRails() {
   // он ещё не закрыт, доска ждёт человека и продолжит сама.
   const plans = (state.plans || []).filter((p) => !p.archived && !CLOSED_STATES.has(closeState(p))
     && (p.cardIds || []).some((id) => cardById(id)));
-  host.innerHTML = quotaBannerHTML() + plans.map(railHTML).join("");
-  host.querySelectorAll("[data-planfilter]").forEach((b) => b.addEventListener("click", () => { planFilter = planFilter === b.dataset.planfilter ? null : b.dataset.planfilter; render(); }));
+  syncOpenRuns(plans);
+  const stages = plans.reduce((n, p) => n + (p.cardIds || []).length, 0);
+  host.innerHTML = quotaBannerHTML() + (plans.length ? `<div class="runs">${plans.map(runHTML).join("")}
+    <div class="runs__note">${plural(plans.length, "живой прогон", "живых прогона", "живых прогонов")} · ${plural(stages, "этап", "этапа", "этапов")} · строго последовательно (WIP=1 на проект)</div>
+  </div>` : "");
+  host.querySelectorAll("[data-runtoggle]").forEach((b) => b.addEventListener("click", () => {
+    runsTouched = true;
+    const id = b.dataset.runtoggle;
+    openRuns.has(id) ? openRuns.delete(id) : openRuns.add(id);
+    render();
+  }));
+  host.querySelectorAll("[data-open-card]").forEach((el) => el.addEventListener("click", (e) => {
+    if (e.target.closest("button[data-ask],button[data-runtoggle],a")) return;
+    const card = cardById(el.dataset.openCard); if (!card) return;
+    card.column === "asking" ? openAsk(card.id) : openDetail(card.id);
+  }));
+  host.querySelectorAll("[data-ask]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); openAsk(b.dataset.ask); }));
   host.querySelectorAll("[data-planreopen]").forEach((b) => b.addEventListener("click", () => onPlanReopen(b.dataset.planreopen)));
   host.querySelectorAll("[data-planclose]").forEach((b) => b.addEventListener("click", () => onPlanClose(b.dataset.planclose)));
 }
@@ -637,7 +750,7 @@ async function onPlanClose(planId) {
   if (!confirm(`Убрать прогон с доски?${done ? ` Готовых карточек уйдёт в архив: ${done}.` : ""} Прогон, PR и история останутся.`)) return;
   try {
     const r = await api(`/api/plans/${planId}?withCards=1`, { method: "DELETE" });
-    if (planFilter === planId) planFilter = null;
+    openRuns.delete(planId);
     toast(`Убрано с доски${(r.archived || []).length ? `: <strong>${r.archived.length} карточек</strong>` : ""} · прогон и PR остались в истории`);
     loadBoard();
   } catch (err) { toast("Не удалось убрать: " + err.message); }
