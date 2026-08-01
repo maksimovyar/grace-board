@@ -61,6 +61,11 @@ const BIN_PATH_HINT = process.env.GRACE_BIN_PATH || [
 // pinned per-agent in the gfd-* files; the orchestrator uses the session default.
 const RIGORS = ["grace", "off"];          // GRACE semantic markup on/off
 const AUTONOMIES = ["ask", "auto"];       // Plan Run §5.3: ask = human picks forks · auto = agent picks, hard-floor still stops
+// v4 Ш0: the board-level brake. Three positions differ ONLY in what is allowed to finish
+// playing. "now" is deliberately NOT a stored value — it is an ACTION (SIGTERM + pause)
+// that leaves the board in "after-stage"; see FUNC_hold.
+const HOLDS = ["off", "after-stage", "after-run"];
+const HOLD_RETRY_MIN = 2;                 // backoff between failed relaunch attempts after a hold is lifted
 // Global autonomy default (board.autonomy), overridable per card (card.autonomy). Cached in a
 // module var so the prompt builders resolve effAutonomy() without threading `board` everywhere;
 // readBoard() refreshes it from disk on every read, PATCH /api/settings persists it.
@@ -524,6 +529,134 @@ function purgeUploads(cardId) {
   try { fs.rmSync(path.join(UPLOADS_DIR, cardId), { recursive: true, force: true }); } catch {}
 }
 
+// region FUNC_hold — the board-level brake: let it finish playing, then stand still (v4 Ш0)
+// ## @purpose Give the human a way to STOP the conveyor without killing it. Until now the
+// ##   only stop was pausing one card; "let the current run finish and don't start the next"
+// ##   was impossible short of killing the server. The three positions differ solely in what
+// ##   is allowed to finish playing — that difference is the whole feature, so it is modelled
+// ##   as data (board.hold) and not as a kill switch.
+// ## @io (board) -> holdMode/runningPlanIds are pure reads · stopNow/resumeHeld mutate cards
+// ## @invariants
+// ## - The hold lives in board.json: it survives a server restart and is lifted ONLY by a human.
+// ## - Closing a run is NOT new work: planCloseTick is never gated by the hold, so a run held
+// ##   with "after-run" still reaches its PR by its own policy.
+// ## - "now" never persists as a hold value: it kills the live run and leaves "after-stage",
+// ##   so the queue behind it cannot roll forward while the human decides.
+// ## - A card stopped by the brake keeps its queue place (paused, like the quota stop) and is
+// ##   relaunched from the furthest RECORDED point — the process context survives nothing.
+// ## @rationale Q: why is "the current run" computed as started-and-unfinished instead of
+// ##   "whoever holds the project slot right now"? A: between two stages a plan holds no slot
+// ##   at all. Keying on the live card would make "after-run" freeze the very run it promised
+// ##   to let finish, the moment it was armed in that gap.
+// ## @modulemap
+// ## FUNC 2[read]    => holdMode        — normalize board.hold, unknown value reads as "off"
+// ## FUNC 4[read]    => runningPlanIds  — plans already started and not yet finished
+// ## FUNC 6[persist] => stopNow         — SIGTERM the live run + park the card + arm after-stage
+// ## FUNC 7[persist] => resumeHeld      — hold lifted → relaunch what the brake stopped
+// GREP_SUMMARY: hold, brake, stop conveyor, after-stage, after-run, SIGTERM, resumeHeld, pausedKind stop
+// STRUCTURE: ▶ holdMode → ⊕ runningPlanIds → ⚡ stopNow(SIGTERM+pause) → ⎋ resumeHeld(tick)
+
+// Unknown / missing value reads as "off" — a corrupted field must never freeze the board.
+function holdMode(board) { return HOLDS.includes(board.hold) ? board.hold : "off"; }
+
+// Which plans count as "the current run" for `after-run`: started (some card was dispatched)
+// and not finished (some card is still short of terminal). Deliberately independent of who
+// holds the project slot this second — see @rationale.
+function runningPlanIds(board) {
+  const ids = new Set();
+  for (const plan of board.plans || []) {
+    const cards = (plan.cardIds || []).map((id) => board.cards.find((c) => c.id === id)).filter(Boolean);
+    if (!cards.length) continue;
+    if (cards.some((c) => c.dispatchedAt) && cards.some((c) => c.column !== TERMINAL && c.column !== "blocked"))
+      ids.add(plan.id);
+  }
+  return ids;
+}
+
+// "Оборвать этап сейчас": the pause flag alone does NOT stop work — nobody kills the process
+// and syncFromPipeline merely stops mirroring the card, so the agent keeps writing code while
+// the board claims it is paused. So the stop is a real SIGTERM, and only then the pause.
+// Returns the ids it actually stopped.
+function stopNow(board) {
+  const ts = new Date().toISOString();
+  const stopped = [];
+  for (const card of board.cards) {
+    if (!card.dispatchedAt || card.queued || card.paused) continue;
+    // ACTIVE_COLUMNS, not OCCUPYING_COLUMNS: in `asking` the run has already exited by design and
+    // the board is waiting on the human. There is no work there to cut short — parking such a card
+    // would only cost it a relaunch later for nothing.
+    if (!ACTIVE_COLUMNS.has(card.column)) continue;
+    if (card.runPid && isAlive(card.runPid)) { try { process.kill(card.runPid, "SIGTERM"); } catch { /* already gone */ } }
+    card.paused = true;
+    card.pausedKind = "stop";
+    card.pausedReason = "остановлено человеком";
+    card.pausedUntil = null;          // this pause has no clock: only a human lifts it
+    card.pausedAt = ts;
+    card.wardenPending = null;
+    card.notes = (card.notes || []).slice(-19);
+    card.notes.push({ ts, by: "board", class: "stop", text:
+      `Этап оборван стоп-краном на станции «${card.column}». Место в очереди сохранено; когда снимешь ` +
+      `удержание, прогон продолжится с самой дальней записанной точки — контекст процесса не переживает обрыв, ` +
+      `переживают ответы, решения и зелёные коммиты.` });
+    stopped.push(card.id);
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts, event: "hold-stop", cardId: card.id, column: card.column, pid: card.runPid || null }) + "\n"); } catch {}
+  }
+  return stopped;
+}
+
+// The hold is lifted → put back what the brake stopped. Mirror image of quotaResumeTick:
+// same resumeRun, same "furthest recorded point" rule, different reason in the RECOVERY block.
+function resumeHeld(board) {
+  if (holdMode(board) !== "off") return false;
+  const now = Date.now();
+  let changed = false;
+  for (const card of board.cards) {
+    if (!card.paused || card.pausedKind !== "stop") continue;
+    // Back off between failed relaunch attempts. Without this the tick retries every 2 s and
+    // writes a journal line each time — a card that cannot spawn would drown DISPATCH_LOG.
+    if (card.holdRetryAt && Date.parse(card.holdRetryAt) > now) continue;
+    const unpause = () => { card.paused = false; card.pausedKind = null; card.pausedReason = null; card.pausedUntil = null; card.pausedAt = null; };
+    if (!card.dispatchedAt || card.queued || card.column === TERMINAL || card.column === "backlog") {
+      unpause(); changed = true; continue;
+    }
+    const projectDir = resolveProjectDir(card.project);
+    if (!isInsideRoot(projectDir)) { unpause(); changed = true; continue; }
+    if (hasActiveForProject(board, card.project, card.id)) continue;   // WIP=1 outlives the brake
+    const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);
+    const rigor = (card.rigor && card.rigor !== "auto") ? card.rigor : "off";
+    const recovery = [
+      `RECOVERY-КОНТЕКСТ (этап был оборван человеком стоп-краном): ПРЕДЫДУЩИЙ прогон убит сигналом на станции`,
+      `«${card.column}» — это НЕ дефект кода и НЕ причина переделывать фичу. Удержание снято, продолжай работу.`,
+      `Продолжи с самого дальнего ЗЕЛЁНОГО чекпоинта: "git log --oneline" в ветке "${branchFor(card)}" → коммиты`,
+      `"green(<cardId>): …"; при необходимости "git restore --source=<sha> -- <файл>". Фичу заново НЕ начинай.`,
+    ].join("\n");
+    const { target, launch, kind } = resumeRun(card, projectDir, runDir, rigor, recovery);
+    if (launch && launch.launched) {
+      unpause();
+      card.holdRetryAt = null;
+      card.column = target;
+      card.blockReason = null;
+      card.lastColumnChangeAt = new Date().toISOString();
+      recordLaunch(card, launch, kind);
+      card.history.push({ column: target, ts: card.lastColumnChangeAt, via: "hold-resume" });
+      card.notes = (card.notes || []).slice(-19);
+      card.notes.push({ ts: card.lastColumnChangeAt, by: "board", class: "stop",
+        text: `Удержание снято — прогон продолжен со станции «${target}» (${kind}), с последнего зелёного чекпоинта.` });
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "hold-resume", cardId: card.id, kind }) + "\n"); } catch {}
+      changed = true;
+    } else {
+      // Could not spawn (bin missing, AUTORUN=0…): stay parked rather than silently die, and probe
+      // again later. The card is visibly stopped, which is the honest state.
+      card.holdRetryAt = new Date(now + HOLD_RETRY_MIN * 60000).toISOString();
+      changed = true;
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date(now).toISOString(), event: "hold-resume-failed",
+        cardId: card.id, error: (launch && launch.error) || (launch && launch.reason) || "spawn failed", retryAt: card.holdRetryAt }) + "\n"); } catch {}
+    }
+  }
+  return changed;
+}
+// endregion FUNC_hold
+
 // region FUNC_scheduleQueued — per-project WIP=1 serialization (roadmap §5.1/§5.2)
 // ## @purpose Close the shared-cwd git race (server.js spawns every run in the SAME
 // ##   projectDir): only ONE card per project may hold a live run at a time. A card
@@ -580,8 +713,14 @@ function scheduleQueued(board) {
   // S6: a subscription limit hits the ACCOUNT, so a freshly dispatched card would die on spawn
   // and burn its fuse. While the window is open the queue simply holds — order is preserved.
   if (quotaOpen(board)) return false;
+  // v4 Ш0: a human hold is the same early exit, just by a flag instead of a clock. "after-stage"
+  // starts nothing at all; "after-run" still feeds the stages of runs already under way.
+  const hold = holdMode(board);
+  if (hold === "after-stage") return false;
+  const holding = hold === "after-run" ? runningPlanIds(board) : null;
   for (const card of board.cards) {
     if (!card.queued) continue;
+    if (holding && !(card.planId && holding.has(card.planId))) continue;
     if (!canDispatchNow(board, card)) continue;
     dispatchNow(board, card, "queue-dispatch");
     try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.dispatchedAt, event: "queue-dispatch", cardId: card.id, project: card.project }) + "\n"); } catch {}
@@ -1908,6 +2047,9 @@ function syncFromPipeline() {
   // S6 · 0) the clock first: cards that were waiting out a subscription limit go back to work
   // before the liveness watchdog gets a chance to read a just-resumed card as a dead one.
   if (quotaResumeTick(board, now)) changed = true;
+  // v4 Ш0 · 0b) same reasoning for the brake: a hold the human just lifted must relaunch what it
+  // stopped BEFORE the watchdog sees a dispatched card with a dead pid and calls it blocked.
+  if (resumeHeld(board)) changed = true;
   for (const card of board.cards) {
     if (!card.dispatchedAt || card.column === TERMINAL || card.column === "blocked") continue;
     // S4 §2.2: a paused card is NOT broken — it is waiting out an external limit. Keep its
@@ -2244,13 +2386,23 @@ async function handleApi(req, res, urlPath) {
     return sendJSON(res, 200, readBoard());
   }
 
-  // PATCH /api/settings -> board-wide defaults. Today: the global autonomy (§5.3 header toggle).
+  // PATCH /api/settings -> board-wide defaults: the global autonomy (§5.3 header toggle) and
+  // the v4 Ш0 brake. `hold: "now"` is an ACTION, not a stored position — it SIGTERMs whatever is
+  // live and leaves the board in "after-stage", so the queue behind it cannot roll forward.
   if (req.method === "PATCH" && urlPath === "/api/settings") {
     const b = await readBody(req);
     const board = readBoard();
     if (AUTONOMIES.includes(b.autonomy)) { board.autonomy = b.autonomy; GLOBAL_AUTONOMY = b.autonomy; }
+    let stopped = null;
+    if (b.hold !== undefined) {
+      if (b.hold === "now") { stopped = stopNow(board); board.hold = "after-stage"; }
+      else if (HOLDS.includes(b.hold)) board.hold = b.hold;
+      else return sendJSON(res, 400, { error: `hold must be one of ${HOLDS.join(" | ")} | now` });
+      board.holdSetAt = new Date().toISOString();
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: board.holdSetAt, event: "hold-set", hold: board.hold, asked: b.hold, stopped }) + "\n"); } catch {}
+    }
     writeBoard(board);
-    return sendJSON(res, 200, { autonomy: board.autonomy || GLOBAL_AUTONOMY });
+    return sendJSON(res, 200, { autonomy: board.autonomy || GLOBAL_AUTONOMY, hold: holdMode(board), stopped });
   }
 
   // GET /api/plans/:planId/manifest -> plan.result.releaseManifest (§6.1): accumulated,
