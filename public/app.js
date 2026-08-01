@@ -564,10 +564,66 @@ function renderPulse(n) {
   el.innerHTML = n ? `ждут тебя <b>${n}</b>` : "тебя не ждут";
 }
 
+// ══ v4 Ш5 · полка закрытого ══════════════════════════════════════════════════
+// @purpose Прогон, по которому доска больше ничего не сделает сама, не должен занимать место
+//   среди работающих — но и исчезать ему нельзя: у него остались PR, приёмка и карточки.
+//   Красная приёмка живёт ЗДЕСЬ, а не в зоне «Требует меня»: конвейер по ней не стоит, решение
+//   не срочное. Но то, что PR остался черновиком, обязано быть видно — раньше это лежало
+//   только в notice внутри данных, и на доске об этом не было ни слова.
+// STRUCTURE: ▶ closeState → ⊕ CLOSE_WORD → ⚡ renderShelf → ⎋ «Убрать с доски» (Ш3)
+const CLOSE_WORD = {
+  "pr-ready": ["✓", "закрыт · PR за тобой", "мерж руками — политика прогона"],
+  closed: ["✓", "закрыт", "смержено и раскатано по политике"],
+  failed: ["✕", "провален", "приёмка красная — PR оставлен черновиком, деплоя не было"],
+};
+function shelfRowHTML(plan) {
+  const st = closeState(plan);
+  const [ic, word, why] = CLOSE_WORD[st] || ["·", st, ""];
+  const cards = (plan.cardIds || []).map(cardById).filter(Boolean);
+  const onBoard = cards.filter((c) => !c.archived).length;
+  const a = (plan.result || {}).acceptance, pr = (plan.result || {}).pr;
+  const chips = [`<span class="tag tag--${st === "failed" ? "bad" : "ok"}">${ic} ${esc(word)}</span>`];
+  if (a) chips.push(`<span class="tag tag--${a.passed ? "ok" : "bad"}" title="${esc((a.checks || []).map((c) => `${c.status}: ${c.title}`).join("\n"))}">приёмка ${(a.checks || []).filter((c) => c.status === "pass").length}/${(a.checks || []).length}</span>`);
+  // Черновик называется черновиком: PR по красной приёмке не смержить, и это видно сразу.
+  if (pr && pr.url) chips.push(`<a class="tag${pr.draft ? " tag--bad" : ""}" href="${esc(safeUrl(pr.url) || "#")}" target="_blank" rel="noopener">PR${pr.draft ? " · черновик" : ""} →</a>`);
+  else if (pr && pr.error) chips.push(`<span class="tag tag--bad" title="${esc(pr.error)}">PR не создан</span>`);
+  chips.push(`<span class="tag">${onBoard ? `${onBoard} на доске` : "карточек нет"}</span>`);
+  return `<div class="done${st === "failed" ? " done--failed" : ""}">
+    <div class="done__head">
+      <span class="done__ic">${ic}</span>
+      <span class="done__t">${esc(plan.goal || "Прогон " + plan.id)}</span>
+      <div class="done__meta">${chips.join("")}</div>
+      ${onBoard ? `<button class="done__act" type="button" data-planclose="${esc(plan.id)}">Убрать с доски</button>` : ""}
+      ${st === "failed" ? `<button class="done__act" type="button" data-planreopen="${esc(plan.id)}" title="если прогон провалила не работа, а лимит подписки">↻ переиграть приёмку</button>` : ""}
+    </div>
+    <!-- notice приходит от сервера и всегда конкретнее общей формулировки исхода; выводить
+         оба значит написать одно и то же дважды подряд -->
+    <div class="done__body">${esc(((plan.result || {}).notice || {}).text || why)}</div>
+  </div>`;
+}
+function renderShelf() {
+  const host = document.getElementById("shelfHost");
+  if (!host) return;
+  const shelved = (state.plans || []).filter((p) => CLOSED_STATES.has(closeState(p)));
+  if (!shelved.length) { host.innerHTML = ""; return; }
+  const red = shelved.filter((p) => closeState(p) === "failed").length;
+  const held = shelved.reduce((n, p) => n + (p.cardIds || []).map(cardById).filter((c) => c && !c.archived).length, 0);
+  host.innerHTML = `<section class="shelf">
+    <div class="shelf__head">Закрытые прогоны</div>
+    ${shelved.map(shelfRowHTML).join("")}
+    <div class="shelf__note">${plural(shelved.length, "закрытый прогон", "закрытых прогона", "закрытых прогонов")}${red ? `, из них ${red} с красной приёмкой` : ""} · держат ${plural(held, "карточку", "карточки", "карточек")} на доске</div>
+  </section>`;
+  host.querySelectorAll("[data-planclose]").forEach((b) => b.addEventListener("click", () => onPlanClose(b.dataset.planclose)));
+  host.querySelectorAll("[data-planreopen]").forEach((b) => b.addEventListener("click", () => onPlanReopen(b.dataset.planreopen)));
+}
+
 function renderRails() {
   const host = document.getElementById("railHost");
   if (!host) return;
-  const plans = (state.plans || []).filter((p) => !p.archived && (p.cardIds || []).some((id) => cardById(id)));
+  // Закрытые уезжают на полку (Ш5) — среди работающих им не место. `deploy-hold` остаётся:
+  // он ещё не закрыт, доска ждёт человека и продолжит сама.
+  const plans = (state.plans || []).filter((p) => !p.archived && !CLOSED_STATES.has(closeState(p))
+    && (p.cardIds || []).some((id) => cardById(id)));
   host.innerHTML = quotaBannerHTML() + plans.map(railHTML).join("");
   host.querySelectorAll("[data-planfilter]").forEach((b) => b.addEventListener("click", () => { planFilter = planFilter === b.dataset.planfilter ? null : b.dataset.planfilter; render(); }));
   host.querySelectorAll("[data-planreopen]").forEach((b) => b.addEventListener("click", () => onPlanReopen(b.dataset.planreopen)));
@@ -596,7 +652,7 @@ function render() {
   ensureAutonomyToggle(); paintAutonomy();
   bindBrake(); renderHold();
   renderPulse(renderAttn());
-  renderRails();
+  renderRails(); renderShelf();
   stripEl.innerHTML = stripHTML();
   const parts = [stationHTML("backlog")];
   parts.push(`<div class="lever" data-drop="todo" id="lever" title="перетащи карточку через рычаг — команда возьмёт задачу"><span class="lever__knob"></span><span class="lever__label">launch</span></div>`);
