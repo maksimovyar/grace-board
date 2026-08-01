@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ps -o pid,ppid,etime,rss,stat,command -p 74763)",
+      "Bash(ps -eo pid,ppid,etime,rss,stat,command)",
+      "Edit(/.claude/skills/graceboard-plan/**)",
+      "Bash(sed -n '527,595px' /Users/vm/Projects/grace-board/server.js 2>/dev/null; sed -n '527,595p' /Users/vm/Projects/grace-board/server.js)",
+      "Bash(grep -n \"^function\\\\|^const\\\\|^async function\\\\|=>\\\\s*{$\" /Users/vm/Projects/grace-board/public/app.js)",
+      "Bash(cat >> *)"
+    ],
+    "additionalDirectories": [
+      "/Users/vm/Projects/grace-board",
+      "/Users/vm/Projects/grace-board/.claude/skills/graceboard-plan"
+    ]
+  }
+}
