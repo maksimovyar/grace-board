@@ -21,9 +21,17 @@
     </div>
   </div>
   <nav class="strip" id="strip" aria-label="станции"></nav>
+  <!-- v4 Ш0 · стоп-кран: три положения, у каждого сказано, что доиграет и чего это стоит -->
+  <div class="brake" id="brake">
+    <button class="brake__btn" id="brakeBtn" type="button" aria-haspopup="menu" aria-expanded="false">⏸ Остановить</button>
+    <div class="brake__menu" id="brakeMenu" role="menu"></div>
+  </div>
   <button class="btn btn--run" id="openLaunch" type="button">⚡ Прогон</button>
   <button class="btn btn--solid" id="openComposer" type="button">+ Новая задача</button>
 </header>
+
+<!-- взведённое удержание: что доигрывает и сколько осталось (v4 Ш0) -->
+<div id="holdHost"></div>
 
 <!-- plan-rail(s) — запущенные прогоны над колонками (§2, S4); app.js наполняет из board.plans -->
 <div class="railhost" id="railHost"></div>

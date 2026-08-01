@@ -360,6 +360,120 @@ function quotaBannerHTML() {
     ${q.raw ? `<span class="qbanner__raw" title="строка из лога прогона">${esc(q.raw)}</span>` : ""}
   </div>`;
 }
+// ══ v4 Ш0 · стоп-кран ═══════════════════════════════════════════════════════
+// @purpose Остановить конвейер, не убивая его. Три положения отличаются ровно тем, что успеет
+//   доиграть, — поэтому у каждого пункта сказано И что доигрывает, И когда примерно встанет,
+//   И чего это будет стоить. Оценка считается из фактических длительностей закрытых этапов
+//   этого прогона, а не выдумывается: цифра, которой нельзя верить, хуже отсутствия цифры.
+// STRUCTURE: ▶ holdView → ⊕ avgStageMin/stopCost → ⚡ brakeMenuHTML → ⎋ renderHold(полоса)
+const AGENT_COLUMNS = new Set(["asking", "implementing", "verifying", "reviewing"]);
+const HOLD_WORD = { "after-stage": "после текущего этапа", "after-run": "после текущего прогона" };
+// Цена обрыва по фазам — из Ш0.1: контекст процесса не переживает ничего, переживают ответы,
+// решения и зелёные коммиты. Отсюда арх-фаза стоит минут работы агента, а сборка — отката.
+const STOP_COST = {
+  asking: "вопросы и решения архитектора придётся собрать заново · ответы блока 1 сохранятся",
+  implementing: "вернётся к последнему зелёному коммиту · несохранённое пропадёт",
+  verifying: "проверка пойдёт заново · код на месте",
+  reviewing: "ревью пойдёт заново · код на месте",
+};
+// Сервер хранит три положения; «остановлен сейчас» — это after-stage плюс карточки, которые
+// стоп-кран действительно оборвал. Разводим здесь, чтобы полоса не врала про состояние.
+function holdView() {
+  const h = state.hold === "after-stage" || state.hold === "after-run" ? state.hold : "off";
+  if (h === "after-stage" && state.cards.some((c) => c.paused && c.pausedKind === "stop")) return "now";
+  return h;
+}
+const liveCard = () => state.cards.find((c) => c.dispatchedAt && !c.queued && !c.paused && AGENT_COLUMNS.has(c.column));
+const planStagesLeft = (plan) => (plan.cardIds || []).map(cardById).filter((c) => c && c.column !== "ready").length;
+// Средняя длительность закрытого этапа этого прогона, в минутах. Только по фактическим данным:
+// нет закрытых этапов — нет и оценки, а не «примерно час».
+function avgStageMin(plan) {
+  if (!plan) return 0;
+  const spans = (plan.cardIds || []).map(cardById).filter((c) => c && c.column === "ready").map((c) => {
+    const first = (c.history || []).find((h) => h.column !== "backlog" && h.column !== "todo");
+    if (!first || !c.lastColumnChangeAt) return 0;
+    return (Date.parse(c.lastColumnChangeAt) - Date.parse(first.ts)) / 60000;
+  }).filter((m) => m > 0);
+  return spans.length ? Math.round(spans.reduce((a, b) => a + b, 0) / spans.length) : 0;
+}
+function etaText(plan, stages) {
+  const avg = avgStageMin(plan);
+  return avg ? ` · ~${Math.round(avg * stages)} мин по средней длительности этапа (${avg} мин)` : "";
+}
+function stopCost() {
+  const c = liveCard();
+  if (!c) return "сейчас никто не работает — встанет только очередь";
+  const plan = planOfCard(c);
+  const s = plan ? `S${stageOf(c, plan).n} · ` : "";
+  return s + (STOP_COST[c.column] || "этап начнётся заново");
+}
+function brakeMenuHTML() {
+  const c = liveCard(), plan = c ? planOfCard(c) : null;
+  const left = plan ? planStagesLeft(plan) : 0;
+  const queued = (state.plans || []).filter((p) => !p.archived && closeState(p) === "running"
+    && !(p.cardIds || []).some((id) => (cardById(id) || {}).dispatchedAt)).length;
+  const opts = [
+    ["after-stage", "Дать доработать этап", `текущий этап дойдёт до конца, следующий не начнётся${plan ? etaText(plan, 1) : ""}`, ""],
+    ["after-run", "Дать доработать прогон", left
+      ? `осталось ${left} этап.${etaText(plan, left)}${queued ? ` · следующий прогон (их ${queued} в очереди) не стартует` : " · следующий прогон не стартует"}`
+      : "текущий прогон закроется по своей политике, следующий не стартует", ""],
+    ["now", "Оборвать этап сейчас", stopCost(), " brake__opt--now"],
+  ];
+  if (holdView() !== "off") opts.push(["off", "Отменить удержание", "конвейер продолжит сам", ""]);
+  return opts.map(([v, t, s, mod]) =>
+    `<button class="brake__opt${mod}" type="button" role="menuitem" data-hold="${v}"><b>${t}</b><span>${esc(s)}</span></button>`).join("");
+}
+function renderHold() {
+  const btn = document.getElementById("brakeBtn"), menu = document.getElementById("brakeMenu"), host = document.getElementById("holdHost");
+  if (!btn || !menu || !host) return;
+  const view = holdView();
+  btn.textContent = view === "off" ? "⏸ Остановить" : view === "now" ? "⏸ остановлен" : `⏸ ${HOLD_WORD[view]}`;
+  btn.classList.toggle("is-on", view !== "off");
+  if (!menu.hasAttribute("data-open")) menu.innerHTML = brakeMenuHTML();
+  if (view === "off") { host.innerHTML = ""; return; }
+  const c = liveCard(), plan = c ? planOfCard(c) : null;
+  const left = plan ? planStagesLeft(plan) : 0;
+  const body = view === "now"
+    ? `<b>Конвейер остановлен.</b><span>этап оборван · место в очереди сохранено · при возобновлении продолжит с последнего записанного шага</span>`
+    : view === "after-stage"
+      ? `<b>Конвейер встанет после текущего этапа.</b><span>${c ? `этап доигрывает${etaText(plan, 1)}` : "сейчас никто не работает"} · новые этапы и прогоны не запускаются</span>`
+      : `<b>Конвейер встанет после текущего прогона.</b><span>${left ? `осталось ${left} этап.${etaText(plan, left)} · ` : ""}прогон закроется по политике, следующий не стартует</span>`;
+  host.innerHTML = `<div class="holdbar" role="status">
+    <span class="holdbar__ic">⏸</span>
+    <div class="holdbar__b">${body}</div>
+    <div class="holdbar__acts">
+      ${view === "now" ? "" : `<button class="holdbar__act" type="button" data-hold="now">Встать сейчас</button>`}
+      <button class="holdbar__act" type="button" data-hold="off">Отменить</button>
+    </div>
+  </div>`;
+  host.querySelectorAll("[data-hold]").forEach((b) => b.addEventListener("click", () => setHold(b.dataset.hold)));
+}
+async function setHold(v) {
+  try {
+    const r = await api("/api/settings", { method: "PATCH", body: JSON.stringify({ hold: v }) });
+    const stopped = (r.stopped || []).length;
+    toast(v === "off" ? "Удержание снято — конвейер продолжит сам"
+      : v === "now" ? `Этап на паузе · <strong>место в очереди сохранено</strong>${stopped ? ` · оборвано: ${stopped}` : ""}`
+      : `Конвейер встанет <strong>${HOLD_WORD[v]}</strong>`);
+    loadBoard();
+  } catch (err) { toast("Не удалось: " + err.message); }
+}
+function bindBrake() {
+  const btn = document.getElementById("brakeBtn"), menu = document.getElementById("brakeMenu");
+  if (!btn || !menu || btn.dataset.bound) return;
+  btn.dataset.bound = "1";
+  const close = () => { menu.removeAttribute("data-open"); btn.setAttribute("aria-expanded", "false"); };
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (menu.hasAttribute("data-open")) return close();
+    menu.innerHTML = brakeMenuHTML();
+    menu.querySelectorAll("[data-hold]").forEach((b) => b.addEventListener("click", () => { close(); setHold(b.dataset.hold); }));
+    menu.setAttribute("data-open", "1"); btn.setAttribute("aria-expanded", "true");
+  });
+  document.addEventListener("click", (e) => { if (!menu.contains(e.target)) close(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+}
+
 function renderRails() {
   const host = document.getElementById("railHost");
   if (!host) return;
@@ -390,6 +504,7 @@ async function onPlanReopen(planId) {
 
 function render() {
   ensureAutonomyToggle(); paintAutonomy();
+  bindBrake(); renderHold();
   renderRails();
   stripEl.innerHTML = stripHTML();
   const parts = [stationHTML("backlog")];

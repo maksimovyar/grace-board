@@ -1535,6 +1535,21 @@ function spawnRun(projectDir, runDir, prompt, logName) {
 }
 
 // Asking · block 1 (FUNCTIONAL) — ask up to 8 questions about WHAT to build, then stop.
+// ## @purpose Block 1 ALSO classifies the architecture gate, so a card with nothing to ask
+// ##   goes asking→build in ONE session instead of two. Measured on run 13dc2476 (7 cards):
+// ##   the separate arch pass burned 663k cache-write + 1.63M cache-read + 7.2 min of
+// ##   wall-clock to answer «архитектурных развилок нет» 7 times out of 7 — a fresh process
+// ##   re-warms ~115k of system prompt to re-read the same brief this session already has.
+// ## @invariants
+// ## - The gate is NOT skipped, it MOVES: the same escalation threshold as launchAskArchitecture.
+// ## - Priority is strict — functional questions WIN. `questions` non-empty ⇒ archQuestions is
+// ##   left empty and block 2 runs later (POST /answers), because architecture must be classified
+// ##   AFTER the human's functional answers, not against a guess about them.
+// ## - launchAskArchitecture stays and is still reached two ways: POST /api/tasks/:id/answers
+// ##   (human answered block 1) and the supervisor's `functional-done` branch (older cards
+// ##   mid-flight, whose runDir board.json predates this prompt).
+// ## @rationale Q: why not delete block 2 outright? A: the human-answered path genuinely needs a
+// ##   second session — its input (the answers) does not exist when block 1 runs.
 function launchAskFunctional(card, projectDir, runDir) {
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
@@ -1548,7 +1563,8 @@ function launchAskFunctional(card, projectDir, runDir) {
     dirs ? `${dirs}\n` : ``,
     auto ? `${auto}\n` : ``,
     planDec ? `${planDec}\n` : ``,
-    `AUTONOMOUS HEADLESS — ЭТАП ASKING, БЛОК 1 (ФУНКЦИОНАЛ). Сделай discovery + краткую разведку, затем ОСТАНОВИСЬ.`,
+    `AUTONOMOUS HEADLESS — ЭТАП ASKING. Сделай discovery + краткую разведку, классифицируй ОБА гейта`,
+    `(функционал и архитектуру) в ЭТОЙ сессии, затем ОСТАНОВИСЬ. НЕ пиши код — build запустит диспетчер.`,
     `ПОРОГ ЭСКАЛАЦИИ — спрашивать человека МОЖНО ТОЛЬКО если решение: (а) меняет ПОВЕДЕНИЕ продукта или объём`,
     `(что система делает/не делает для пользователя), ЛИБО (б) это настоящая развилка с внешними последствиями`,
     `(стоимость, vendor lock-in, юридика/комплаенс, необратимость, форма данных в контракте), ЛИБО (в) по нему`,
@@ -1557,14 +1573,27 @@ function launchAskFunctional(card, projectDir, runDir) {
     `глубину/способ тестирования, формат логов — всё системное/имплементационное решай САМ по best-practice и`,
     `инвариантам проекта (CLAUDE.md/ARCHITECTURE.md) и записывай принятое решение с кратким обоснованием в "answers".`,
     ``,
-    `• ЕСТЬ что спросить человека → сформулируй 3–8 конкретных вопросов ПО ФУНКЦИОНАЛУ И СМЫСЛУ (поведение,`,
-    `  сценарии, данные, роли/доступ, граничные случаи, что НЕ входит в объём). Запиши top-level массив`,
-    `  "questions" (короткие строки), выставь "column":"asking", "askStage":"functional", перезапиши board.json`,
-    `  и ВЫЙДИ — человек ответит. НЕ проектируй архитектуру и НЕ пиши код.`,
-    `• НЕЧЕГО спрашивать (типично для фундаментальных core/infra-этапов — норма 0 вопросов) → выставь`,
+    `Тот же порог применяется и к АРХИТЕКТУРНОЙ развилке: она идёт человеку, только если это настоящий выбор`,
+    `с внешними последствиями (стоимость, vendor lock-in, юридика/комплаенс/резидентность/провайдер,`,
+    `необратимость, форма модели данных, влияющая на контракт). Детали стека, имена, паттерны, структура`,
+    `файлов, глубина тестов, формат логов — НЕ развилка: решай САМ.`,
+    ``,
+    `Выбери РОВНО ОДИН из трёх исходов, перезапиши board.json и ВЫЙДИ:`,
+    `• ЕСТЬ что спросить человека ПО ФУНКЦИОНАЛУ → сформулируй 3–8 конкретных вопросов (поведение, сценарии,`,
+    `  данные, роли/доступ, граничные случаи, что НЕ входит в объём). Запиши top-level массив "questions"`,
+    `  (короткие строки), выставь "column":"asking", "askStage":"functional". Архитектуру в этом случае НЕ`,
+    `  классифицируй и "archQuestions" НЕ пиши — её оценит блок 2 ПОСЛЕ ответов человека (они могут её изменить).`,
+    `• Функциональных вопросов нет, но ЕСТЬ настоящая АРХИТЕКТУРНАЯ развилка → заполни "answers", а для КАЖДОЙ`,
+    `  развилки предложи 2–4 варианта: top-level "archQuestions", элемент { "id":"d1", "q":"<вопрос>",`,
+    `  "options":[ { "id":"o1", "title":"<краткий заголовок>", "desc":"<1–2 фразы>", "pros":["<плюс>", ...],`,
+    `  "cons":["<минус>", ...], "recommended":true|false } , ... ] }. Ровно ОДИН вариант в развилке помечай`,
+    `  "recommended":true. Выставь "askStage":"architecture", "column":"asking" — человек выберет решения.`,
+    `• НЕТ НИ ТОГО, НИ ДРУГОГО (типично для фундаментальных core/infra-этапов — норма 0 вопросов) → выставь`,
     `  "questions":[], сам заполни top-level "answers":[{"q":"…","a":"… + обоснование"}] принятыми решениями,`,
-    `  выставь "askStage":"functional-done", "column":"asking", перезапиши board.json и ВЫЙДИ. Человека НЕ ждём —`,
-    `  диспетчер сам запустит блок 2 (архитектуру).`,
+    `  выставь "archQuestions":[] и "archDecisions":[] (ПУСТОЙ массив = маркер «гейт пройден, выбирать нечего»;`,
+    `  принятые тобой системные решения фиксируй элементами вида {"q":"…","chosenTitle":"…","ownText":"<обоснование>"}),`,
+    `  затем "askStage":"done", "column":"asking". Человека НЕ ждём — полный build до "ready" диспетчер запустит`,
+    `  САМ, НЕ строй его здесь.`,
     `Твой board.json: ${path.join(runDir, "board.json")}.`,
   ].join("\n");
   return spawnRun(projectDir, runDir, prompt, "ask-functional.log");
