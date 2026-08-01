@@ -59,7 +59,7 @@ const GROUPS = [
   { key: "ready", name: "Готово", no: "04", cols: ["ready"] },
 ];
 const groupOf = (col) => GROUPS.find((g) => g.cols.includes(col)) || GROUPS[0];
-const groupCards = (g) => liveCards().filter((c) => !c.planId && g.cols.includes(c.column));
+const groupCards = (g) => visibleCards().filter((c) => !c.planId && g.cols.includes(c.column));
 // Лампа группы горит по самой громкой карточке в ней: остановка важнее работы, работа важнее тишины.
 function groupLamp(g, cards) {
   if (cards.some((c) => c.column === "blocked")) return "var(--s-blocked)";
@@ -201,7 +201,7 @@ function cardHTML(card) {
         card.paused ? esc("ран остановлен — вопросы ещё не записаны") : esc("агент составляет вопросы…")}</div>`;
     } else {
       const label = s === "func"
-        ? `${nQ} вопросов · ответь`
+        ? `${plural(nQ, "вопрос", "вопроса", "вопросов")} · ответь`
         : s === "arch-pick"
           ? `Блок 1 готов · ${card.archQuestions.length} решений по архитектуре`
           : `Блок 1 готов · архитектор думает…`;
@@ -239,13 +239,28 @@ function cardHTML(card) {
 
 // v4 Ш3: архивная карточка — законченная жизнь, а не удалённая задача. Из колонок она уходит
 // (иначе Ready копится десятками), но остаётся в прогоне и в данных.
+// ══ v4 Ш9 · поиск, фильтр по проекту, плотность ══════════════════════════════
+// @purpose Доска обслуживает несколько проектов сразу, и «где моя карточка» решалось глазами.
+//   Фильтры сужают И колонки, И треки — иначе прогон остался бы виден там, где его карточек
+//   уже не показывают. Плотность — пять переменных, а не второй набор классов.
+let findQ = "", projQ = "";
+const matches = (c) => {
+  if (projQ && c.project !== projQ) return false;
+  if (!findQ) return true;
+  const hay = `${c.theme || ""} ${c.description || ""} ${c.project || ""} ${c.id}`.toLowerCase();
+  return hay.includes(findQ);
+};
+// Зона «Требует меня» считается по liveCards и НЕ фильтруется: спрятать остановку из-за
+// набранного в поиске слова значит соврать на главный вопрос доски.
 const liveCards = () => state.cards.filter((c) => !c.archived);
+const visibleCards = () => liveCards().filter(matches);
 // v4 Ш6: этап прогона живёт в треке и ТОЛЬКО там. В колонках — одиночные карточки, чей путь
 // доработка не меняет: рычаг, дроп-зоны, POST /api/tasks работают как прежде.
 function stationHTML(key) {
   const g = GROUPS.find((x) => x.key === key);
   const cards = groupCards(g);
-  const empty = key === "backlog" ? "Добавь задачу и перетащи\nеё через рычаг запуска ⟶" : "—";
+  const empty = (findQ || projQ) ? "ничего не нашлось"
+    : key === "backlog" ? "Добавь задачу и перетащи\nеё через рычаг запуска ⟶" : "—";
   const inner = cards.length ? cards.map(cardHTML).join("") : `<div class="well__empty">${empty}</div>`;
   // Дроп-цель группы — её ПЕРВАЯ колонка: у «В работе» это asking, то есть ровно то, куда
   // карточка попадает при обычном запуске. Так перетаскивание сохраняет прежний смысл.
@@ -794,7 +809,9 @@ function renderRails() {
   // Закрытые уезжают на полку (Ш5) — среди работающих им не место. `deploy-hold` остаётся:
   // он ещё не закрыт, доска ждёт человека и продолжит сама.
   const plans = (state.plans || []).filter((p) => !p.archived && !CLOSED_STATES.has(closeState(p))
-    && (p.cardIds || []).some((id) => cardById(id)));
+    && (p.cardIds || []).some((id) => cardById(id))
+    // фильтры сужают и треки: прогон, ни одна карточка которого не прошла фильтр, скрыт целиком
+    && (!(findQ || projQ) || (p.cardIds || []).map(cardById).some((c) => c && matches(c)) || matches({ theme: p.goal, project: p.project, id: p.id })));
   syncOpenRuns(plans);
   const stages = plans.reduce((n, p) => n + (p.cardIds || []).length, 0);
   host.innerHTML = quotaBannerHTML() + (plans.length ? `<div class="runs">${plans.map(runHTML).join("")}
@@ -816,6 +833,50 @@ function renderRails() {
   host.querySelectorAll("[data-planreopen]").forEach((b) => b.addEventListener("click", () => onPlanReopen(b.dataset.planreopen)));
   host.querySelectorAll("[data-planclose]").forEach((b) => b.addEventListener("click", () => onPlanClose(b.dataset.planclose)));
 }
+// Плотность — пять переменных на body, а не второй набор классов: одна и та же разметка
+// просто дышит иначе. Выбор переживает перезагрузку, иначе его пришлось бы делать каждый раз.
+function setDensity(v) {
+  document.body.dataset.d = v;
+  try { localStorage.setItem("gb.density", v); } catch { /* приватный режим — переживём */ }
+  document.querySelectorAll("#densSeg .seg__opt").forEach((o) => o.classList.toggle("is-on", o.dataset.dens === v));
+}
+function syncProjOptions() {
+  const sel = document.getElementById("projBox");
+  if (!sel) return;
+  const projects = [...new Set(liveCards().map((c) => c.project).filter(Boolean))].sort();
+  const sig = projects.join("|");
+  if (sel.dataset.sig === sig) return;
+  sel.dataset.sig = sig;
+  sel.innerHTML = `<option value="">все проекты</option>` + projects.map((p) => `<option${p === projQ ? " selected" : ""}>${esc(p)}</option>`).join("");
+}
+function bindTools() {
+  const find = document.getElementById("findBox"), proj = document.getElementById("projBox"), dens = document.getElementById("densSeg");
+  if (!find || find.dataset.bound) return;
+  find.dataset.bound = "1";
+  find.addEventListener("input", () => { findQ = find.value.trim().toLowerCase(); render(); });
+  proj.addEventListener("change", () => { projQ = proj.value; render(); });
+  dens.querySelectorAll(".seg__opt").forEach((o) => o.addEventListener("click", () => setDensity(o.dataset.dens)));
+  // «/» — фокус в поиск, Escape — сброс. Ни то, ни другое не должно срабатывать во время ввода.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "/" && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) { e.preventDefault(); find.focus(); find.select(); }
+    if (e.key === "Escape" && document.activeElement === find) { find.value = ""; findQ = ""; find.blur(); render(); }
+  });
+  let saved = null;
+  try { saved = localStorage.getItem("gb.density"); } catch {}
+  setDensity(saved === "comfy" ? "comfy" : "dense");
+  // Подсказка — для первого раза. Она висела поверх нижней карточки в каждой сессии.
+  const hint = document.getElementById("hint");
+  if (hint) {
+    let seen = false;
+    try { seen = localStorage.getItem("gb.hintSeen") === "1"; } catch {}
+    hint.hidden = seen;
+    document.getElementById("hintX").addEventListener("click", () => {
+      hint.hidden = true;
+      try { localStorage.setItem("gb.hintSeen", "1"); } catch {}
+    });
+  }
+}
+
 // v4 Ш3: «убрать с доски» = снять рельс И увести законченные карточки прогона в архив. Идущие
 // этапы остаются: убирать с доски работу, которая ещё едет, значит спрятать живой прогон.
 async function onPlanClose(planId) {
@@ -835,8 +896,21 @@ async function onPlanReopen(planId) {
   catch (err) { toast("Не удалось переиграть: " + err.message); }
 }
 
-function render() {
-  ensureAutonomyToggle(); paintAutonomy();
+// v4 Ш9: доска перерисовывается целиком каждые 2.5 с. Без этого любой фоновый тик утаскивал
+// длинную колонку обратно наверх прямо под курсором — читать список было невозможно.
+function keepScroll(fn) {
+  const pos = [...document.querySelectorAll(".well")].map((w) => [w.closest(".station").dataset.col, w.scrollTop]);
+  const win = window.scrollY;
+  fn();
+  for (const [col, top] of pos) {
+    const w = document.querySelector(`.station[data-col="${col}"] .well`);
+    if (w && top) w.scrollTop = top;
+  }
+  if (win) window.scrollTo({ top: win });
+}
+function render() { keepScroll(paint); }
+function paint() {
+  ensureAutonomyToggle(); paintAutonomy(); bindTools(); syncProjOptions();
   bindBrake(); renderHold();
   renderPulse(renderAttn());
   renderRails(); renderShelf();
@@ -884,11 +958,41 @@ async function onDrop(targetCol) {
   } catch (err) { toast("Не удалось переместить: " + err.message); }
 }
 
-async function onDelete(e) {
-  const id = e.currentTarget.dataset.del;
-  if (!confirm("Удалить задачу?")) return;
-  try { await api(`/api/tasks/${id}`, { method: "DELETE" }); state.cards = state.cards.filter((c) => c.id !== id); closeAll(); render(); }
-  catch (err) { toast("Не удалось удалить: " + err.message); }
+// v4 Ш9: вместо confirm() — обратимое удаление. confirm задаёт вопрос ДО того, как человек
+// увидел результат, и всё равно не даёт передумать после. Тут карточка исчезает сразу, а сам
+// DELETE уходит через окно отмены — успел нажать «Отменить», значит ничего и не было.
+const UNDO_MS = 6000;
+let pendingDelete = null;
+function onDelete(e) {
+  const id = (e.currentTarget || e).dataset ? (e.currentTarget || e).dataset.del : e;
+  const card = cardById(id);
+  if (!card) return;
+  if (pendingDelete) commitDelete();            // второе удаление подтверждает первое
+  pendingDelete = { id, card, at: Date.now() };
+  state.cards = state.cards.filter((c) => c.id !== id);
+  closeAll(); render();
+  toastUndo(`Задача «${esc((card.theme || id).slice(0, 40))}» удалена`, () => {
+    state.cards.push(pendingDelete.card); pendingDelete = null; render();
+  });
+  pendingDelete.timer = setTimeout(commitDelete, UNDO_MS);
+}
+async function commitDelete() {
+  const p = pendingDelete;
+  if (!p) return;
+  pendingDelete = null; clearTimeout(p.timer);
+  try { await api(`/api/tasks/${p.id}`, { method: "DELETE" }); }
+  catch (err) { state.cards.push(p.card); render(); toast("Не удалось удалить: " + err.message); }
+}
+function toastUndo(html, undo) {
+  toastEl.innerHTML = `${html} <button class="toast__undo" type="button">Отменить</button>`;
+  toastEl.hidden = false;
+  clearTimeout(toastTimer);
+  toastEl.querySelector(".toast__undo").addEventListener("click", () => {
+    const p = pendingDelete;
+    if (p) clearTimeout(p.timer);
+    undo(); toastEl.hidden = true; toast("Удаление отменено");
+  });
+  toastTimer = setTimeout(() => (toastEl.hidden = true), UNDO_MS);
 }
 async function onRelaunch(e) {
   const id = e.currentTarget.dataset.relaunch;
@@ -990,7 +1094,7 @@ function openDetail(id) {
     </div>`;
   const panel = document.getElementById("detailPanel");
   panel.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", closeAll));
-  panel.querySelector("[data-del-detail]").addEventListener("click", () => { if (confirm("Удалить задачу?")) api(`/api/tasks/${id}`, { method: "DELETE" }).then(() => { state.cards = state.cards.filter((c) => c.id !== id); closeAll(); render(); }); });
+  panel.querySelector("[data-del-detail]").addEventListener("click", () => onDelete({ dataset: { del: id } }));
   const edit = panel.querySelector("[data-edit]"); if (edit) edit.addEventListener("click", () => openComposer(card));
   const undraft = panel.querySelector("[data-undraft]");
   if (undraft) undraft.addEventListener("click", async () => {
