@@ -912,17 +912,6 @@ function bindTools() {
   let saved = null;
   try { saved = localStorage.getItem("gb.density"); } catch {}
   setDensity(saved === "comfy" ? "comfy" : "dense");
-  // Подсказка — для первого раза. Она висела поверх нижней карточки в каждой сессии.
-  const hint = document.getElementById("hint");
-  if (hint) {
-    let seen = false;
-    try { seen = localStorage.getItem("gb.hintSeen") === "1"; } catch {}
-    hint.hidden = seen;
-    document.getElementById("hintX").addEventListener("click", () => {
-      hint.hidden = true;
-      try { localStorage.setItem("gb.hintSeen", "1"); } catch {}
-    });
-  }
 }
 
 // v4 Ш3: «убрать с доски» = снять рельс И увести законченные карточки прогона в архив. Идущие

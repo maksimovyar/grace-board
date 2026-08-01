@@ -63,8 +63,7 @@ body{
 .btn[disabled]{opacity:.55;cursor:default;transform:none}
 
 /* ── board ── */
-/* min-height: станции не сплющиваются под высокими рельсами — вместо этого страница скроллится.
-   padding-bottom оставляет воздух под плавающей плашкой .hint. */
+/* min-height: станции не сплющиваются под высокими треками — вместо этого страница скроллится. */
 /* v4 Ш8: grid вместо ряда фиксированных станций — четыре колонки делят ширину, а не требуют её.
    overflow-x снят: горизонтальной прокрутки на доске больше нет by design. */
 .board{display:grid;grid-template-columns:1fr 54px 1fr 1.25fr 1fr;gap:0;align-items:stretch;
@@ -349,9 +348,6 @@ button.zone__act:hover{background:var(--surface-2);color:var(--ember)}
 .find input:focus~kbd{display:none}
 .tools__proj{font-family:var(--mono);font-size:11px;color:var(--ink-soft);background:var(--surface);
   border:1px solid var(--line-2);border-radius:9px;padding:8px 10px;cursor:pointer;max-width:150px;flex:none}
-.hint{display:flex;align-items:center;gap:10px}
-.hint__x{background:none;border:none;color:var(--ink-faint);font-size:12px;cursor:pointer;line-height:1}
-.hint__x:hover{color:var(--ink)}
 .toast__undo{font-family:var(--display);font-weight:600;font-size:12px;color:var(--ember);background:none;
   border:1px solid var(--ember);border-radius:8px;padding:3px 10px;margin-left:10px;cursor:pointer}
 .toast__undo:hover{background:rgba(216,91,34,.1)}
@@ -723,11 +719,6 @@ button.tag--auto:hover{border-color:var(--ink-soft)}
 .planempty{font-family:var(--mono);font-size:11.5px;color:var(--ink-faint);padding:6px 0}
 .planbody{flex:1;margin:0;padding:14px 15px;overflow:auto;background:#0c0f15;border:1px solid #232a36;border-radius:10px;
   font-family:var(--mono);font-size:11.5px;line-height:1.55;color:#c3cad7;white-space:pre-wrap;word-break:break-word}
-
-/* hint banner */
-.hint{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:30;background:var(--surface);
-  border:1px solid var(--line-2);color:var(--ink-soft);font-size:12.5px;font-family:var(--mono);padding:9px 16px;border-radius:999px;box-shadow:var(--shadow-lift)}
-.hint b{color:var(--ember)}
 
 /* toast */
 .toast{position:fixed;left:50%;top:18px;transform:translateX(-50%);z-index:60;background:var(--ink);color:#fff;
