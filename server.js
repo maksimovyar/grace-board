@@ -577,6 +577,9 @@ function dispatchNow(board, card, via) {
 // this pass — natural WIP=1 without a lock. FIFO by board array order (= creation order).
 function scheduleQueued(board) {
   let changed = false;
+  // S6: a subscription limit hits the ACCOUNT, so a freshly dispatched card would die on spawn
+  // and burn its fuse. While the window is open the queue simply holds — order is preserved.
+  if (quotaOpen(board)) return false;
   for (const card of board.cards) {
     if (!card.queued) continue;
     if (!canDispatchNow(board, card)) continue;
@@ -1044,6 +1047,9 @@ function normalizeAcceptance(raw) {
 // parks, or reads that child's output file. The tick itself never waits on anything.
 function planCloseTick(board) {
   let changed = false;
+  // S6: acceptance spawns a model run like any other — under an open quota window it would die
+  // on spawn and paint the run red for a reason that has nothing to do with the code. Hold.
+  if (quotaOpen(board)) return false;
   for (const plan of (board.plans || [])) {
     if (plan.closeStep === "closed") continue;
     const cards = planCards(board, plan);
@@ -1275,6 +1281,7 @@ function recordLaunch(card, launch, kind) {
     card.runPid = launch.pid;
     card.runKind = kind;
     card.runLog = launch.log;
+    card.runLogFrom = launch.from || 0;   // S6: read only THIS run's output, never a stale tail
     card.runStartedAt = new Date().toISOString();
   }
 }
@@ -1319,12 +1326,15 @@ function spawnRun(projectDir, runDir, prompt, logName) {
   if (!AUTORUN) return { launched: false, reason: "GRACE_AUTORUN=0" };
   if (!fs.existsSync(CLAUDE_BIN)) return { launched: false, error: "claude bin not found: " + CLAUDE_BIN };
   try {
+    // Where THIS run's output starts. Logs are appended across relaunches, so without the offset
+    // a stale «hit your limit» from an earlier attempt would keep re-arming the quota wait (S6).
+    let from = 0; try { from = fs.statSync(path.join(runDir, logName)).size; } catch {}
     const out = fs.openSync(path.join(runDir, logName), "a");
     const env = { ...process.env, PATH: `${BIN_PATH_HINT}:${process.env.PATH || ""}` };
     const args = ["-p", prompt, "--permission-mode", "bypassPermissions", "--add-dir", projectDir];
     const child = spawn(CLAUDE_BIN, args, { cwd: projectDir, env, detached: true, stdio: ["ignore", out, out] });
     child.unref();
-    return { launched: true, pid: child.pid, log: path.join(runDir, logName) };
+    return { launched: true, pid: child.pid, log: path.join(runDir, logName), from };
   } catch (e) {
     return { launched: false, error: String(e.message || e) };
   }
@@ -1678,6 +1688,181 @@ function tailLog(file, maxLines) {
   } catch { return ""; }
 }
 
+// region FUNC_quotaStop — a subscription limit is a CLOCK, not a crash (S6)
+// ## @purpose 30.07: the 5-hour limit ran out mid-run and killed three runs inside 32 s. The
+// ##   board read every death as «the run broke»: autoheal spent its one retry INSIDE the dead
+// ##   window, the card landed in `blocked` with «открой лог и перезапусти», the WIP=1 slot
+// ##   stayed occupied and the whole plan stood still for 3 h — although the limit had already
+// ##   reset at 18:10. A quota stop is not a defect: nothing is broken, the clock simply has to
+// ##   run out. So the board reads the reset time OUT OF THE RUN'S OWN LOG, pauses until then
+// ##   (a promise with a deadline, not an error), and resumes itself when the clock is up.
+// ## @io (log tail | board) -> { until, exact, raw } · card.paused/pausedKind/pausedUntil · board.quota
+// ## @invariants
+// ## - The wait is READ, never assumed: the window is 5 h but may expire 4:50 from now or in
+// ##   10 min, so only the «resets 6:10pm» stamp in the log decides. No stamp → short fallback
+// ##   probe (GRACE_QUOTA_FALLBACK_MIN), never a blind 5-hour sleep.
+// ## - A quota pause costs NO autoHealCount and never blocks: the fuse exists for broken code,
+// ##   and this card is not broken. It keeps its station, its place in the queue and its work.
+// ## - Board-wide by nature: a limit hits the ACCOUNT, so while `board.quota` is open nothing
+// ##   new is dispatched and no run is closed — otherwise the queue just feeds fresh corpses.
+// ## - Self-resuming: the ONLY exit is the clock. Resume re-enters through resumeRun() from the
+// ##   furthest green checkpoint, so a paused build continues instead of starting over.
+// ## @rationale Q: why not hand it to the warden? A: classification needs a model only when the
+// ##   evidence is ambiguous. «You've hit your limit · resets 6:10pm» is unambiguous and free to
+// ##   read — the warden stays for the cases that genuinely need judgement (§2.3).
+// ## @modulemap
+// ## FUNC 3[calc]   => parseQuotaStop   — log tail → reset clock (the only source of the wait)
+// ## FUNC 2[calc]   => nextClockTs      — «6:10pm (Europe/Moscow)» → absolute ISO instant
+// ## FUNC 2[calc]   => quotaOpen        — is the account-wide window still running?
+// ## FUNC 4[persist]=> pauseForQuota    — the non-error stop: pause + human-readable promise
+// ## FUNC 5[persist]=> quotaResumeTick  — the clock is up → resume every card that was waiting
+// GREP_SUMMARY: quota, usage limit, 5-hour limit, resets, pause, auto-resume, self-healing wait
+// STRUCTURE: ▶ run dies → ⊕ parseQuotaStop(log) → ⚡ pauseForQuota → ⏳ clock → ⎋ quotaResumeTick
+
+const QUOTA_FALLBACK_MIN = Number(process.env.GRACE_QUOTA_FALLBACK_MIN || 30);   // no clock in the log → probe again
+const QUOTA_MAX_WAIT_MIN = Number(process.env.GRACE_QUOTA_MAX_WAIT_MIN || 360);  // sanity cap: the window is 5 h
+const QUOTA_MARK = /(hit your (usage |session )?limit|usage limit reached|limit reached|limit exceeded|out of (usage|credits)|rate.?limit(ed)?)/i;
+// «resets 6:10pm (Europe/Moscow)» · «reset at 3pm» · «try again at 18:10» — hour, optional minutes,
+// optional am/pm, optional IANA zone. The zone matters: the log speaks the user's zone, not UTC.
+const QUOTA_CLOCK = /(?:resets?|reset at|resets at|try again(?: at)?|available again(?: at)?)\D{0,12}?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s*\(([A-Za-z]+\/[A-Za-z_\-0-9+]+)\))?/i;
+
+// The next instant whose wall-clock in `tz` is hh:mm. Intl gives the zone's current time without
+// a date library; «already passed today» can only mean tomorrow.
+function nextClockTs(hour, minute, tz, nowMs) {
+  let cur;
+  try {
+    const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz || undefined, hour12: false,
+      hour: "2-digit", minute: "2-digit", second: "2-digit" }).formatToParts(new Date(nowMs));
+    const p = {}; for (const x of parts) if (x.type !== "literal") p[x.type] = Number(x.value);
+    cur = (p.hour % 24) * 3600 + p.minute * 60 + p.second;
+  } catch {
+    const d = new Date(nowMs); cur = d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
+  }
+  let delta = (hour * 3600 + minute * 60) - cur;
+  if (delta <= 0) delta += 24 * 3600;
+  return new Date(nowMs + delta * 1000).toISOString();
+}
+// Read the stop out of a log tail. Returns null when the tail shows no limit at all — that is the
+// normal case, and it is what keeps a genuinely broken run on the autoheal/block path.
+function parseQuotaStop(text, nowMs) {
+  const lines = String(text || "").split(/\r?\n/).filter((l) => l.trim()).slice(-40);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!QUOTA_MARK.test(lines[i])) continue;
+    const m = QUOTA_CLOCK.exec(lines[i]);
+    const raw = lines[i].trim().slice(0, 200);
+    const fallback = new Date(nowMs + QUOTA_FALLBACK_MIN * 60000).toISOString();
+    if (!m) return { until: fallback, exact: false, raw };
+    let h = Number(m[1]) % 24; const min = Number(m[2] || 0), ap = (m[3] || "").toLowerCase();
+    if (ap === "pm" && h < 12) h += 12;
+    if (ap === "am" && h === 12) h = 0;
+    const until = nextClockTs(h, min, m[4] || null, nowMs);
+    // Further away than a whole window? Then this stamp is a LEFTOVER from an earlier run in the
+    // same appended log (its clock rolled to «tomorrow»). Probe soon instead of sleeping a day.
+    if (Date.parse(until) - nowMs > QUOTA_MAX_WAIT_MIN * 60000) return { until: fallback, exact: false, raw };
+    return { until, exact: true, raw };
+  }
+  return null;
+}
+// Only the CURRENT run's output counts: `fromBytes` (recorded at spawn) cuts off everything an
+// earlier attempt appended, so a stale limit line cannot pause a card that died for a real reason.
+function detectQuotaStop(logFile, nowMs, fromBytes) {
+  if (!logFile) return null;
+  try {
+    const size = fs.statSync(logFile).size;
+    const start = Math.max(Number(fromBytes) || 0, Math.max(0, size - 64 * 1024));
+    if (size - start <= 0) return null;
+    const fd = fs.openSync(logFile, "r");
+    const buf = Buffer.alloc(size - start);
+    fs.readSync(fd, buf, 0, size - start, start);
+    fs.closeSync(fd);
+    return parseQuotaStop(buf.toString("utf8"), nowMs);
+  } catch { return null; }
+}
+
+// Is the account-wide window still open? While it is, the board starts nothing new.
+const quotaOpen = (board, nowMs) =>
+  (board.quota && board.quota.until && Date.parse(board.quota.until) > (nowMs || Date.now())) ? board.quota : null;
+const hhmm = (iso) => { try { return new Date(iso).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }); } catch { return iso; } };
+
+// One card stops on the clock. Deliberately NOT blockCard(): no error chip, no burnt fuse, and
+// the note says what the human actually needs — nothing is lost, and when it comes back.
+function pauseForQuota(board, card, stop, how) {
+  const ts = new Date().toISOString();
+  card.paused = true;
+  card.pausedKind = "quota";
+  card.pausedReason = "лимит Claude";
+  card.pausedUntil = stop.until;
+  card.pausedAt = ts;
+  card.blockReason = null;
+  card.wardenPending = null;
+  card.quotaWaits = (card.quotaWaits || 0) + 1;
+  card.notes = (card.notes || []).slice(-19);
+  card.notes.push({ ts, by: "board", class: "quota", text:
+    `Лимит подписки Claude — прогон остановлен на станции «${card.column}»${how ? ` (${how})` : ""}. Это не ошибка: ` +
+    `сделанное сохранено, карточка держит своё место и продолжится сама в ${hhmm(stop.until)}` +
+    `${stop.exact ? "" : ` (время сброса в логе не указано — доска проверит снова через ${QUOTA_FALLBACK_MIN} мин)`}. ` +
+    `Из лога: ${stop.raw}` });
+  // Account-wide: keep the LATEST known reset, so a second card cannot shorten the wait.
+  if (!board.quota || Date.parse(board.quota.until || 0) < Date.parse(stop.until))
+    board.quota = { since: board.quota && quotaOpen(board) ? board.quota.since : ts, until: stop.until,
+      exact: stop.exact, raw: stop.raw, cardId: card.id };
+  try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts, event: "quota-pause", cardId: card.id,
+    column: card.column, until: stop.until, exact: stop.exact, raw: stop.raw }) + "\n"); } catch {}
+}
+
+// The clock is up → put everything back on the rails. Runs FIRST in the tick, before the liveness
+// watchdog can mistake a just-resumed card for a dead one.
+function quotaResumeTick(board, now) {
+  let changed = false;
+  if (board.quota && !quotaOpen(board, now)) {
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date(now).toISOString(), event: "quota-clear", until: board.quota.until }) + "\n"); } catch {}
+    board.quota = null; changed = true;
+  }
+  for (const card of board.cards) {
+    if (!card.paused || card.pausedKind !== "quota") continue;
+    if (!card.pausedUntil || Date.parse(card.pausedUntil) > now) continue;
+    const unpause = () => { card.paused = false; card.pausedKind = null; card.pausedReason = null; card.pausedUntil = null; card.pausedAt = null; };
+    // Never dispatched / queued / finished: the scheduler owns it — just lift the pause.
+    if (!card.dispatchedAt || card.queued || card.column === TERMINAL || card.column === "backlog") {
+      unpause(); changed = true; continue;
+    }
+    const projectDir = resolveProjectDir(card.project);
+    if (!isInsideRoot(projectDir)) { unpause(); changed = true; continue; }
+    // WIP=1 still holds after a global stop: if a sibling already took the project's slot,
+    // wait for the next tick rather than starting two runs in the same working copy.
+    if (hasActiveForProject(board, card.project, card.id)) continue;
+    const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);
+    const rigor = (card.rigor && card.rigor !== "auto") ? card.rigor : "off";
+    const recovery = [
+      `RECOVERY-КОНТЕКСТ (пауза по лимиту подписки): ПРЕДЫДУЩИЙ прогон был убит лимитом Claude на станции`,
+      `«${card.column}» — это НЕ дефект кода и НЕ причина что-то переделывать. Лимит сброшен, продолжай работу.`,
+      `Продолжи с самого дальнего ЗЕЛЁНОГО чекпоинта: "git log --oneline" в ветке "${branchFor(card)}" → коммиты`,
+      `"green(<cardId>): …"; при необходимости "git restore --source=<sha> -- <файл>". Фичу заново НЕ начинай.`,
+    ].join("\n");
+    const { target, launch, kind } = resumeRun(card, projectDir, runDir, rigor, recovery);
+    if (launch && launch.launched) {
+      unpause();
+      card.column = target;
+      card.blockReason = null;
+      card.lastColumnChangeAt = new Date().toISOString();
+      recordLaunch(card, launch, kind);
+      card.history.push({ column: target, ts: card.lastColumnChangeAt, via: "quota-resume" });
+      card.notes = (card.notes || []).slice(-19);
+      card.notes.push({ ts: card.lastColumnChangeAt, by: "board", class: "quota",
+        text: `Лимит сброшен — прогон продолжен со станции «${target}» (${kind}), с последнего зелёного чекпоинта.` });
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "quota-resume", cardId: card.id, kind, launch }) + "\n"); } catch {}
+    } else {
+      // Could not spawn (bin missing, AUTORUN=0…) — stay paused and probe again, never silently die.
+      card.pausedUntil = new Date(now + QUOTA_FALLBACK_MIN * 60000).toISOString();
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date(now).toISOString(), event: "quota-resume-failed",
+        cardId: card.id, error: (launch && launch.error) || (launch && launch.reason) || "spawn failed", retryAt: card.pausedUntil }) + "\n"); } catch {}
+    }
+    changed = true;
+  }
+  return changed;
+}
+// endregion FUNC_quotaStop
+
 // Resume a stuck/blocked card from the furthest-reached point, reusing the exact
 // gate-choice logic the /relaunch endpoint and the watchdog auto-heal both rely on.
 // `recovery` (optional) is a RECOVERY-context block injected into the build prompt so
@@ -1720,6 +1905,9 @@ function syncFromPipeline() {
   let board, changed = false;
   try { board = readBoard(); } catch { return; }
   const now = Date.now();
+  // S6 · 0) the clock first: cards that were waiting out a subscription limit go back to work
+  // before the liveness watchdog gets a chance to read a just-resumed card as a dead one.
+  if (quotaResumeTick(board, now)) changed = true;
   for (const card of board.cards) {
     if (!card.dispatchedAt || card.column === TERMINAL || card.column === "blocked") continue;
     // S4 §2.2: a paused card is NOT broken — it is waiting out an external limit. Keep its
@@ -1899,6 +2087,14 @@ function syncFromPipeline() {
         }
         const fromCol = card.column;
         const how = stalled ? "ЗАВИС" : "УМЕР";
+        // S6: was it the account's 5-hour limit? Then nothing is broken — do NOT spend the
+        // autoheal fuse (the relaunch would die inside the same dead window, which is exactly
+        // how 3.6 h were lost on 30.07) and do NOT block. Wait out the clock and resume.
+        if (died) {
+          const stop = detectQuotaStop(card.runLog, now, card.runLogFrom)
+            || (quotaOpen(board, now) ? { until: board.quota.until, exact: board.quota.exact, raw: board.quota.raw } : null);
+          if (stop) { pauseForQuota(board, card, stop, card.runKind || "run"); changed = true; continue; }
+        }
         const humanTail = stalled
           ? `Зависание: станция «${fromCol}» не менялась > ${Math.round(STALL_MS / 60000)} мин; процесс остановлен.`
           : `Прогон завершился, не достигнув ready (процесс ${card.runPid} мёртв, станция «${fromCol}»).`;
@@ -1954,6 +2150,14 @@ function syncFromPipeline() {
       const nothingToAnswer = !(card.questions || []).length && !(card.archQuestions || []).length;
       const crashed = nothingToAnswer && card.askStage !== "done" && !isAlive(card.runPid)
         && sinceMove > LIVENESS_GRACE_MS;
+      // S6: the same limit can kill an ask-run before it writes its questions. Then the card sits
+      // in `asking` with nothing to answer and the human is «needed» for no reason — the exact
+      // dead end of 30.07. A read of the log settles it without a model: pause, don't wait on a human.
+      if (crashed) {
+        const stop = detectQuotaStop(card.runLog, now, card.runLogFrom)
+          || (quotaOpen(board, now) ? { until: board.quota.until, exact: board.quota.exact, raw: board.quota.raw } : null);
+        if (stop) { pauseForQuota(board, card, stop, "вопросы не записаны"); changed = true; continue; }
+      }
       if (cooldownOk && (crashed || sinceMove > ASK_STALL_MS)) {
         if (fireWardenEvent(board, card, {
           kind: crashed ? "crash-before-write" : "asking-stalled",
@@ -2334,10 +2538,13 @@ async function handleApi(req, res, urlPath) {
       card.pausedReason = String(b.reason || "quota").slice(0, 200);
       card.pausedUntil = Number.isFinite(mins) && mins > 0 ? new Date(Date.now() + mins * 60000).toISOString() : null;
       card.pausedAt = ts;
+      // S6: a quota pause is the one pause that ENDS BY ITSELF. Mark it so the tick resumes the
+      // card when its clock runs out — a warden that says «quota» gets the auto-resume for free.
+      card.pausedKind = (b.kind === "quota" || /quota|лимит/i.test(card.pausedReason)) && card.pausedUntil ? "quota" : null;
       if (b.note) (card.notes = card.notes || []).push({ ts, by, class: card.pausedReason, text: String(b.note).slice(0, 2000) });
       card.wardenPending = null;
     } else if (action === "resume") {
-      card.paused = false; card.pausedReason = null; card.pausedUntil = null; card.pausedAt = null;
+      card.paused = false; card.pausedKind = null; card.pausedReason = null; card.pausedUntil = null; card.pausedAt = null;
       card.wardenPending = null;
     } else {
       if (!String(b.text || "").trim()) return sendJSON(res, 400, { error: "text is required" });
@@ -2413,7 +2620,13 @@ async function handleApi(req, res, urlPath) {
       recordWardenAction(card, "relaunch");
     }
     card.wardenPending = null;   // the agent answered → the deferred block is cancelled
-    card.paused = false; card.pausedReason = null; card.pausedUntil = null;
+    card.paused = false; card.pausedKind = null; card.pausedReason = null; card.pausedUntil = null;
+    // S6: a human pressing «перезапустить» is proof the account works again — close the board-wide
+    // quota window too, or the queue stays frozen against a clock that is already wrong.
+    if (by === "human" && board.quota) {
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "quota-clear", by: "human", until: board.quota.until }) + "\n"); } catch {}
+      board.quota = null;
+    }
     const projectDir = resolveProjectDir(card.project);
     if (!isInsideRoot(projectDir)) return sendJSON(res, 400, { error: "project resolves outside the projects root" });
     const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);

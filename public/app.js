@@ -32,6 +32,7 @@ async function api(path, opts) {
 }
 const cardById = (id) => state.cards.find((c) => c.id === id);
 function lampColor(col) { return (STATIONS[col] || STATIONS.backlog).c; }
+const hm = (iso) => { try { return new Date(iso).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }); } catch { return ""; } };
 
 // What is the Asking card waiting on?  func → answer block 1 · arch-wait → agent
 // is drafting decisions · arch-pick → pick decisions.
@@ -58,8 +59,12 @@ function cardTags(card) {
   // S4 §2.2: paused ≠ broken. The card keeps its station and its place in the queue, and the
   // chip says WHY it stands — that is the whole point of the warden's note.
   if (card.paused) {
-    const until = card.pausedUntil ? " · до " + new Date(card.pausedUntil).toLocaleTimeString() : "";
-    t.push(`<span class="tag tag--paused" title="${esc((card.notes || []).slice(-1)[0]?.text || "пауза: " + (card.pausedReason || ""))}">⏸ пауза · ${esc(card.pausedReason || "")}${esc(until)}</span>`);
+    // S6: a quota wait is not an error and must not read like one — it is a promise with a time
+    // on it. «продолжу в 18:10» is the whole message; the note carries the log line behind it.
+    const at = card.pausedUntil ? hm(card.pausedUntil) : "";
+    const quota = card.pausedKind === "quota";
+    const label = quota ? `⏳ лимит Claude${at ? ` · продолжу в ${at}` : ""}` : `⏸ пауза · ${card.pausedReason || ""}${at ? ` · до ${at}` : ""}`;
+    t.push(`<span class="tag tag--paused${quota ? " tag--quota" : ""}" title="${esc((card.notes || []).slice(-1)[0]?.text || "пауза: " + (card.pausedReason || ""))}">${esc(label)}</span>`);
   }
   if (card.wardenPending) t.push(`<span class="tag tag--warden" title="${esc(card.wardenPending.reason || "")}">🛡 страж · ${esc(card.wardenPending.kind || "")}</span>`);
   // S3: draft (an unreviewed tail) never dispatches — say so where the card is, not in a 409.
@@ -150,7 +155,9 @@ function cardHTML(card) {
   const st = STATIONS[card.column] || STATIONS.backlog;
   const plan = planOfCard(card);
   const stage = plan ? stageOf(card, plan) : null;
-  const crew = st.crew ? `<span class="card__crew">${esc(st.crew)}</span>` : "";
+  // «нужны вы» только когда человеку правда есть что сделать: на паузе по лимиту ждут часы, а не он.
+  const crewLabel = (card.paused && card.pausedKind === "quota") ? "ждём сброса лимита" : st.crew;
+  const crew = crewLabel ? `<span class="card__crew">${esc(crewLabel)}</span>` : "";
   const working = WORKING.has(card.column) ? ` data-working="1"` : "";
   const ignite = card.id === igniteId ? " is-ignite" : "";
   const planAttr = plan ? ` data-plan="${esc(plan.id)}"` : "";
@@ -161,12 +168,20 @@ function cardHTML(card) {
   let askBanner = "";
   if (card.column === "asking") {
     const s = askState(card);
-    const label = s === "func"
-      ? `${(card.questions || []).length || "…"} вопросов · ответь`
-      : s === "arch-pick"
-        ? `Блок 1 готов · ${card.archQuestions.length} решений по архитектуре`
-        : `Блок 1 готов · архитектор думает…`;
-    askBanner = `<div class="card__ask" data-ask="${card.id}"><span class="dot"></span>${esc(label)}<span class="arr">→</span></div>`;
+    const nQ = (card.questions || []).length;
+    // S6: «… вопросов · ответь» без единого вопроса — ложный вызов человека: отвечать не на что,
+    // а карточка выглядит как ждущая тебя. Пока вопросов нет, говорим что происходит на самом деле.
+    if (s === "func" && !nQ) {
+      askBanner = `<div class="card__ask card__ask--wait"><span class="dot"></span>${
+        card.paused ? esc("ран остановлен — вопросы ещё не записаны") : esc("агент составляет вопросы…")}</div>`;
+    } else {
+      const label = s === "func"
+        ? `${nQ} вопросов · ответь`
+        : s === "arch-pick"
+          ? `Блок 1 готов · ${card.archQuestions.length} решений по архитектуре`
+          : `Блок 1 готов · архитектор думает…`;
+      askBanner = `<div class="card__ask" data-ask="${card.id}"><span class="dot"></span>${esc(label)}<span class="arr">→</span></div>`;
+    }
   }
 
   const blocked = (card.column === "blocked" && card.blockReason)
@@ -307,11 +322,27 @@ function closeHTML(plan) {
   if ((r.tails || []).length) bits.push(`<span class="close__chip" title="${esc(r.tails.map((t) => t.theme).join("\n"))}">хвостов: ${r.tails.length}</span>`);
   return `<div class="close">${bits.join("")}${note ? `<div class="close__note close__note--${esc(note.level)}">${esc(note.text)}</div>` : ""}</div>`;
 }
+// S6 · the account-wide limit, said once and plainly: WHY the board stands still, that nothing
+// is lost, and WHEN it comes back by itself. Without this the only visible symptom is «ничего не
+// происходит», which is what sent a human digging through logs for three hours on 30.07.
+function quotaBannerHTML() {
+  const q = state.quota;
+  if (!q || !q.until || new Date(q.until) <= new Date()) return "";
+  const waiting = state.cards.filter((c) => c.paused && c.pausedKind === "quota").length;
+  return `<div class="qbanner" role="status">
+    <span class="qbanner__mark">⏳</span>
+    <div class="qbanner__body">
+      <strong>Лимит подписки Claude${q.exact ? "" : " (время сброса не указано в логе)"}</strong>
+      <span>Прогоны на паузе, сделанное не потеряно — доска поднимет их сама${q.exact ? ` в ${esc(hm(q.until))}` : " при следующей проверке"}${waiting ? ` · ждут карточек: ${waiting}` : ""}. Новые задачи в это время не запускаются.</span>
+    </div>
+    ${q.raw ? `<span class="qbanner__raw" title="строка из лога прогона">${esc(q.raw)}</span>` : ""}
+  </div>`;
+}
 function renderRails() {
   const host = document.getElementById("railHost");
   if (!host) return;
   const plans = (state.plans || []).filter((p) => !p.archived && (p.cardIds || []).some((id) => cardById(id)));
-  host.innerHTML = plans.map(railHTML).join("");
+  host.innerHTML = quotaBannerHTML() + plans.map(railHTML).join("");
   host.querySelectorAll("[data-planfilter]").forEach((b) => b.addEventListener("click", () => { planFilter = planFilter === b.dataset.planfilter ? null : b.dataset.planfilter; render(); }));
   host.querySelectorAll("[data-planpr]").forEach((b) => b.addEventListener("click", () => onPlanPR(b.dataset.planpr)));
   host.querySelectorAll("[data-planclose]").forEach((b) => b.addEventListener("click", () => onPlanClose(b.dataset.planclose)));

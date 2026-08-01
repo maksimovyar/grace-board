@@ -19,7 +19,12 @@
   --mono:"JetBrains Mono",ui-monospace,monospace;
 }
 *{box-sizing:border-box}
-html,body{height:100%}
+/* S6 · доска перестала скроллиться, когда над колонками появились plan-rail'ы: body с жёсткой
+   height:100% не может вырасти под контент, поэтому вертикального скролла у страницы нет в
+   принципе, а .board (flex:1, overflow-y:hidden) просто обрезает станции нижней кромкой окна.
+   min-height оставляет «одноэкранный» вид, но разрешает странице вырасти, если места не хватило. */
+html{height:100%}
+body{min-height:100%}
 body{
   margin:0; font-family:var(--sans); color:var(--ink); -webkit-font-smoothing:antialiased;
   background:
@@ -54,8 +59,12 @@ body{
 .btn[disabled]{opacity:.55;cursor:default;transform:none}
 
 /* ── board ── */
-.board{flex:1;display:flex;align-items:stretch;gap:0;padding:22px 24px 30px;overflow-x:auto;overflow-y:hidden}
-.station{flex:0 0 286px;display:flex;flex-direction:column;min-height:0}
+/* min-height: станции не сплющиваются под высокими рельсами — вместо этого страница скроллится.
+   padding-bottom оставляет воздух под плавающей плашкой .hint. */
+.board{flex:1;display:flex;align-items:stretch;gap:0;padding:22px 24px 76px;overflow-x:auto;overflow-y:hidden;min-height:min(460px,58vh)}
+/* max-height держит станцию в пределах экрана — иначе с длинной колонкой (двадцать карточек в
+   «Ready for deploy») .well растянулся бы под контент и перестал скроллиться внутри себя. */
+.station{flex:0 0 286px;display:flex;flex-direction:column;min-height:0;max-height:calc(100dvh - 210px)}
 .station+.station{margin-left:16px}
 .station__head{display:flex;align-items:center;gap:9px;padding:0 4px 11px}
 .station__no{font-family:var(--mono);font-size:11px;color:var(--ink-faint)}
@@ -109,6 +118,8 @@ body{
 .tag--floor{border-color:rgba(211,63,53,.45);background:rgba(211,63,53,.08);color:#a8362e}
 /* S4 · warden (§2): paused ≠ broken — a distinct, calm tone, not the red of `blocked` */
 .tag--paused{border-color:rgba(47,115,194,.45);background:rgba(47,115,194,.10);color:#255a97}
+/* S6 · ожидание по лимиту — амбер «ждём часы», а не красный «сломалось» */
+.tag--quota{border-color:rgba(230,161,30,.5);background:rgba(230,161,30,.12);color:#8a5e08;font-weight:600}
 .tag--warden{border-color:rgba(20,155,139,.45);background:rgba(20,155,139,.10);color:#0e6f64}
 /* S3 · statement of work (§4): who authored the card · unreviewed tail held as a draft */
 .tag--origin{border-style:dashed;color:var(--ink-faint)}
@@ -117,6 +128,9 @@ body{
   background:var(--amber);border-radius:var(--radius-sm);padding:8px 11px;cursor:pointer}
 .card__ask .dot{width:7px;height:7px;border-radius:50%;background:#3a2706;animation:blip 1.3s ease-in-out infinite}
 .card__ask .arr{margin-left:auto}
+/* нечего отвечать — это не призыв к человеку, а состояние: приглушённо и без курсора-руки */
+.card__ask--wait{background:var(--surface-2);border:1px dashed var(--line-2);color:var(--ink-soft);font-weight:600;cursor:default}
+.card__ask--wait .dot{background:var(--ink-faint)}
 .card__blocked{margin:9px 13px 0;padding:8px 10px;border-radius:var(--radius-sm);background:rgba(211,63,53,.08);
   border:1px solid rgba(211,63,53,.25);font-size:11.5px;line-height:1.45;color:#a8362e}
 .card__stamp{margin:9px 13px 0;padding-top:8px;border-top:1px dashed var(--line-2);font-family:var(--mono);
@@ -294,7 +308,18 @@ body{
 .btn--run[disabled]{opacity:.55;filter:none;transform:none;cursor:default}
 
 /* plan-rail — запущенная большая фича над колонками */
+/* Несколько прогонов сразу съедали весь экран — рельсы получают свой скролл, станции остаются видны. */
 .railhost:empty{display:none}
+.railhost{max-height:32vh;overflow-y:auto;overscroll-behavior:contain}
+/* S6 · плашка лимита подписки: доска стоит по часам, а не по поломке */
+.qbanner{display:flex;align-items:center;gap:13px;margin:0 24px 14px;padding:12px 16px;border-radius:var(--radius);
+  border:1px solid rgba(230,161,30,.45);background:linear-gradient(180deg,rgba(230,161,30,.12),rgba(230,161,30,.06))}
+.qbanner__mark{font-size:17px;line-height:1;flex:none}
+.qbanner__body{display:flex;flex-direction:column;gap:3px;flex:1;min-width:0}
+.qbanner__body strong{font-family:var(--display);font-weight:700;font-size:14px;color:#8a5e08;letter-spacing:-.01em}
+.qbanner__body span{font-size:12.5px;line-height:1.5;color:var(--ink-soft)}
+.qbanner__raw{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);background:var(--surface);
+  border:1px solid var(--line);border-radius:999px;padding:4px 10px;max-width:38%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .rail{margin:0 24px 16px;background:linear-gradient(180deg,var(--surface),var(--surface-2));
   border:1.5px solid var(--line-2);border-left:4px solid var(--s-verifying);border-radius:var(--radius);
   box-shadow:var(--shadow);padding:14px 18px;position:relative}
