@@ -2479,16 +2479,31 @@ async function handleApi(req, res, urlPath) {
     const plan = planById(board, decodeURIComponent(mpone[1]));
     return plan ? sendJSON(res, 200, { plan: planView(board, plan) }) : sendJSON(res, 404, { error: "plan not found" });
   }
-  // DELETE /api/plans/:id -> archive a plan (hide its rail). Stage cards are left untouched —
-  // they keep their history/branch/manifest; only the run's rail is dismissed. Additive flag.
+  // DELETE /api/plans/:id[?withCards=1] -> archive a plan (hide its rail). Stage cards keep their
+  // history/branch/manifest either way; `withCards` additionally marks the run's FINISHED cards
+  // archived (v4 Ш3), which is the end of a card's life: 11 of 23 cards on the live board were
+  // `ready` leftovers of closed runs. Unfinished cards are never touched — archiving work that is
+  // still moving would hide a live run. There is no un-archive: the card stays visible inside its
+  // run on the shelf, so nothing is actually lost.
   if (mpone && req.method === "DELETE") {
     const board = readBoard();
     const plan = planById(board, decodeURIComponent(mpone[1]));
     if (!plan) return sendJSON(res, 404, { error: "plan not found" });
+    const withCards = new URL(req.url, `http://${HOST}`).searchParams.get("withCards") === "1";
     plan.archived = true;
+    const archived = [];
+    if (withCards) {
+      const ts = new Date().toISOString();
+      for (const card of planCards(board, plan)) {
+        if (card.column !== TERMINAL || card.archived) continue;
+        card.archived = true;
+        card.archivedAt = ts;
+        archived.push(card.id);
+      }
+    }
     writeBoard(board);
-    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "plan-archive", planId: plan.id }) + "\n"); } catch {}
-    return sendJSON(res, 200, { ok: true });
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "plan-archive", planId: plan.id, cards: archived }) + "\n"); } catch {}
+    return sendJSON(res, 200, { ok: true, archived, left: planCards(board, plan).filter((c) => !c.archived).length });
   }
 
   // POST /api/plans/:id/reopen -> переиграть приёмку проваленного прогона (v4 Ш1.1). Без этой
