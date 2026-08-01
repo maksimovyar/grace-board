@@ -1,0 +1,1204 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>grace · board v4 — пульт прогонов (прототип)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ffffff'/%3E%3Ccircle cx='16' cy='16' r='6' fill='none' stroke='%23D85B22' stroke-width='2.4'/%3E%3Ccircle cx='16' cy='16' r='2' fill='%23C98A12'/%3E%3C/svg%3E" />
+<style>
+/* ═══════════════════════════════════════════════════════════════════════════
+   grace-board v4 — «пульт прогонов». Прототип информационной архитектуры.
+   Дизайн-язык не тронут: те же токены, те же шрифты, те же лампы станций.
+   Изменено только одно — ЧТО показано и в каком порядке.
+
+   Правило прототипа: ровно одна область прокрутки на экран — страница.
+   Ни .well, ни .railhost, ни горизонтального скролла доски здесь нет.
+   ═══════════════════════════════════════════════════════════════════════════ */
+:root{
+  --bg:#E7EBF1; --bg-2:#EEF1F6; --well:#DFE4EC; --surface:#FFFFFF; --surface-2:#F4F6FA;
+  --line:#D4DBE5; --line-2:#BFC8D6;
+  --ink:#1B2027; --ink-soft:#525C6B; --ink-faint:#868F9E;
+  --s-backlog:#6B7480; --s-todo:#2F73C2; --s-asking:#C98A12; --s-implementing:#D85B22;
+  --s-verifying:#8B53E0; --s-reviewing:#149B8B; --s-ready:#2E9E50; --s-blocked:#D33F35;
+  --ember:#D85B22; --amber:#E6A11E;
+  --radius:13px; --radius-sm:8px;
+  --shadow:0 1px 2px rgba(27,40,68,.06),0 8px 22px rgba(27,40,68,.07);
+  --shadow-lift:0 2px 6px rgba(27,40,68,.10),0 20px 44px rgba(27,40,68,.14);
+  --display:"Bricolage Grotesque",system-ui,sans-serif;
+  --sans:"Hanken Grotesk",system-ui,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,monospace;
+  /* сетка v4 — единственное, что двигает переключатель плотности */
+  --row:30px;        /* высота строки этапа в очереди */
+  --pad:14px;        /* внутренний отступ блоков */
+  --gap:10px;        /* зазор между блоками */
+  --fs:13.5px;       /* базовый кегль строки */
+  --fs-mono:10.5px;
+}
+body[data-d="comfy"]{ --row:38px; --pad:18px; --gap:14px; --fs:14.5px; --fs-mono:11px; }
+*{box-sizing:border-box}
+html{height:100%}
+body{
+  margin:0;min-height:100%;font-family:var(--sans);color:var(--ink);-webkit-font-smoothing:antialiased;
+  background:
+    radial-gradient(1200px 600px at 80% -10%,rgba(216,91,34,.05),transparent 60%),
+    radial-gradient(900px 520px at 10% 110%,rgba(47,115,194,.05),transparent 60%),
+    var(--bg);
+}
+
+/* ── консоль ───────────────────────────────────────────────────────────── */
+.console{display:flex;align-items:center;gap:14px;padding:12px 24px;border-bottom:1px solid var(--line);
+  background:rgba(238,241,246,.9);backdrop-filter:blur(10px);position:sticky;top:0;z-index:20}
+.console__brand{display:flex;align-items:center;gap:12px;flex:none}
+.console__mark{width:28px;height:28px;border-radius:9px;border:2.4px solid var(--ember);position:relative;flex:none;box-shadow:0 0 0 4px rgba(216,91,34,.08)}
+.console__mark::after{content:"";position:absolute;inset:0;margin:auto;width:7px;height:7px;border-radius:50%;background:var(--amber)}
+.console__title{font-family:var(--display);font-weight:800;font-size:19px;margin:0;letter-spacing:-.02em;white-space:nowrap}
+.console__title span{color:var(--ember);margin:0 1px}
+.console__sub{margin:1px 0 0;font-size:11px;color:var(--ink-faint);font-family:var(--mono)}
+
+/* сводка вместо ленты из восьми счётчиков: одно число, которое решает — идти к доске или нет */
+.pulse{display:flex;align-items:center;gap:12px;margin-left:4px;flex-wrap:wrap}
+@media (max-width:1500px){ .pulse__k--muted{display:none} }   /* сначала уходит наименее срочное */
+.pulse__k{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;color:var(--ink-soft);white-space:nowrap}
+.pulse__k b{font-size:13px;color:var(--ink);font-weight:700}
+.pulse__lamp{width:8px;height:8px;border-radius:50%;box-shadow:0 0 7px currentColor;flex:none}
+.pulse__k--you{color:#8a5e08;background:rgba(230,161,30,.14);border:1px solid rgba(230,161,30,.45);border-radius:999px;padding:4px 12px}
+.pulse__k--you b{color:#8a5e08}
+.pulse__k--calm{color:#1f7a42;background:rgba(46,158,80,.10);border:1px solid rgba(46,158,80,.35);border-radius:999px;padding:4px 12px}
+
+.console__tools{margin-left:auto;display:flex;align-items:center;gap:9px;flex:none}
+.find{position:relative}
+.find input{font-family:var(--sans);font-size:13px;color:var(--ink);background:var(--surface);border:1px solid var(--line-2);
+  border-radius:9px;padding:8px 11px 8px 30px;width:190px}
+.find input:focus{outline:2px solid var(--s-todo);outline-offset:1px;border-color:transparent;width:250px}
+.find::before{content:"⌕";position:absolute;left:10px;top:7px;color:var(--ink-faint);font-size:14px}
+.find kbd{position:absolute;right:8px;top:8px;font-family:var(--mono);font-size:9px;color:var(--ink-faint);border:1px solid var(--line);border-radius:4px;padding:1px 4px;background:var(--surface-2)}
+.find input:focus~kbd{display:none}
+.seg{display:inline-flex;background:var(--surface);border:1px solid var(--line-2);border-radius:9px;padding:3px;gap:3px}
+.seg__opt{font-family:var(--sans);font-size:12px;font-weight:600;color:var(--ink-soft);background:none;border:none;border-radius:6px;padding:5px 10px;cursor:pointer}
+.seg__opt.is-on{color:#fff;background:var(--ember)}
+.btn{font-family:var(--display);font-weight:600;font-size:13.5px;border-radius:10px;padding:9px 14px;cursor:pointer;white-space:nowrap;
+  border:1px solid transparent;transition:transform .12s ease,background .18s ease,border-color .18s ease}
+.btn--solid{color:#fff;background:var(--ember)}
+.btn--solid:hover{background:#c44f1b;transform:translateY(-1px)}
+.btn--ghost{color:var(--ink-soft);background:var(--surface);border-color:var(--line-2)}
+.btn--ghost:hover{color:var(--ink);border-color:var(--ink-soft)}
+.btn--run{color:#fff;background:var(--s-verifying)}
+.btn--run:hover{filter:brightness(1.07);transform:translateY(-1px)}
+
+/* ── стоп-кран: дать доработать и встать ────────────────────────────────
+   Пауза ≠ поломка, поэтому тон синий (как у tag--paused), а не красный.
+   Полоса живёт над палубой и не исчезает, пока удержание взведено. */
+.brake{position:relative}
+.brake__btn{font-family:var(--display);font-weight:600;font-size:13.5px;border-radius:10px;padding:9px 13px;cursor:pointer;
+  border:1px solid var(--line-2);background:var(--surface);color:var(--ink-soft);white-space:nowrap}
+.brake__btn:hover{color:var(--ink);border-color:var(--ink-soft)}
+.brake__btn.is-on{background:rgba(47,115,194,.12);border-color:rgba(47,115,194,.5);color:#255a97}
+.brake__menu{position:absolute;top:calc(100% + 7px);right:0;z-index:30;width:330px;background:var(--surface);
+  border:1px solid var(--line-2);border-radius:var(--radius);box-shadow:var(--shadow-lift);padding:7px;display:none}
+.brake__menu[data-open="1"]{display:block}
+.brake__opt{display:block;width:100%;text-align:left;background:none;border:none;border-radius:9px;padding:9px 11px;cursor:pointer}
+.brake__opt:hover{background:var(--surface-2)}
+.brake__opt b{display:block;font-family:var(--display);font-weight:600;font-size:13.5px;color:var(--ink)}
+.brake__opt span{display:block;font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);margin-top:3px;line-height:1.45}
+.brake__opt--now b{color:var(--s-blocked)}
+.brake__sep{height:1px;background:var(--line);margin:5px 9px}
+.holdbar{display:flex;align-items:center;gap:12px;padding:10px 15px;border-radius:var(--radius);
+  border:1px solid rgba(47,115,194,.45);background:linear-gradient(180deg,rgba(47,115,194,.11),rgba(47,115,194,.05))}
+.holdbar__ic{font-size:16px;flex:none}
+.holdbar__b{flex:1;min-width:0;font-size:13.5px;line-height:1.45;color:#255a97}
+.holdbar__b b{font-family:var(--display)}
+.holdbar__b span{display:block;font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);margin-top:2px}
+.holdbar__acts{display:flex;gap:7px;flex:none}
+
+/* ── общая раскладка палубы ─────────────────────────────────────────────── */
+.deck{max-width:1440px;margin:0 auto;padding:16px 24px 40px;display:flex;flex-direction:column;gap:18px;min-width:0}
+body{overflow-x:hidden}
+.zone__head{display:flex;align-items:baseline;gap:10px;margin:0 0 8px;padding:0 2px}
+.zone__name{font-family:var(--display);font-weight:700;font-size:13px;letter-spacing:.02em;color:var(--ink)}
+.zone__note{font-family:var(--mono);font-size:var(--fs-mono);color:var(--ink-faint)}
+.zone__act{margin-left:auto;font-family:var(--mono);font-size:var(--fs-mono);color:var(--s-todo);background:none;border:none;cursor:pointer;padding:2px 4px;border-radius:5px}
+.zone__act:hover{background:var(--surface-2);color:var(--ember)}
+
+/* ── ЗОНА 1 · требует меня ──────────────────────────────────────────────── */
+.att{display:flex;flex-direction:column;gap:7px}
+.att__row{display:grid;grid-template-columns:26px minmax(0,1fr) auto;align-items:center;gap:11px;
+  background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--line-2);border-radius:var(--radius);
+  padding:9px 12px;box-shadow:var(--shadow);cursor:pointer;transition:transform .12s ease,box-shadow .15s ease}
+.att__row:hover{transform:translateY(-1px);box-shadow:var(--shadow-lift)}
+.att__ic{font-size:15px;text-align:center;line-height:1}
+.att__txt{min-width:0;display:block}
+.att__t{display:block;font-family:var(--display);font-weight:600;font-size:var(--fs);line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.att__s{display:block;font-family:var(--mono);font-size:var(--fs-mono);color:var(--ink-faint);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.att__go{font-family:var(--display);font-weight:600;font-size:12.5px;color:#fff;border:none;border-radius:8px;padding:7px 13px;cursor:pointer;white-space:nowrap}
+.att__row--ask{border-left-color:var(--s-asking)} .att__row--ask .att__go{background:var(--s-asking)}
+.att__row--block{border-left-color:var(--s-blocked)} .att__row--block .att__go{background:var(--s-blocked)}
+.att__row--merge{border-left-color:var(--s-verifying)} .att__row--merge .att__go{background:var(--s-verifying)}
+.att__row--floor{border-left-color:var(--amber)} .att__row--floor .att__go{background:var(--amber);color:#3a2706}
+.att__row--arch{border-left-color:var(--s-verifying)} .att__row--arch .att__go{background:var(--s-verifying)}
+.att__row--draft{border-left-color:var(--s-backlog)} .att__row--draft .att__go{background:var(--s-backlog)}
+.att__row--ask .att__ic{animation:blip 1.4s ease-in-out infinite}
+/* пусто — это результат, а не отсутствие контента: строка говорит, что конвейер идёт сам */
+.calm{display:flex;align-items:center;gap:11px;background:rgba(46,158,80,.07);border:1px solid rgba(46,158,80,.3);
+  border-radius:var(--radius);padding:10px 14px;font-size:var(--fs);color:#1f7a42}
+.calm b{font-family:var(--display)}
+.calm span{margin-left:auto;font-family:var(--mono);font-size:var(--fs-mono);color:var(--ink-soft)}
+
+/* ── ЗОНА 2 · прогоны как треки ─────────────────────────────────────────── */
+.runs{display:flex;flex-direction:column;gap:var(--gap)}
+.run{background:linear-gradient(180deg,var(--surface),var(--surface-2));border:1.5px solid var(--line-2);
+  border-left:4px solid var(--s-verifying);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.run--auto{border-left-color:var(--s-ready)}
+.run__head{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:13px;padding:11px var(--pad);cursor:pointer}
+.run__badge{font-family:var(--mono);font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+  color:#fff;background:var(--s-verifying);border-radius:5px;padding:3px 8px;flex:none}
+.run--auto .run__badge{background:var(--s-ready)}
+.run__title{font-family:var(--display);font-weight:700;font-size:15.5px;letter-spacing:-.01em;margin:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.run__meta{display:flex;gap:7px;align-items:center;flex:none}
+.chip{font-family:var(--mono);font-size:var(--fs-mono);color:var(--ink-soft);background:var(--surface);
+  border:1px solid var(--line);border-radius:6px;padding:3px 8px;white-space:nowrap;text-decoration:none;display:inline-flex;align-items:center;gap:5px}
+.chip--branch{color:var(--s-todo);border-color:rgba(47,115,194,.35);background:rgba(47,115,194,.06)}
+/* проект — первый чип прогона: при нескольких проектах это первый вопрос «а это про что» */
+.chip--proj{color:var(--ink);border-color:var(--line-2);background:var(--surface-2);font-weight:700}
+.chip--ask{color:#8a5e08;border-color:rgba(230,161,30,.45);background:rgba(230,161,30,.10)}
+.chip--auto{color:#1f7a42;border-color:rgba(46,158,80,.4);background:rgba(46,158,80,.08)}
+.chip--ok{color:#1f7a42;border-color:rgba(46,158,80,.4);background:rgba(46,158,80,.07)}
+.chip--bad{color:#a8362e;border-color:rgba(211,63,53,.45);background:rgba(211,63,53,.07)}
+.run__toggle{font-family:var(--mono);font-size:13px;color:var(--ink-faint);background:none;border:1px solid var(--line-2);
+  border-radius:8px;width:28px;height:28px;cursor:pointer;flex:none;transition:transform .18s ease}
+.run__toggle:hover{color:var(--ink);border-color:var(--ink-soft)}
+.run[data-open="1"] .run__toggle{transform:rotate(180deg)}
+
+/* ── СИГНАТУРА: перегон. Одна линия отвечает на «пройдёт ли прогон сам» ── */
+.track{display:flex;align-items:center;padding:2px var(--pad) 13px;gap:0;min-height:34px}
+.node{display:inline-flex;align-items:center;gap:5px;flex:none;position:relative;background:none;border:none;padding:0;cursor:pointer;font:inherit}
+.node__dot{width:17px;height:17px;border-radius:50%;flex:none;display:grid;place-items:center;font-size:9.5px;font-weight:700;
+  color:#fff;background:var(--line-2);font-family:var(--mono);border:2px solid var(--surface-2)}
+.node__n{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);letter-spacing:.02em}
+.node--done .node__dot{background:var(--s-ready)} .node--done .node__n{color:#1f7a42}
+.node--live .node__dot{background:var(--s-implementing);animation:pulse 1.5s ease-in-out infinite;
+  box-shadow:0 0 0 3px rgba(216,91,34,.18)}
+.node--live .node__n{color:var(--ink);font-weight:700}
+.node--blocked .node__dot{background:var(--s-blocked)} .node--blocked .node__n{color:#a8362e}
+.node:hover .node__n{color:var(--ink)}
+.node.is-target .node__dot{outline:2px solid var(--s-todo);outline-offset:2px}
+/* флажок = обещанная остановка. В auto без «пола» их нет — линия чистая, прогон пройдёт сам */
+.node__flag{position:absolute;top:-13px;left:2px;font-size:10px;line-height:1;color:var(--s-asking)}
+.seg-line{flex:1;height:2px;background:var(--line-2);min-width:8px;margin:0 4px;border-radius:2px}
+.seg-line--done{background:var(--s-ready);opacity:.55}
+.track__verdict{margin-left:14px;flex:none;font-family:var(--mono);font-size:var(--fs-mono);white-space:nowrap}
+.track__verdict--stop{color:#8a5e08}
+.track__verdict--free{color:#1f7a42}
+
+/* ── строки этапов ──────────────────────────────────────────────────────── */
+.run__body{border-top:1px dashed var(--line);padding:6px var(--pad) var(--pad)}
+.run[data-open="0"] .run__body{display:none}
+.stage{display:grid;grid-template-columns:26px 30px minmax(0,1fr) auto;align-items:center;gap:9px;
+  height:var(--row);border-bottom:1px solid rgba(212,219,229,.6);cursor:pointer}
+.stage:last-child{border-bottom:none}
+.stage:hover{background:rgba(255,255,255,.7)}
+.stage__mark{font-family:var(--mono);font-size:11px;text-align:center;color:var(--ink-faint)}
+.stage__id{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+.stage__t{font-size:var(--fs);line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-soft)}
+.stage__r{font-family:var(--mono);font-size:var(--fs-mono);color:var(--ink-faint);white-space:nowrap;display:flex;gap:7px;align-items:center}
+.stage--done .stage__mark{color:var(--s-ready)}
+.stage--done .stage__t{color:var(--ink-faint)}
+.stage--wait .stage__mark{color:var(--line-2)}
+.stage--blocked .stage__t{color:#a8362e}
+.lock{color:#8a5e08}
+
+/* голова прогона — единственная карточка, которую действительно читают */
+.stage--live{display:block;height:auto;background:var(--surface);border:1px solid rgba(216,91,34,.35);
+  border-left:3px solid var(--s-implementing);border-radius:var(--radius);padding:11px 13px;margin:7px 0;
+  box-shadow:0 0 0 3px rgba(216,91,34,.06)}
+.head__top{display:flex;align-items:center;gap:9px;margin-bottom:5px}
+.head__id{font-family:var(--mono);font-size:11px;color:var(--s-implementing);font-weight:700}
+.head__phase{font-family:var(--mono);font-size:var(--fs-mono);color:#fff;background:var(--s-implementing);border-radius:5px;padding:2px 8px}
+.head__lamp{width:9px;height:9px;border-radius:50%;background:var(--s-implementing);box-shadow:0 0 8px currentColor;color:var(--s-implementing);animation:pulse 1.5s ease-in-out infinite;flex:none}
+.head__age{margin-left:auto;font-family:var(--mono);font-size:var(--fs-mono);color:var(--ink-soft)}
+.head__age.is-stale{color:#8a5e08;font-weight:700}
+.head__t{font-family:var(--display);font-weight:600;font-size:16px;line-height:1.25;letter-spacing:-.01em;margin:0 0 6px}
+.head__facts{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.head__acts{display:flex;gap:6px}
+/* ── цикл карточки: где она сейчас и сколько заняла каждая фаза ──────────
+   Станция — это не только цвет лампы: у каждой своё слово и своя длительность.
+   Пройденное показано фактом («вопросы 1 мин»), текущее пульсирует, будущее — тускло. */
+.cycle{display:flex;align-items:center;flex-wrap:wrap;gap:0;margin:0 0 9px}
+.cyc{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);
+  border:1px solid var(--line);background:var(--surface-2);border-radius:999px;padding:3px 10px;white-space:nowrap}
+.cyc b{font-weight:700;color:var(--ink-soft)}
+.cyc__ic{font-size:9px}
+.cyc--done{color:#1f7a42;border-color:rgba(46,158,80,.35);background:rgba(46,158,80,.07)}
+.cyc--done b{color:#1f7a42}
+.cyc--now{color:var(--ink);border-color:rgba(216,91,34,.5);background:var(--surface);font-weight:700;
+  box-shadow:0 0 0 3px rgba(216,91,34,.10)}
+.cyc--now .cyc__ic{animation:pulse 1.5s ease-in-out infinite}
+.cyc--now b{color:var(--s-implementing)}
+.cyc--next{opacity:.55}
+.cyc--stop{color:#a8362e;border-color:rgba(211,63,53,.45);background:rgba(211,63,53,.07)}
+.cyc__arr{color:var(--line-2);font-size:11px;padding:0 5px}
+/* вопросы к человеку — единственное место, где карточка кричит */
+.head__ask{display:flex;align-items:center;gap:9px;margin:0 0 9px;font-family:var(--mono);font-size:12px;
+  font-weight:700;color:#3a2706;background:var(--amber);border-radius:var(--radius-sm);padding:9px 12px;cursor:pointer;border:none;width:100%;text-align:left}
+.head__ask .dot{width:7px;height:7px;border-radius:50%;background:#3a2706;animation:blip 1.3s ease-in-out infinite;flex:none}
+.head__ask .arr{margin-left:auto}
+.head__ask--wait{background:var(--surface-2);border:1px dashed var(--line-2);color:var(--ink-soft);font-weight:600;cursor:default}
+.head__ask--wait .dot{background:var(--ink-faint)}
+/* «решено без тебя» — AUTO-след: вопросы не исчезли, они стали журналом */
+.autochip{font-family:var(--mono);font-size:var(--fs-mono);color:#6a3fc0;background:rgba(139,83,224,.08);
+  border:1px solid rgba(139,83,224,.4);border-radius:6px;padding:3px 8px;cursor:pointer}
+.autochip:hover{background:rgba(139,83,224,.16)}
+/* прогон между этапами — не пустота, а состояние */
+.between{display:flex;align-items:center;gap:9px;margin:7px 0;padding:9px 12px;border:1px dashed var(--line-2);
+  border-radius:var(--radius);background:var(--surface);font-size:12.5px;color:var(--ink-soft)}
+.between b{font-family:var(--display);color:var(--ink)}
+
+/* ── опросник в шторке: блок 1 функционал · блок 2 архитектура ─────────── */
+.qblock{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:14px 15px}
+.qblock+.qblock{margin-top:12px}
+.qblock__head{display:flex;align-items:center;gap:9px;margin-bottom:3px}
+.qblock__no{width:21px;height:21px;border-radius:6px;display:grid;place-items:center;font-family:var(--mono);
+  font-size:11px;font-weight:700;color:#fff;background:var(--s-asking)}
+.qblock--arch .qblock__no{background:var(--s-verifying)}
+.qblock__title{font-family:var(--display);font-weight:600;font-size:14.5px}
+.qblock__sub{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);margin:0 0 11px 30px}
+.qrow{margin-bottom:11px}
+.qrow__q{display:block;font-size:13px;line-height:1.45;color:var(--ink);margin-bottom:5px}
+.qrow__q b{color:var(--s-asking);font-family:var(--mono);margin-right:5px}
+.qrow__a{width:100%;font-family:var(--sans);font-size:13px;color:var(--ink);background:var(--surface-2);
+  border:1px solid var(--line-2);border-radius:8px;padding:8px 10px;resize:vertical;min-height:38px}
+.qblock__send{width:100%;font-family:var(--display);font-weight:600;font-size:13.5px;color:#fff;
+  background:var(--s-asking);border:none;padding:10px;border-radius:9px;cursor:pointer}
+.qblock--arch .qblock__send{background:var(--s-verifying)}
+.qblock__wait{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink-faint);font-family:var(--mono)}
+.decision{margin-bottom:14px}
+.decision__q{font-size:13.5px;font-weight:600;color:var(--ink);margin-bottom:8px;line-height:1.4}
+.decision__q b{color:var(--s-verifying);font-family:var(--mono);margin-right:6px}
+.opt{display:block;position:relative;border:1.5px solid var(--line);border-radius:11px;padding:10px 12px 10px 36px;
+  margin-bottom:7px;cursor:pointer;background:var(--surface-2)}
+.opt input{position:absolute;left:12px;top:13px;accent-color:var(--s-verifying);width:15px;height:15px;cursor:pointer}
+.opt:has(input:checked){border-color:var(--s-verifying);background:rgba(139,83,224,.05);box-shadow:0 0 0 1px var(--s-verifying)}
+.opt__title{font-family:var(--display);font-weight:600;font-size:13px;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.opt__rec{font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
+  color:#fff;background:var(--s-verifying);border-radius:5px;padding:1px 6px}
+.opt__desc{font-size:12.5px;line-height:1.45;color:var(--ink-soft);margin:4px 0 0}
+.autodec{border-left:3px solid var(--s-verifying);background:var(--surface);border:1px solid var(--line);
+  border-left:3px solid var(--s-verifying);border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:8px}
+.autodec__q{font-size:12.5px;color:var(--ink);line-height:1.4}
+.autodec__a{font-family:var(--display);font-weight:600;font-size:13px;color:#6a3fc0;margin-top:4px}
+.autodec__w{font-size:12px;line-height:1.5;color:var(--ink-soft);margin-top:4px}
+.demo{font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.07em;color:#8a5e08;
+  background:rgba(230,161,30,.15);border:1px solid rgba(230,161,30,.5);border-radius:5px;padding:2px 7px}
+.mini{font-family:var(--mono);font-size:11px;color:var(--ink-soft);background:var(--surface-2);border:1px solid var(--line-2);
+  border-radius:7px;padding:5px 10px;cursor:pointer}
+.mini:hover{color:var(--ink);border-color:var(--ink-soft)}
+
+/* ── ЗОНА 3 · одиночные карточки ────────────────────────────────────────── */
+.solo{display:grid;grid-template-columns:1fr 54px 1fr 1fr;gap:0;align-items:stretch}
+.col{display:flex;flex-direction:column;gap:6px;min-width:0}
+.col+.col{margin-left:12px}
+.col__head{display:flex;align-items:center;gap:8px;padding:0 3px 7px}
+.col__lamp{width:9px;height:9px;border-radius:50%;flex:none;box-shadow:0 0 8px currentColor}
+.col__name{font-family:var(--display);font-weight:600;font-size:13px}
+.col__n{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
+  border:1px solid var(--line);min-width:20px;text-align:center;padding:1px 6px;border-radius:999px}
+.col__wrap{background:var(--well);border-radius:var(--radius);padding:6px;display:flex;flex-direction:column;gap:6px;min-height:64px}
+/* рычаг остаётся — это и подпись продукта, и настоящая дроп-зона одиночного режима */
+.lever{align-self:stretch;margin:22px 6px 0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;position:relative;border-radius:var(--radius)}
+.lever::before{content:"";position:absolute;top:16px;bottom:16px;left:50%;width:2px;
+  background:repeating-linear-gradient(var(--ember) 0 7px,transparent 7px 14px);opacity:.55;transform:translateX(-50%)}
+.lever__knob{width:24px;height:24px;border-radius:50%;z-index:1;background:radial-gradient(circle at 35% 30%,#ffb27e,var(--ember));
+  box-shadow:0 0 0 4px rgba(216,91,34,.14),0 4px 10px rgba(27,40,68,.2)}
+.lever__label{font-family:var(--mono);font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--ember);writing-mode:vertical-rl;transform:rotate(180deg);z-index:1}
+.sc{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--line-2);border-radius:var(--radius-sm);
+  padding:8px 10px;box-shadow:var(--shadow);cursor:grab}
+.sc__t{font-family:var(--display);font-weight:600;font-size:13px;line-height:1.25;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.sc__m{display:flex;align-items:center;gap:7px;margin-top:5px;font-family:var(--mono);font-size:10px;color:var(--ink-faint)}
+.sc[data-col="backlog"]{border-left-color:var(--s-backlog)}
+.sc[data-col="todo"]{border-left-color:var(--s-todo)}
+.sc[data-col="implementing"]{border-left-color:var(--s-implementing)}
+.empty{font-family:var(--mono);font-size:11.5px;color:var(--ink-faint);text-align:center;padding:14px 10px;line-height:1.6}
+.soloempty{display:flex;align-items:center;gap:11px;background:var(--surface);border:1px dashed var(--line-2);
+  border-radius:var(--radius);padding:11px 14px;font-size:var(--fs);color:var(--ink-soft)}
+.soloempty b{color:var(--ink);font-family:var(--display)}
+.soloempty button{margin-left:auto}
+
+/* ── ЗОНА 4 · полка закрытого ───────────────────────────────────────────── */
+.shelf{display:flex;flex-direction:column;gap:6px}
+.done{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--s-ready);border-radius:var(--radius);overflow:hidden}
+.done--failed{border-left-color:var(--s-blocked)}
+.done__head{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:11px;padding:9px 13px;cursor:pointer}
+.done__ic{font-size:13px;color:var(--s-ready)}
+.done--failed .done__ic{color:var(--s-blocked)}
+.done__t{font-size:var(--fs);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-soft)}
+.done__body{display:none;border-top:1px dashed var(--line);padding:6px 13px 11px}
+.done[data-open="1"] .done__body{display:block}
+.done__row{display:grid;grid-template-columns:30px minmax(0,1fr) auto;gap:9px;align-items:center;height:26px;
+  font-size:12.5px;color:var(--ink-faint);border-bottom:1px solid rgba(212,219,229,.5)}
+.done__row:last-child{border-bottom:none}
+.done__row span:first-child{font-family:var(--mono);font-size:10px}
+.done__row b{font-weight:400;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ── метрика: проверяемое обещание плотности ────────────────────────────── */
+.gauge{display:flex;align-items:center;gap:18px;flex-wrap:wrap;font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);
+  border-top:1px dashed var(--line-2);padding-top:12px;margin-top:4px}
+.gauge b{color:var(--ink-soft);font-weight:700}
+.gauge s{color:var(--s-blocked);text-decoration-color:rgba(211,63,53,.5)}
+
+/* ── лист (объяснение вместо неработающей кнопки) ──────────────────────── */
+.sheet{position:fixed;inset:0;z-index:40;display:none}
+.sheet[data-open="1"]{display:block}
+.sheet__scrim{position:absolute;inset:0;background:rgba(40,52,74,.34);backdrop-filter:blur(2px)}
+.sheet__panel{position:absolute;top:0;right:0;height:100%;width:min(460px,94vw);background:var(--bg-2);
+  border-left:1px solid var(--line-2);box-shadow:-28px 0 70px rgba(27,40,68,.22);padding:22px 24px;overflow-y:auto;
+  display:flex;flex-direction:column;gap:14px;animation:slidein .22s ease}
+@keyframes slidein{from{transform:translateX(28px);opacity:.5}to{transform:none;opacity:1}}
+.sheet__head{display:flex;align-items:center;gap:10px}
+.sheet__title{font-family:var(--display);font-weight:700;font-size:18px;margin:0}
+.sheet__close{margin-left:auto;background:none;border:none;font-size:16px;cursor:pointer;color:var(--ink-soft)}
+.sheet__k{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--ink-faint)}
+.sheet__v{font-size:13.5px;line-height:1.55;color:var(--ink-soft);white-space:pre-wrap}
+.sheet__box{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;display:flex;flex-direction:column;gap:9px}
+
+/* ── мастер запуска: политика релиза + предсказание финала ─────────────── */
+.launch{position:fixed;inset:0;z-index:50;display:none;place-items:center;padding:24px}
+.launch[data-open="1"]{display:grid}
+.launch__scrim{position:absolute;inset:0;background:rgba(40,52,74,.40);backdrop-filter:blur(3px)}
+.launch__panel{position:relative;width:min(660px,96vw);max-height:92vh;overflow:auto;background:var(--bg-2);
+  border:1px solid var(--line-2);border-radius:16px;box-shadow:var(--shadow-lift);padding:20px 24px 22px;
+  display:flex;flex-direction:column;gap:15px;animation:slidein .22s ease}
+.launch__head{display:flex;align-items:center;gap:11px}
+.launch__mark{width:29px;height:29px;border-radius:9px;background:var(--s-verifying);color:#fff;display:grid;place-items:center;font-size:15px;flex:none}
+.launch__title{font-family:var(--display);font-weight:700;font-size:19px;margin:0;letter-spacing:-.01em}
+.launch__sub{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);margin:2px 0 0}
+.lk{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-soft)}
+.lrow{display:flex;gap:12px;flex-wrap:wrap}
+.lrow>label{flex:1;min-width:190px;display:flex;flex-direction:column;gap:6px}
+.lin{font-family:var(--sans);font-size:14px;color:var(--ink);background:var(--surface);border:1px solid var(--line-2);
+  border-radius:9px;padding:9px 11px;width:100%}
+/* три переключателя политики: доска умеет всё это, но сегодня не спрашивает */
+.pol{display:flex;flex-direction:column;gap:9px;background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--radius);padding:13px 15px}
+.pol__row{display:grid;grid-template-columns:64px minmax(0,1fr);align-items:center;gap:12px}
+.pol__k{font-family:var(--mono);font-size:11px;color:var(--ink-soft)}
+.pol .seg{flex-wrap:wrap}
+.pol .seg__opt{font-size:12.5px;padding:6px 12px}
+#polMerge .seg__opt.is-on,#polDeploy .seg__opt.is-on{background:var(--s-verifying)}
+.verdict{display:flex;gap:11px;align-items:flex-start;background:rgba(139,83,224,.06);
+  border:1px solid rgba(139,83,224,.25);border-radius:11px;padding:12px 14px}
+.verdict__ic{font-size:16px;flex:none;margin-top:1px}
+.verdict__b{font-size:13px;line-height:1.55;color:var(--ink-soft)}
+.verdict__b b{color:var(--ink);font-family:var(--display)}
+.verdict__b em{font-style:normal;color:#8a5e08}
+.lfoot{display:flex;gap:10px;justify-content:flex-end;align-items:center}
+
+.toast{position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:60;background:var(--ink);color:#fff;
+  font-size:13px;padding:10px 18px;border-radius:999px;box-shadow:var(--shadow-lift);max-width:90vw;display:none}
+.toast[data-open="1"]{display:block}
+.toast b{color:#ffb27e;font-family:var(--mono);font-weight:500}
+
+.is-dim{opacity:.25;filter:saturate(.4)}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.78)}}
+@keyframes blip{0%,100%{opacity:1}50%{opacity:.3}}
+:focus-visible{outline:2px solid var(--s-todo);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media (max-width:1100px){.pulse{display:none}.solo{grid-template-columns:1fr}.lever{display:none}.col+.col{margin-left:0;margin-top:12px}}
+@media (max-width:760px){.console{flex-wrap:wrap;gap:10px;padding:11px 14px}.deck{padding:12px 14px 32px}.find input{width:130px}}
+</style>
+</head>
+<body data-d="dense">
+
+<header class="console">
+  <div class="console__brand">
+    <span class="console__mark" aria-hidden="true"></span>
+    <div>
+      <h1 class="console__title">grace<span>·</span>board</h1>
+      <p class="console__sub">пульт прогонов · v4 прототип</p>
+    </div>
+  </div>
+  <div class="pulse" id="pulse"></div>
+  <div class="console__tools">
+    <div class="find"><input id="find" type="search" placeholder="Найти этап или прогон" aria-label="Поиск" /><kbd>/</kbd></div>
+    <div class="seg" id="density" title="плотность сетки">
+      <button class="seg__opt is-on" type="button" data-d="dense">Плотно</button>
+      <button class="seg__opt" type="button" data-d="comfy">Просторно</button>
+    </div>
+    <div class="brake">
+      <button class="brake__btn" type="button" id="brakeBtn">⏸ Остановить</button>
+      <div class="brake__menu" id="brakeMenu" data-open="0"></div>
+    </div>
+    <button class="btn btn--run" type="button" data-demo="launch">⚡ Прогон</button>
+    <button class="btn btn--solid" type="button" data-demo="task">+ Задача</button>
+  </div>
+</header>
+<div id="holdHost" style="max-width:1440px;margin:0 auto;padding:14px 24px 0"></div>
+
+<main class="deck">
+  <section>
+    <div class="zone__head">
+      <span class="zone__name">Требует меня</span>
+      <span class="zone__note" id="attNote"></span>
+      <button class="zone__act" type="button" id="askDemo">показать пример вопросов</button>
+    </div>
+    <div class="att" id="att"></div>
+  </section>
+
+  <section>
+    <div class="zone__head">
+      <span class="zone__name">Прогоны</span>
+      <span class="zone__note" id="runsNote"></span>
+      <button class="zone__act" type="button" id="collapseAll">свернуть все</button>
+    </div>
+    <div class="runs" id="runs"></div>
+  </section>
+
+  <section>
+    <div class="zone__head">
+      <span class="zone__name">Одиночные задачи</span>
+      <span class="zone__note">вне прогонов · путь через рычаг не изменился</span>
+      <button class="zone__act" type="button" id="demoSolo">показать на примере</button>
+    </div>
+    <div id="solo"></div>
+  </section>
+
+  <section>
+    <div class="zone__head">
+      <span class="zone__name">Закрытое</span>
+      <span class="zone__note" id="shelfNote"></span>
+    </div>
+    <div class="shelf" id="shelf"></div>
+    <div class="gauge" id="gauge"></div>
+  </section>
+</main>
+
+<!-- мастер запуска · шаг 1: проект, автономия и политика релиза -->
+<div class="launch" id="launch" data-open="0">
+  <div class="launch__scrim" data-lclose></div>
+  <div class="launch__panel">
+    <div class="launch__head">
+      <span class="launch__mark">⚡</span>
+      <div><h2 class="launch__title">Запуск прогона</h2>
+        <p class="launch__sub">шаг 1 из 3 · дальше — состав из карточек доски и сводный гейт</p></div>
+      <button class="sheet__close" type="button" data-lclose aria-label="Закрыть">✕</button>
+    </div>
+    <div class="lrow">
+      <label><span class="lk">Проект</span><select class="lin" id="lProject"></select></label>
+      <label><span class="lk">Автономия · кого спрашивать по ходу</span>
+        <div class="seg" id="lMode"><button type="button" class="seg__opt is-on" data-v="ask">Ask</button><button type="button" class="seg__opt" data-v="auto">Auto</button></div></label>
+    </div>
+    <div>
+      <div class="lk" style="margin-bottom:7px">Политика релиза · что доска сделает в конце сама</div>
+      <div class="pol">
+        <div class="pol__row"><span class="pol__k">PR</span>
+          <div class="seg" id="polPr"><button type="button" class="seg__opt is-on" data-v="always">Собирать</button><button type="button" class="seg__opt" data-v="never">Не собирать</button></div></div>
+        <div class="pol__row"><span class="pol__k">Мерж</span>
+          <div class="seg" id="polMerge"><button type="button" class="seg__opt is-on" data-v="manual">Руками</button><button type="button" class="seg__opt" data-v="auto">Автомерж</button></div></div>
+        <div class="pol__row"><span class="pol__k">Стенд</span>
+          <div class="seg" id="polDeploy"><button type="button" class="seg__opt is-on" data-v="off">Не трогать</button><button type="button" class="seg__opt" data-v="after-merge">Раскатать после мержа</button><button type="button" class="seg__opt" data-v="ask">Спросить</button></div></div>
+      </div>
+    </div>
+    <div class="verdict" id="lVerdict"></div>
+    <div class="lfoot">
+      <button class="btn btn--ghost" type="button" data-lclose>Отмена</button>
+      <button class="btn btn--run" type="button" data-toast="Дальше — состав прогона из карточек доски">К задачам проекта →</button>
+    </div>
+  </div>
+</div>
+
+<div class="sheet" id="sheet" data-open="0">
+  <div class="sheet__scrim" data-close></div>
+  <div class="sheet__panel" id="sheetPanel"></div>
+</div>
+<div class="toast" id="toast" data-open="0"></div>
+
+<script>
+/* Данные — снимок реального data/board.json (23 карточки, 6 прогонов).
+   «Сейчас» зафиксировано на board.updatedAt, чтобы возрасты не плыли. */
+const DATA = {"updatedAt":"2026-08-01T09:54:47.734Z","cards":[{"id":"d2c7b5ac-2ab8-4a3b-aafe-180b8725ae40","project":"DocsInside2","theme":"Docsinside · Онбординг A2 · Add client: аккаунт + компания + первый пользователь + письмо с доступом","column":"ready","planId":"2fff0e85","dependsOn":["10ab2de2-78cb-484a-94ac-1749553ebacc"],"dispatchedAt":"2026-07-30T09:52:52.620Z","lastColumnChangeAt":"2026-07-30T10:22:15.468Z","queued":false,"files":8,"acceptance":9,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-онбординг-a2-add-client-аккаунт-компа/build.log","desc":"### A7 · Заведение клиента: аккаунт, компания, первый пользователь, письмо с доступом **Тема:** `Docsinside · Онбординг A2 · Add client: аккаунт + компания + первый пользователь + письмо с доступом` **Суть.** `POST /api/accounts` принимает ФИО и **обязательный** email первого пользователя, его роль из списка (`owner` | `project_manager`, по умолчанию `project_manager`) и опциональный блок компании (`name` обязателен,…","history":[{"c":"backlog","ts":"2026-07-30T08:33:00.241Z","via":null},{"c":"todo","ts":"2026-07-30T08:34:22.997Z","via":"plan-queued"},{"c":"asking","ts":"2026-07-30T09:57:08.742Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T09:59:36.830Z","via":"auto-build"},{"c":"ready","ts":"2026-07-30T10:22:15.468Z","via":"pipeline"}],"archDecisions":[],"autoN":0},{"id":"0c5fb70d-9eed-46a6-b1ee-845614a659cb","project":"DocsInside2","theme":"Docsinside · Онбординг A2 · Пользователи компании: список, роли, отключение, повторный доступ","column":"ready","planId":"2fff0e85","dependsOn":["d2c7b5ac-2ab8-4a3b-aafe-180b8725ae40"],"dispatchedAt":"2026-07-30T10:22:15.470Z","lastColumnChangeAt":"2026-07-30T10:53:28.337Z","queued":false,"files":7,"acceptance":9,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-онбординг-a2-пользователи-компании-сп/build.log","desc":"### A8 · Люди компании: список, добавление, роли, повторная отправка доступа **Тема:** `Docsinside · Онбординг A2 · Пользователи компании: список, роли, отключение, повторный доступ` **Суть.** Написать эндпоинты, в которые фронт уже стучится (сейчас их на сервере нет, ошибка глушится и таблицы рисуются пустыми): `GET /api/companies/{id}/users` — единый список пользователей кабинета и сотрудников с полями `name · emai…","history":[{"c":"backlog","ts":"2026-07-30T08:33:00.325Z","via":null},{"c":"todo","ts":"2026-07-30T08:34:22.997Z","via":"plan-queued"},{"c":"asking","ts":"2026-07-30T10:29:09.646Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T10:33:11.775Z","via":"auto-build"},{"c":"ready","ts":"2026-07-30T10:53:28.337Z","via":"pipeline"}],"archDecisions":[{"q":"Где хранить first_name/last_name и is_active?","chosen":"Новые колонки в CompanyUserProfile","why":"first_name, last_name (String 255), is_active (Boolean, server_default=True)."},{"q":"Паттерн сервиса и роутера","chosen":"Повторяет account.py","why":"service raises domain exceptions, router catches → JSONResponse."},{"q":"Partial unique index на persons","chosen":"Partial unique index WHERE email IS NOT NULL","why":"CREATE UNIQUE INDEX uq_persons_company_email ON persons(company_id, email) WHERE email IS NOT NULL."},{"q":"Hierarchy check fix","chosen":"Правка assign_company_role: >= на >","why":"Одно место правки в company_rbac.py."},{"q":"Resend-credentials task","chosen":"Переиспользование send_credentials_email.delay()","why":"Задача уже принимает user_id + temp_password + company_id."}],"autoN":5},{"id":"fb9c3fc0-70f8-4e35-85f6-b16d0430ea8a","project":"DocsInside2","theme":"Docsinside · Онбординг A2 · Согласие на экране входа, активация первым входом, смена пароля","column":"ready","planId":"2fff0e85","dependsOn":["10ab2de2-78cb-484a-94ac-1749553ebacc"],"dispatchedAt":"2026-07-30T10:53:28.339Z","lastColumnChangeAt":"2026-07-30T11:36:05.439Z","queued":false,"files":11,"acceptance":8,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-онбординг-a2-согласие-на-экране-входа/build.log","desc":"### A9 · Вход: согласие с политикой, отметка активации, смена пароля **Тема:** `Docsinside · Онбординг A2 · Согласие на экране входа, активация первым входом, смена пароля` **Суть.** Модели `PolicyDocument(kind, version, url, published_at, is_current)` и `UserConsent(user_id, policy_document_id, kind, accepted_at, ip_hash, user_agent_hash)` — сейчас в коде нет ни одного упоминания согласия, то есть правового основани…","history":[{"c":"backlog","ts":"2026-07-30T08:33:00.409Z","via":null},{"c":"todo","ts":"2026-07-30T08:34:22.997Z","via":"plan-queued"},{"c":"asking","ts":"2026-07-30T10:58:24.488Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T11:01:30.568Z","via":"auto-build"},{"c":"ready","ts":"2026-07-30T11:36:05.439Z","via":"pipeline"}],"archDecisions":[{"q":"PolicyDocument и UserConsent — tenant-scope или global?","chosen":"Global (без TenantMixin, без RLS)","why":"PolicyDocument — справочник, единый для платформы. UserConsent привязан к user_id, а не к компании — GDPR-согласие персональное. Подтверждено паттерном User (тоже global, без TenantMixin)."},{"q":"Точка интеграции record_login в auth-flow","chosen":"Два вызова: auth.py (non-MFA) + mfa.py (after TOTP verify)","why":"Company-пользователи без MFA — record_login из auth.py после успешного логина. DS-пользователи с MFA — record_login из mfa.py после TOTP verify. Partial-auth не считается входом."},{"q":"Миграция: одна или две?","chosen":"Одна миграция на обе таблицы","why":"policy_documents и user_consents создаются в одной миграции — UserConsent ссылается на PolicyDocument FK, появляются одновременно."}],"autoN":3},{"id":"f4c73e0e-5339-4218-a059-5d9cddc05e6d","project":"DocsInside2","theme":"Docsinside · Онбординг A2 · DS-scope на проде: доступ к данным компании по роли Docsinside","column":"ready","planId":"2fff0e85","dependsOn":["10ab2de2-78cb-484a-94ac-1749553ebacc"],"dispatchedAt":"2026-07-30T11:36:05.444Z","lastColumnChangeAt":"2026-07-30T12:05:58.315Z","queued":false,"files":6,"acceptance":6,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-онбординг-a2-ds-scope-на-проде-доступ/build.log","desc":"### A10 · Доступ Docsinside к данным компаний на боевом сервере **Тема:** `Docsinside · Онбординг A2 · DS-scope на проде: доступ к данным компании по роли Docsinside` **Суть.** Сейчас прод-`TenantMiddleware` пускает к данным компании только того, у кого есть запись в `company_user_profiles`; у сотрудника Docsinside её нет, поэтому он получает 403 и не видит данные компаний вообще — работает только тестовый заголовок …","history":[{"c":"backlog","ts":"2026-07-30T08:33:00.499Z","via":null},{"c":"todo","ts":"2026-07-30T08:34:22.997Z","via":"plan-queued"},{"c":"asking","ts":"2026-07-30T11:40:13.550Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T11:43:05.631Z","via":"auto-build"},{"c":"ready","ts":"2026-07-30T12:05:58.315Z","via":"pipeline"}],"archDecisions":[{"q":"Куда вставлять DS-ветку в middleware?","chosen":"До membership-проверки","why":"Функциональный ответ однозначен: DS-проверка идёт первой, company membership — fallback. Порядок гарантирует, что company-пользователь не попадёт в DS-path."},{"q":"Формат circuit/actor_role в аудите","chosen":"В detail JSONB","why":"Не колонка — расширяет существующий паттерн. circuit уже пишется так в authorization.py. Добавление колонки потребовало бы миграцию audit_log и не даёт преимуществ (поле информационное, не фильтруется по нему)."},{"q":"Dual GUC при DS + конкретная компания","chosen":"app.is_docsinside + app.current_company одновременно","why":"Без двойного GUC DS-пользователь не увидит данные в таблицах, где есть только company policy (без docsinside policy). Двойной GUC — минимальное изменение в apply_tenant."}],"autoN":3},{"id":"b83978ab-a9d4-42dc-9157-1636d14f4800","project":"DocsInside2","theme":"Docsinside · Онбординг A2 · Аудит удач и отказов + переключатель компаний аккаунта","column":"ready","planId":"2fff0e85","dependsOn":["f4c73e0e-5339-4218-a059-5d9cddc05e6d"],"dispatchedAt":"2026-07-30T12:05:58.317Z","lastColumnChangeAt":"2026-07-30T12:22:58.766Z","queued":false,"files":6,"acceptance":6,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-онбординг-a2-аудит-удач-и-отказов-пер/build.log","desc":"### A11 · Журнал: удачи и отказы, переключатель компаний **Тема:** `Docsinside · Онбординг A2 · Аудит удач и отказов + переключатель компаний аккаунта` **Суть.** Запись об отказе сейчас пишется в ту же сессию, что затем откатывается вместе с 403, — в базе не остаётся ничего. Писать `PERMISSION_DENIED` в отдельной транзакции (отдельная сессия из фабрики, свой commit), чтобы она выживала откат запроса. По A-Q7 писать и…","history":[{"c":"backlog","ts":"2026-07-30T08:33:00.585Z","via":null},{"c":"todo","ts":"2026-07-30T08:34:22.997Z","via":"plan-queued"},{"c":"asking","ts":"2026-07-30T12:09:30.393Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T12:11:44.451Z","via":"auto-build"},{"c":"ready","ts":"2026-07-30T12:22:58.766Z","via":"pipeline"}],"archDecisions":[{"q":"Где хранить active_company_id?","chosen":"Nullable FK на таблице users","why":"Простой nullable UUID FK users.active_company_id → companies.id. Миграция forward-only, default NULL."},{"q":"Как audit_denied() получает engine?","chosen":"from app.core.db import engine (как require_ds_staff)","why":"Паттерн уже работает в dependencies.py:185."},{"q":"Где AUDITED_RESOURCES?","chosen":"В audit_writer.py рядом с audit_access","why":"Единый модуль аудита, helper should_audit(resource_type, action)."},{"q":"Новая схема UserCompanyRead?","chosen":"В schemas/user.py","why":"По контракту карточки."}],"autoN":4},{"id":"76645f23-acdf-4986-acc4-d6d353936064","project":"DocsInside2","theme":"Docsinside · Онбординг A2 · Client List + Add client + Add company","column":"ready","planId":"f618b40c","dependsOn":[],"dispatchedAt":"2026-07-30T12:22:58.768Z","lastColumnChangeAt":"2026-07-30T12:40:01.587Z","queued":false,"files":9,"acceptance":5,"rigor":"off","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-онбординг-a2-client-list-add-client-a/build.log","desc":"### A12 · Фронт админки: список клиентов и заведение клиента **Тема:** `Docsinside · Онбординг A2 · Client List + Add client + Add company` **Суть.** Вынести вызовы в `lib/api/{accounts,companies,company-users}.ts` — сейчас они инлайновые в страницах на 600–900 строк, из-за чего несуществующий эндпоинт жил незамеченным. Add client: ФИО, обязательный email, список ролей, блок компании; ветка 409 «такой email уже есть»…","history":[{"c":"backlog","ts":"2026-07-30T08:33:00.674Z","via":null},{"c":"todo","ts":"2026-07-30T08:34:33.833Z","via":"plan-queued"},{"c":"asking","ts":"2026-07-30T12:28:25.026Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T12:29:37.070Z","via":"auto-build"},{"c":"ready","ts":"2026-07-30T12:40:01.587Z","via":"pipeline"}],"archDecisions":[],"autoN":0},{"id":"491255b1-8707-4973-8afc-c83b6b86fdd9","project":"DocsInside2","theme":"Docsinside · Онбординг A2 · Карточка компании: люди, роли, действия за клиента, Open","column":"ready","planId":"f618b40c","dependsOn":[],"dispatchedAt":"2026-07-30T12:40:01.588Z","lastColumnChangeAt":"2026-07-30T17:37:02.565Z","queued":false,"files":5,"acceptance":5,"rigor":"off","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-онбординг-a2-карточка-компании-люди-р/build.log","desc":"### A13 · Фронт админки: карточка компании как рабочее место **Тема:** `Docsinside · Онбординг A2 · Карточка компании: люди, роли, действия за клиента, Open` **Суть.** Сделать карточку компании достижимой (сейчас на неё не ведёт ни одна ссылка — экран-сирота) и починить кнопку `Open`: четыре ссылки ведут на `/company/{id}/dashboard`, каталога `frontend/app/company/[companyId]/` нет, все дают 404. `Open` ведёт на карт…","history":[{"c":"backlog","ts":"2026-07-30T08:33:00.758Z","via":null},{"c":"todo","ts":"2026-07-30T08:34:33.833Z","via":"plan-queued"},{"c":"asking","ts":"2026-07-30T12:48:15.977Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T12:50:06.066Z","via":"auto-build"},{"c":"blocked","ts":"2026-07-30T12:51:02.097Z","via":"supervisor"},{"c":"implementing","ts":"2026-07-30T17:27:12.354Z","via":"relaunch"},{"c":"ready","ts":"2026-07-30T17:37:02.565Z","via":"pipeline"}],"archDecisions":[],"autoN":0},{"id":"5a510ad6-1c42-4674-b65a-9237b3889237","project":"DocsInside2","theme":"Docsinside · Онбординг A2 · Settings: пользователи компании, роли, действия","column":"ready","planId":"f618b40c","dependsOn":[],"dispatchedAt":"2026-07-30T12:51:02.098Z","lastColumnChangeAt":"2026-07-30T16:57:31.261Z","queued":false,"files":5,"acceptance":4,"rigor":"off","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-онбординг-a2-settings-пользователи-ко/build.log","desc":"### A14 · Фронт кабинета: команда компании в Настройках **Тема:** `Docsinside · Онбординг A2 · Settings: пользователи компании, роли, действия` **Суть.** Колонка Role, добавление с выбором роли (сейчас `role: \"hr\"` захардкожен), меню строки: сменить роль, отключить, выслать доступ заново — эндпоинты появляются в A8, а `resend`/`cancel` из старой схемы не вызывались ниоткуда. Список запрашивать с `?company_id=` (сейча…","history":[{"c":"backlog","ts":"2026-07-30T08:33:00.847Z","via":null},{"c":"todo","ts":"2026-07-30T08:34:33.833Z","via":"plan-queued"},{"c":"asking","ts":"2026-07-30T12:51:18.121Z","via":"autoheal"},{"c":"implementing","ts":"2026-07-30T16:45:38.928Z","via":"auto-build"},{"c":"ready","ts":"2026-07-30T16:57:31.261Z","via":"pipeline"}],"archDecisions":[],"autoN":0},{"id":"bdfc58dd-ed3b-4aca-b4a8-54d88194389b","project":"DocsInside2","theme":"Docsinside · Онбординг A2 · Вход с согласием, смена пароля, переключатель компаний, empty states","column":"ready","planId":"f618b40c","dependsOn":[],"dispatchedAt":"2026-07-30T16:57:31.263Z","lastColumnChangeAt":"2026-07-30T17:20:10.055Z","queued":false,"files":9,"acceptance":7,"rigor":"off","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-онбординг-a2-вход-с-согласием-смена-п/build.log","desc":"### A15 · Фронт: вход, согласие, смена пароля, выбор компании, пустой дашборд **Тема:** `Docsinside · Онбординг A2 · Вход с согласием, смена пароля, переключатель компаний, empty states` **Суть.** Подпись о принятии политики на экране входа со ссылками из `GET /api/policies/current`; экран смены пароля в профиле; экран выбора компании при нескольких компаниях и переключатель в верхней панели (слот `topbarChildren` в …","history":[{"c":"backlog","ts":"2026-07-30T08:33:00.935Z","via":null},{"c":"todo","ts":"2026-07-30T08:34:33.833Z","via":"plan-queued"},{"c":"asking","ts":"2026-07-30T17:00:09.327Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T17:01:33.362Z","via":"auto-build"},{"c":"asking","ts":"2026-07-30T17:05:05.461Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T17:08:33.556Z","via":"pipeline"},{"c":"ready","ts":"2026-07-30T17:20:10.055Z","via":"pipeline"}],"archDecisions":[{"why":""},{"why":""},{"why":""},{"why":""},{"why":""}],"autoN":0},{"id":"3afbd46f-3eca-4cf8-9241-562291f85176","project":"DocsInside2","theme":"Docsinside · Онбординг A2 · Вырезать employee_limit и invitations, дозалить локали","column":"ready","planId":"f618b40c","dependsOn":["76645f23-acdf-4986-acc4-d6d353936064","491255b1-8707-4973-8afc-c83b6b86fdd9","5a510ad6-1c42-4674-b65a-9237b3889237","bdfc58dd-ed3b-4aca-b4a8-54d88194389b"],"dispatchedAt":"2026-07-30T17:37:02.567Z","lastColumnChangeAt":"2026-07-30T17:56:33.324Z","queued":false,"files":10,"acceptance":5,"rigor":"off","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-онбординг-a2-вырезать-employee-limit-/build.log","desc":"### A16 · Чистка и локализация **Тема:** `Docsinside · Онбординг A2 · Вырезать employee_limit и invitations, дозалить локали` **Суть.** Вырезать `employee_limit` из моделей, схем, API и интерфейса (A-Q16) — сейчас поле хранится, рисуется, правится диалогом и **нигде не применяется**. Удалить таблицу `invitations` и её остатки после того как фронт отвязался (A-Q13), включая тесты RLS на неё. Локали: неймспейсы `client…","history":[{"c":"backlog","ts":"2026-07-30T08:33:01.022Z","via":null},{"c":"todo","ts":"2026-07-30T08:34:33.833Z","via":"plan-queued"},{"c":"asking","ts":"2026-07-30T17:40:40.660Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T17:41:00.669Z","via":"auto-build"},{"c":"ready","ts":"2026-07-30T17:56:33.324Z","via":"pipeline"}],"archDecisions":[],"autoN":0},{"id":"e7ee356b-dca9-42c5-878f-04b9f6b8f4ca","project":"DocsInside2","theme":"Docsinside · Онбординг A2 · E2E: завели клиента → вошёл → добавил команду → Docsinside за него","column":"ready","planId":"f618b40c","dependsOn":["3afbd46f-3eca-4cf8-9241-562291f85176"],"dispatchedAt":"2026-07-30T17:56:33.325Z","lastColumnChangeAt":"2026-07-30T18:46:37.522Z","queued":false,"files":2,"acceptance":4,"rigor":"off","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-онбординг-a2-e2e-завели-клиента-вошёл/build.log","desc":"### A17 · Сквозной прогон четырёх историй **Тема:** `Docsinside · Онбординг A2 · E2E: завели клиента → вошёл → добавил команду → Docsinside за него` **Суть.** `backend/tests/e2e/` сейчас пуст. Написать сквозной сценарий по AC: администратор Docsinside заводит клиента с компанией и первым Project Manager → приходит письмо с логином и паролем (перехват письма в тесте) → PM входит, фиксируется согласие и активация → PM …","history":[{"c":"backlog","ts":"2026-07-30T08:33:01.118Z","via":null},{"c":"todo","ts":"2026-07-30T08:34:33.833Z","via":"plan-queued"},{"c":"asking","ts":"2026-07-30T18:00:33.555Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T18:01:53.615Z","via":"auto-build"},{"c":"verifying","ts":"2026-07-30T18:44:07.456Z","via":"pipeline"},{"c":"implementing","ts":"2026-07-30T18:45:09.491Z","via":"autoheal"},{"c":"ready","ts":"2026-07-30T18:46:37.522Z","via":"pipeline"}],"archDecisions":[{"q":"Структура E2E-теста","chosen":"Один файл test_onboarding_flow.py","why":"Линейная последовательность шагов, разбивать на файлы нет смысла."},{"q":"HTTP-клиент","chosen":"httpx.AsyncClient через ASGITransport","why":"Повторяем паттерн integration-тестов."},{"q":"Изоляция данных","chosen":"Один большой тест без изоляции между шагами","why":"Линейный сценарий, каждый шаг зависит от предыдущего."}],"autoN":3},{"id":"093d38bb-1d58-4a25-9f34-1de42051b569","project":"DocsInside2","theme":"Docsinside · Услуги B+ · Макеты: модалка активации услуг и цена в конструкторе","column":"ready","planId":"13dc2476","dependsOn":[],"dispatchedAt":"2026-08-01T07:57:58.775Z","lastColumnChangeAt":"2026-08-01T08:13:00.332Z","queued":false,"files":4,"acceptance":6,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-услуги-b-макеты-модалка-активации-усл/build.log","desc":"# Макеты: модалка активации услуг и цена в конструкторе Этап B+ возвращает в объём конструктор услуг и чинит активацию услуг компании. Двух макетов для этого не хватает — эта карточка их рисует. Кода она не трогает. ## 1. Модалка Activate Services на карточке компании Файл `docs/design/frontend-design-v3.3/admin/company.html`. Экран карточки компании рисует карточка `62cfa1be` прогона «Онбординг A2», которая по очере…","history":[{"c":"backlog","ts":"2026-08-01T07:55:14.902Z","via":null},{"c":"todo","ts":"2026-08-01T07:57:58.775Z","via":"plan-launch"},{"c":"asking","ts":"2026-08-01T08:01:54.036Z","via":"pipeline"},{"c":"implementing","ts":"2026-08-01T08:02:16.045Z","via":"auto-build"},{"c":"verifying","ts":"2026-08-01T08:11:14.282Z","via":"pipeline"},{"c":"ready","ts":"2026-08-01T08:13:00.332Z","via":"pipeline"}],"archDecisions":[{"q":"Размер модалки Activate Services","chosen":".xl","why":"Таблица с 6+ колонками не влезает в .lg (600px)."},{"q":"Discount control — паттерн UI","chosen":"Segmented .segmented (% / EUR)","why":"Паттерн уже существует в дизайн-системе."},{"q":"Service selector — тип контрола","chosen":"Native <select> с optgroup","why":"В макете достаточно обычного select."},{"q":"Final Price — editability","chosen":"Editable input","why":"ТЗ §3.10.1: «редактируемый, по умолчанию Qty × List − Discount»."}],"autoN":4},{"id":"f9e9e730-d6c0-4329-866f-4a9b36066f59","project":"DocsInside2","theme":"Docsinside · Услуги B+ · Каталог услуг: поля Name/Description/Requirements и запись","column":"ready","planId":"13dc2476","dependsOn":[],"dispatchedAt":"2026-08-01T08:13:00.333Z","lastColumnChangeAt":"2026-08-01T08:50:19.848Z","queued":false,"files":7,"acceptance":6,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-услуги-b-каталог-услуг-поля-name-desc/build.log","desc":"# Каталог услуг: поля Name/Description/Requirements и запись Сейчас каталог услуг меняется только сидом: в `backend/app/domains/common/routers/catalog.py` одни GET-эндпоинты, и они сознательно без Casbin (комментарий в строке 11). Модель `Service` (`backend/app/domains/common/models/service.py`) держит `name_key · slug · residence_has_expiry · is_active · sort_order` — до формы ТЗ §3.5 не хватает названия, описания и…","history":[{"c":"backlog","ts":"2026-08-01T07:55:50.521Z","via":null},{"c":"todo","ts":"2026-08-01T07:57:58.780Z","via":"plan-queued"},{"c":"asking","ts":"2026-08-01T08:15:38.363Z","via":"pipeline"},{"c":"implementing","ts":"2026-08-01T08:16:22.386Z","via":"auto-build"},{"c":"ready","ts":"2026-08-01T08:50:19.848Z","via":"pipeline"}],"archDecisions":[{"q":"Slug generation: python-slugify vs hand-rolled","chosen":"python-slugify","why":"python-slugify — проверенная библиотека с корректным Unicode-транслитом."},{"q":"SERVICE_IN_USE: какие таблицы проверять","chosen":"Case.service_id + ServiceActivationItem via ServiceProfile","why":"Проверяем все статусы — даже закрытый кейс ссылается на услугу."},{"q":"Casbin-интеграция для write-эндпоинтов","chosen":"require_permission по существующим правилам в CSV","why":"Права service create/update/delete уже засиданы в docsinside_policy.csv:32-35 для ds_admin."}],"autoN":3},{"id":"409a318a-724f-4d8f-a528-53fa9d9effa0","project":"DocsInside2","theme":"Docsinside · Услуги B+ · Профили услуги: цена в контракте, CRUD, версионирование","column":"ready","planId":"13dc2476","dependsOn":["f9e9e730-d6c0-4329-866f-4a9b36066f59"],"dispatchedAt":"2026-08-01T08:50:19.850Z","lastColumnChangeAt":"2026-08-01T09:11:22.471Z","queued":false,"files":7,"acceptance":7,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-услуги-b-профили-услуги-цена-в-контра/build.log","desc":"# Профили услуги: цена в контракте, CRUD, версионирование Профиль — комбинация «услуга × категория заявителя × тип обращения», у каждой свой комплект документов, набор видимых шагов и цена (ТЗ §3.5). Модель `backend/app/domains/common/models/service_profile.py` уже держит всё нужное, включая `list_price` (Decimal 10,2, добавлена миграцией `0013`), но наружу цена не выходит: `ServiceProfileRead` (`schemas/service_prof…","history":[{"c":"backlog","ts":"2026-08-01T07:56:07.244Z","via":null},{"c":"todo","ts":"2026-08-01T07:57:58.780Z","via":"plan-queued"},{"c":"asking","ts":"2026-08-01T08:52:53.926Z","via":"pipeline"},{"c":"implementing","ts":"2026-08-01T08:53:51.964Z","via":"auto-build"},{"c":"ready","ts":"2026-08-01T09:11:22.471Z","via":"pipeline"}],"archDecisions":[{"q":"Транзакционность версионирования: нужна ли двухфазная блокировка или достаточно одной транзакции?","chosen":"Одна транзакция с SELECT FOR UPDATE","why":"Версионирование (deactivate old + insert new) выполняется в одной async-транзакции с SELECT FOR UPDATE на текущей строке. Partial unique index — страховка от race condition. Не требует distributed locks или saga — операция локальна в одной таблице."},{"q":"Формат вложенных документов/шагов в Create/Update: inline в теле или отдельные эндпоинты?","chosen":"Inline в теле запроса","why":"Контракт данных задан явно: documents[] и steps[] — вложенные массивы в ServiceProfileCreate/Update. Отдельные эндпоинты для управления документами/шагами профиля избыточны и противоречат заданному контракту. Сервис заменяет связанные записи целиком при каждом сохранении (replace strategy)."},{"q":"Стратегия замены связанных записей при версионировании: merge vs replace","chosen":"Replace (полная замена)","why":"При создании новой версии профиля documents[] и steps[] создаются заново, привязанные к новой строке профиля. Старые связи остаются на старой версии — кейсы ссылаются на неё. Merge (diff старых и новых) усложняет код без пользы: клиент всегда отправляет полный набор."}],"autoN":3},{"id":"7630c0aa-e5f2-46cd-a0c3-28c1efa71013","project":"DocsInside2","theme":"Docsinside · Услуги B+ · Биллинг по company_id из пути: активация, профили, агрегат пула","column":"ready","planId":"13dc2476","dependsOn":["409a318a-724f-4d8f-a528-53fa9d9effa0"],"dispatchedAt":"2026-08-01T09:11:22.474Z","lastColumnChangeAt":"2026-08-01T09:36:13.209Z","queued":false,"files":8,"acceptance":7,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-услуги-b-биллинг-по-company-id-из-пут/build.log","desc":"# Биллинг по company_id из пути: активация, профили, агрегат пула ## Дефект, который чиним `POST /api/billing/activations` берёт компанию из tenant-контекста (`domains/billing/routers/billing.py`), а контекст ставится из заголовка `X-Company-Id` (`core/middleware/tenant.py:57,99`), который фронтенд не шлёт ниоткуда. Для DS-пользователя без заголовка `company_id` = sentinel `uuid(int=0)` (`core/tenant.py:55`) — актива…","history":[{"c":"backlog","ts":"2026-08-01T07:56:26.735Z","via":null},{"c":"todo","ts":"2026-08-01T07:57:58.780Z","via":"plan-queued"},{"c":"asking","ts":"2026-08-01T09:15:24.585Z","via":"pipeline"},{"c":"implementing","ts":"2026-08-01T09:17:04.636Z","via":"auto-build"},{"c":"ready","ts":"2026-08-01T09:36:13.209Z","via":"pipeline"}],"archDecisions":[{"q":"Структура роутера billing: один файл или разбить по суб-ресурсам?","chosen":"Один файл billing.py с company-scoped путями","why":"Роутер уже в одном файле, эндпоинтов ~7 — разбивать нет причин. Префикс /api/billing, company_id в пути для scoped-операций, /services — без company_id (каталог глобальный)."},{"q":"Dependency для проверки существования компании: отдельная зависимость FastAPI или inline в каждом endpoint?","chosen":"Shared dependency verify_company_exists","why":"По образцу company_users.py — dependency, чтобы не дублировать SELECT 1 в каждом endpoint. Возвращает company_id (UUID), кидает 404 если не найден."},{"q":"Схема для quota aggregate: новый pydantic-класс или inline dict?","chosen":"Новый QuotaAggregateRead в schemas/quota.py","why":"Контракт явно задаёт поля {company_id, total, used, available} — нужна типизированная схема для response_model и openapi.json."},{"q":"Метод get_quota_aggregate: в billing/services/quota.py или отдельный файл?","chosen":"В существующем quota.py","why":"Один метод, SQL-агрегат из VIEW — укладывается в quota.py рядом с get_quotas."}],"autoN":4},{"id":"a778e931-af7b-43f5-a4ee-186d7eee0909","project":"DocsInside2","theme":"Docsinside · Услуги B+ · X-Company-Id в клиенте: кабинет компании видит свои данные","column":"ready","planId":"13dc2476","dependsOn":["7630c0aa-e5f2-46cd-a0c3-28c1efa71013"],"dispatchedAt":"2026-08-01T09:36:13.211Z","lastColumnChangeAt":"2026-08-01T09:47:07.527Z","queued":false,"files":3,"acceptance":6,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-услуги-b-x-company-id-в-клиенте-кабин/build.log","desc":"# X-Company-Id в клиенте: кабинет компании видит свои данные ## Дефект `frontend/lib/api/client.ts` не шлёт заголовок `X-Company-Id` — `grep -rn \"X-Company-Id\" frontend/` не находит ни одного вхождения. Прод-`TenantMiddleware` (`backend/app/core/middleware/tenant.py:57,99`) ставит tenant-контекст только из него, а без контекста RLS-политики company-scope возвращают ноль строк. На стенде `APP_ENV=production`, то есть …","history":[{"c":"backlog","ts":"2026-08-01T07:56:42.066Z","via":null},{"c":"todo","ts":"2026-08-01T07:57:58.780Z","via":"plan-queued"},{"c":"asking","ts":"2026-08-01T09:38:49.286Z","via":"pipeline"},{"c":"implementing","ts":"2026-08-01T09:39:45.311Z","via":"auto-build"},{"c":"verifying","ts":"2026-08-01T09:43:41.425Z","via":"pipeline"},{"c":"reviewing","ts":"2026-08-01T09:45:43.484Z","via":"pipeline"},{"c":"ready","ts":"2026-08-01T09:47:07.527Z","via":"pipeline"}],"archDecisions":[{"why":""},{"why":""},{"why":""},{"why":""}],"autoN":0},{"id":"ed5a9c0e-e2b8-463b-b061-05bc188a0681","project":"DocsInside2","theme":"Docsinside · Услуги B+ · Модалка «Активация услуг» на реальном контракте","column":"implementing","planId":"13dc2476","dependsOn":["093d38bb-1d58-4a25-9f34-1de42051b569","7630c0aa-e5f2-46cd-a0c3-28c1efa71013","a778e931-af7b-43f5-a4ee-186d7eee0909"],"dispatchedAt":"2026-08-01T09:47:07.528Z","lastColumnChangeAt":"2026-08-01T09:50:41.605Z","queued":false,"files":8,"acceptance":8,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":"/Users/vm/Projects/DocsInside2/.grace-feature-dev/docsinside-услуги-b-модалка-активация-услуг-на-р/build.log","desc":"# Модалка «Активация услуг» на реальном контракте Модалка на карточке компании (`frontend/app/docsinside/clients/[accountId]/[companyId]/page.tsx`, компонент `ActivateServicesDialog`, строки 667+) сейчас заглушка: выпадашка «Услуга» пуста, цена показывает `0.00`, отправить нельзя. Причина — она зовёт эндпоинты, которых нет (`getAvailableServices` → `GET /api/billing/services`), падает в `.catch(() => setServices([]))…","history":[{"c":"backlog","ts":"2026-08-01T07:57:00.395Z","via":null},{"c":"todo","ts":"2026-08-01T07:57:58.780Z","via":"plan-queued"},{"c":"asking","ts":"2026-08-01T09:50:07.616Z","via":"pipeline"},{"c":"implementing","ts":"2026-08-01T09:50:41.605Z","via":"auto-build"}],"archDecisions":[{"q":"Управление состоянием формы","chosen":"useState + вычисляемые значения","why":"useState для lines[], overallDiscount, comment; Final Price / Total вычисляются. Флаг finalPriceManual per-line."},{"q":"Структура i18n-ключей","chosen":"billing.activate.* — плоское пространство","why":"Ключи billing.activate.title, billing.activate.service и т.д."}],"autoN":2},{"id":"c2cd3b5b-96d3-47a1-b1da-2bd8afc6d4bd","project":"DocsInside2","theme":"Docsinside · Услуги B+ · Экран Constructor → Services: услуги, профили, цена","column":"todo","planId":"13dc2476","dependsOn":["093d38bb-1d58-4a25-9f34-1de42051b569","409a318a-724f-4d8f-a528-53fa9d9effa0"],"dispatchedAt":null,"lastColumnChangeAt":"2026-08-01T07:57:58.780Z","queued":true,"files":8,"acceptance":7,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":null,"desc":"# Экран Constructor → Services: услуги, профили, цена Пункт меню Constructor → Services в админском сайдбаре (`frontend/app/docsinside/layout.tsx:37-39`) ведёт на `/docsinside/constructor/services`, которого не существует — в `frontend/app/docsinside/` лежат только `cases`, `clients`, `dashboard`, `requests`. Эта карточка делает маршрут рабочим. ## Что на экране (ТЗ §3.5) **Список услуг.** Таблица: название, описание…","history":[{"c":"backlog","ts":"2026-08-01T07:57:27.409Z","via":null},{"c":"todo","ts":"2026-08-01T07:57:58.780Z","via":"plan-queued"}],"archDecisions":[],"autoN":0},{"id":"8e6fab73-a8dd-430f-aa13-157dd925b7e3","project":"DocsInside2","theme":"Docsinside · Онбординг A2-4 · Регистрация Celery-задач + тест реестра","column":"todo","planId":"1c72e6a5","dependsOn":[],"dispatchedAt":null,"lastColumnChangeAt":"2026-08-01T08:07:34.352Z","queued":true,"files":3,"acceptance":6,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":null,"desc":"# Регистрация задач Celery и гарант в тестах ## Что сломано `backend/app/workers/celery_app.py:73` вызывает: celery_app.autodiscover_tasks([\"app.workers.tasks\"], force=True) Celery по такому списку ищет модуль `app.workers.tasks.tasks` — его не существует, `app/workers/tasks/__init__.py` пуст. Проверено запуском: $ python -c \"from app.workers.celery_app import celery_app; \\ print([n for n in celery_app.tasks if not n…","history":[{"c":"backlog","ts":"2026-08-01T08:05:04.356Z","via":null},{"c":"todo","ts":"2026-08-01T08:07:34.352Z","via":"plan-queued"}],"archDecisions":[],"autoN":0},{"id":"5d0c6b6a-ad00-41bc-acc3-4e7081ca6d7e","project":"DocsInside2","theme":"Docsinside · Онбординг A2-4 · SMTP и FRONTEND_URL: env-шаблоны, дефолты, деградация /health","column":"todo","planId":"1c72e6a5","dependsOn":[],"dispatchedAt":null,"lastColumnChangeAt":"2026-08-01T08:07:34.352Z","queued":true,"files":7,"acceptance":7,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":null,"desc":"# SMTP и FRONTEND_URL: шаблоны env, рабочие дефолты, деградация вместо тишины ## Что сломано 1. `SMTP_HOST · SMTP_PORT · SMTP_USER · SMTP_PASS · SMTP_FROM_EMAIL · SMTP_USE_TLS` и `FRONTEND_URL` отсутствуют в `backend/.env.example`, в корневом `.env.example` и в якоре `x-app-env` (`infra/docker/docker-compose.yml:10-37`). Контейнеры `api` и `worker` получают дефолты из `app/core/config.py:98-104`: `localhost:587` и `h…","history":[{"c":"backlog","ts":"2026-08-01T08:05:43.406Z","via":null},{"c":"todo","ts":"2026-08-01T08:07:34.352Z","via":"plan-queued"}],"archDecisions":[],"autoN":0},{"id":"a5b3345e-99d3-43e8-976b-92125f3188fd","project":"DocsInside2","theme":"Docsinside · Онбординг A2-4 · Postfix-релей в compose + DKIM и чек-лист DNS","column":"todo","planId":"1c72e6a5","dependsOn":["5d0c6b6a-ad00-41bc-acc3-4e7081ca6d7e"],"dispatchedAt":null,"lastColumnChangeAt":"2026-08-01T08:07:34.352Z","queued":true,"files":4,"acceptance":5,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":null,"desc":"# Почтовый релей Postfix во внутренней сети ## Зачем Решение M-Q1 (2026-08-01): почту отправляем своим сервером, без внешнего провайдера. Плата принята осознанно — репутация нового IP нулевая, и без SPF, DKIM, DMARC и PTR письма уедут в спам. DNS и обратная зона настраиваются вручную, эта карточка готовит всё остальное. ## Что сделать Сервис `postfix` (образ `boky/postfix`) в `infra/docker/docker-compose.yml`: - толь…","history":[{"c":"backlog","ts":"2026-08-01T08:05:59.859Z","via":null},{"c":"todo","ts":"2026-08-01T08:07:34.352Z","via":"plan-queued"}],"archDecisions":[],"autoN":0},{"id":"15a9c675-b445-425a-97f3-7a640c359991","project":"DocsInside2","theme":"Docsinside · Онбординг A2-4 · Mailpit в dev-профиле + интеграционный тест письма","column":"todo","planId":"1c72e6a5","dependsOn":["8e6fab73-a8dd-430f-aa13-157dd925b7e3","5d0c6b6a-ad00-41bc-acc3-4e7081ca6d7e"],"dispatchedAt":null,"lastColumnChangeAt":"2026-08-01T08:07:34.352Z","queued":true,"files":4,"acceptance":5,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":null,"desc":"# Проверяемая доставка: приёмник почты в dev и тест содержимого письма ## Зачем Сегодня отправку письма не проверяет ничто. Интеграционный тест `backend/tests/integration/test_company_users.py:34` мокает задачу по пути импорта, поэтому CI оставался зелёным при полностью мёртвом реестре воркера. Приёмника почты в стеке нет — 0 совпадений по `mailpit|mailhog` в `infra/docker/docker-compose.yml`. ## Что сделать **Приёмн…","history":[{"c":"backlog","ts":"2026-08-01T08:06:19.704Z","via":null},{"c":"todo","ts":"2026-08-01T08:07:34.352Z","via":"plan-queued"}],"archDecisions":[],"autoN":0},{"id":"b1381bf8-5696-46e9-ac4a-409429cfca7a","project":"DocsInside2","theme":"Docsinside · Онбординг A2-4 · Перевыпуск временного пароля на уровне аккаунта","column":"todo","planId":"1c72e6a5","dependsOn":["8e6fab73-a8dd-430f-aa13-157dd925b7e3"],"dispatchedAt":null,"lastColumnChangeAt":"2026-08-01T08:07:34.352Z","queued":true,"files":4,"acceptance":7,"rigor":"grace","questions":0,"blockReason":null,"draft":false,"floor":0,"runLog":null,"desc":"# Перевыпуск доступа первому пользователю аккаунта ## Зачем `resend-credentials` живёт под company-scoped роутером: `backend/app/domains/iam/routers/company_users.py:48` — префикс `/api/companies/{company_id}`, эндпоинт на строке 253. Аккаунт без компании допустим (решение A-Q10) и в списке клиентов показывается с нулём компаний. Для такого аккаунта перевыпустить пароль нельзя — то есть ровно в том случае, когда пись…","history":[{"c":"backlog","ts":"2026-08-01T08:06:36.535Z","via":null},{"c":"todo","ts":"2026-08-01T08:07:34.352Z","via":"plan-queued"}],"archDecisions":[],"autoN":0}],"plans":[{"id":"42b133b8","project":"DocsInside2","goal":"Этап D: документы кейса — object storage + ClamAV, CaseDocument со снимком требований, статусы и счётчики, документы Docsinside с авто-переходом шага, дозапрос и сроки, скачивание PDF, вкладка Documents в кабинетах компании и Docsinside","branch":"autodev/plan-42b133b8","mode":"ask","cardIds":["9eab964e-936b-46e3-a28a-d1e62deba063","50ed08b8-41ea-4f4d-965e-fda2ce0528f5","42abe8b0-83d3-4a67-b2de-1737aef86a21","8e6b2e12-2d4e-4962-a5ee-c880813f8520","9c718906-7132-450a-b6c1-cbfe4a1f80e3","da675df4-48a7-452a-b7b3-eacd603f4f95","301d4afb-a16b-4a5b-8dff-4ad9bd5d3e1f","9853667e-9dc7-4600-b991-fb38fea432a7","1544a592-5b1c-4f9a-9184-899778d1bf78"],"archived":true,"closeStatus":"failed","closeStep":"closed","createdAt":"2026-07-29T09:30:50.029Z","policy":{"pr":"always","merge":"manual","deploy":"off"},"acceptance":{"passed":false,"pass":65,"total":99},"pr":{"url":"https://github.com/docsinside-app/docsinside/pull/2","draft":true},"notice":"Приёмка красная — PR оставлен черновиком, деплоя не было. Провалено: d1, d5, d6, c6, c12, c18, c19, c40, c53, c56, m77, m88"},{"id":"44c0ddf4","project":"DocsInside2","goal":"Прогон A2-1: макеты онбординга в HTML и Figma — экраны входа с подписью о согласии, попапы Add client/Add company, карточка компании как рабочее место, Settings с ролями, пустые состояния дашборда, чистка лимитов и карта пакета. План: docs/plans/A2-1-design.md","branch":"autodev/plan-44c0ddf4","mode":"ask","cardIds":["b12917aa-6e40-481d-ae07-a409e1ea6090","62cfa1be-7923-4363-9cc1-55daafa73240","95ee167c-e8ab-4368-99d0-865889c8f233","e6a0460f-885b-43b4-a01b-90215d3d6f1c"],"archived":true,"closeStatus":"done","closeStep":"awaiting-merge","createdAt":"2026-07-30T08:34:05.440Z","policy":{"pr":"always","merge":"manual","deploy":"off"},"acceptance":{"passed":true,"pass":37,"total":38},"pr":{"url":"https://github.com/docsinside-app/docsinside/pull/3","draft":false},"notice":"Приёмка зелёная — готово к мержу. PR: https://github.com/docsinside-app/docsinside/pull/3"},{"id":"2fff0e85","project":"DocsInside2","goal":"Прогон A2-2: домен онбординга — перечень ролей компании с правами и привязкой к пользователю, заведение клиента с письмом доступа, эндпоинты пользователей компании, согласие с политикой и активация первым входом, DS-scope на проде, аудит удач и отказов. План: docs/plans/A2-2-domain.md","branch":"autodev/plan-2fff0e85","mode":"ask","cardIds":["10ab2de2-78cb-484a-94ac-1749553ebacc","d2c7b5ac-2ab8-4a3b-aafe-180b8725ae40","0c5fb70d-9eed-46a6-b1ee-845614a659cb","fb9c3fc0-70f8-4e35-85f6-b16d0430ea8a","f4c73e0e-5339-4218-a059-5d9cddc05e6d","b83978ab-a9d4-42dc-9157-1636d14f4800"],"archived":true,"closeStatus":"failed","closeStep":"closed","createdAt":"2026-07-30T08:34:22.996Z","policy":{"pr":"always","merge":"manual","deploy":"off"},"acceptance":{"passed":false,"pass":40,"total":58},"pr":{"url":"https://github.com/docsinside-app/docsinside/pull/4","draft":true},"notice":"Приёмка красная — PR оставлен черновиком, деплоя не было. Провалено: c1, c2, c3, c4, c6, c7, c8, c11, c12, c13, c14, c16, c43, c44, c47, c48"},{"id":"f618b40c","project":"DocsInside2","goal":"Прогон A2-3: поверхности онбординга — Client List и заведение клиента, карточка компании с Open и действиями за клиента, Settings с ролями, вход с согласием и переключатель компаний, чистка employee_limit и локали, сквозной прогон четырёх историй. План: docs/plans/A2-3-surfaces.md","branch":"autodev/plan-f618b40c","mode":"ask","cardIds":["76645f23-acdf-4986-acc4-d6d353936064","491255b1-8707-4973-8afc-c83b6b86fdd9","5a510ad6-1c42-4674-b65a-9237b3889237","bdfc58dd-ed3b-4aca-b4a8-54d88194389b","3afbd46f-3eca-4cf8-9241-562291f85176","e7ee356b-dca9-42c5-878f-04b9f6b8f4ca"],"archived":true,"closeStatus":"failed","closeStep":"closed","createdAt":"2026-07-30T08:34:33.833Z","policy":{"pr":"always","merge":"manual","deploy":"off"},"acceptance":{"passed":false,"pass":16,"total":65},"pr":{"url":"https://github.com/docsinside-app/docsinside/pull/5","draft":true},"notice":"Приёмка красная — PR оставлен черновиком, деплоя не было. Провалено: d1, d3, d6, c22, c23, c26, c27, c29"},{"id":"13dc2476","project":"DocsInside2","goal":"Услуги B+: конструктор каталога с ценой и рабочая активация услуг","branch":"autodev/plan-13dc2476","mode":"ask","cardIds":["093d38bb-1d58-4a25-9f34-1de42051b569","f9e9e730-d6c0-4329-866f-4a9b36066f59","409a318a-724f-4d8f-a528-53fa9d9effa0","7630c0aa-e5f2-46cd-a0c3-28c1efa71013","a778e931-af7b-43f5-a4ee-186d7eee0909","ed5a9c0e-e2b8-463b-b061-05bc188a0681","c2cd3b5b-96d3-47a1-b1da-2bd8afc6d4bd"],"archived":false,"closeStatus":null,"closeStep":null,"createdAt":"2026-08-01T07:57:58.775Z","policy":{"pr":"always","merge":"manual","deploy":"off"},"acceptance":null,"pr":null,"notice":null},{"id":"1c72e6a5","project":"DocsInside2","goal":"A2-4 · Доставка писем: задачи воркера, SMTP-конфигурация, Postfix-релей, проверяемость","branch":"autodev/plan-1c72e6a5","mode":"ask","cardIds":["8e6fab73-a8dd-430f-aa13-157dd925b7e3","5d0c6b6a-ad00-41bc-acc3-4e7081ca6d7e","a5b3345e-99d3-43e8-976b-92125f3188fd","15a9c675-b445-425a-97f3-7a640c359991","b1381bf8-5696-46e9-ac4a-409429cfca7a"],"archived":false,"closeStatus":null,"closeStep":null,"createdAt":"2026-08-01T08:07:34.352Z","policy":{"pr":"always","merge":"manual","deploy":"off"},"acceptance":null,"pr":null,"notice":null}]};
+const NOW = Date.parse(DATA.updatedAt);
+
+const PHASE = { backlog:"Backlog", todo:"в очереди", asking:"вопросы", implementing:"пишет код",
+  verifying:"проверяет", reviewing:"ревью", ready:"готово", blocked:"стоит" };
+const LAMP = { backlog:"var(--s-backlog)", todo:"var(--s-todo)", asking:"var(--s-asking)",
+  implementing:"var(--s-implementing)", verifying:"var(--s-verifying)", reviewing:"var(--s-reviewing)",
+  ready:"var(--s-ready)", blocked:"var(--s-blocked)" };
+const AGENT = new Set(["asking","implementing","verifying","reviewing"]);
+
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const card = (id) => DATA.cards.find((c) => c.id === id);
+const plan = (id) => DATA.plans.find((p) => p.id === id);
+function since(iso) {
+  const t = Date.parse(iso || ""); if (!t) return "";
+  const m = Math.round((NOW - t) / 60000);
+  if (m < 60) return m + " мин";
+  const h = Math.floor(m / 60); if (h < 24) return h + " ч " + (m % 60) + " мин";
+  return Math.floor(h / 24) + " дн";
+}
+const stale = (iso) => (NOW - Date.parse(iso || "")) > 30 * 60000;
+/* Тема карточки записана как «Проект · Этап · Суть». На треке проект и этап уже сказаны
+   заголовком прогона — оставляем только суть, иначе десять строк начинаются одинаково. */
+function shortTheme(t) { const p = String(t || "").split(" · "); return p.length > 2 ? p.slice(2).join(" · ") : (t || "—"); }
+
+/* Что мешает этому этапу стартовать: непройденные зависимости. */
+function blockers(c) {
+  return (c.dependsOn || []).map(card).filter((d) => d && d.column !== "ready");
+}
+/* Сколько раз прогон ещё остановит человека. В режиме ask каждый незакрытый этап встанет
+   в Asking; в auto останавливает только жёсткий пол. Это и есть обещание user story. */
+function stops(p) {
+  const rest = p.cardIds.map(card).filter((c) => c && c.column !== "ready");
+  return p.mode === "auto" ? rest.filter((c) => (c.floor || 0) > 0).length : rest.length;
+}
+/* Русская форма числа: «1 решение · 2 решения · 5 решений». Интерфейс, который
+   пишет «4 решении(я)», выглядит машинным — а доска должна говорить как человек. */
+function plural(n, one, few, many) { const d = n % 10, h = n % 100;
+  return n + " " + (d === 1 && h !== 11 ? one : d >= 2 && d <= 4 && (h < 12 || h > 14) ? few : many); }
+const times = (n) => plural(n, "раз", "раза", "раз");
+/* Пять состояний узла, а не четыре. «Запускается» — реальное состояние доски: карточка
+   уже отправлена (есть pid), но первую станцию прогон ещё не записал. Сегодня оно
+   неотличимо от «стоит в очереди», и выглядит как «ничего не происходит». */
+function nodeKind(c) {
+  if (!c) return "wait";
+  if (c.column === "blocked") return "blocked";
+  if (c.column === "ready") return "done";
+  if (c.dispatchedAt && c.column === "todo") return "starting";
+  if (c.dispatchedAt) return "live";
+  return "wait";
+}
+
+/* ── цикл карточки ────────────────────────────────────────────────────────
+   У каждой станции своё слово: вопросы · пишет код · проверяет · ревью · готово.
+   Длительности берём из card.history — она уже пишется сервером на каждом переходе. */
+const CYCLE = [["asking", "вопросы"], ["implementing", "пишет код"], ["verifying", "проверяет"],
+  ["reviewing", "ревью"], ["ready", "готово"]];
+function phaseSpans(c) {
+  const h = (c.history || []).filter((x) => x.c !== "backlog" && x.c !== "todo");
+  const out = {};
+  h.forEach((x, i) => {
+    const end = i + 1 < h.length ? Date.parse(h[i + 1].ts) : NOW;
+    out[x.c] = (out[x.c] || 0) + Math.max(0, end - Date.parse(x.ts));
+  });
+  return out;
+}
+const mins = (ms) => { const m = Math.round(ms / 60000); return m < 1 ? "<1 мин" : m < 60 ? m + " мин" : Math.floor(m / 60) + " ч " + (m % 60) + " мин"; };
+function cycleHTML(c) {
+  const spans = phaseSpans(c);
+  const seen = new Set((c.history || []).map((x) => x.c));
+  const cur = c.column;
+  const parts = CYCLE.map(([key, word], i) => {
+    const isNow = key === cur;
+    const isDone = !isNow && (seen.has(key) || (cur === "ready" && key !== "ready"));
+    const cls = isNow ? "now" : isDone ? "done" : "next";
+    const ic = isNow ? "●" : isDone ? "✓" : "○";
+    const t = spans[key] ? ` <b>${esc(mins(spans[key]))}</b>` : "";
+    return `${i ? `<span class="cyc__arr">→</span>` : ""}<span class="cyc cyc--${cls}"><span class="cyc__ic">${ic}</span>${esc(word)}${t}</span>`;
+  }).join("");
+  const stop = cur === "blocked"
+    ? `<span class="cyc__arr">→</span><span class="cyc cyc--stop"><span class="cyc__ic">!</span>стоит${spans.blocked ? ` <b>${esc(mins(spans.blocked))}</b>` : ""}</span>` : "";
+  return `<div class="cycle">${parts}${stop}</div>`;
+}
+
+/* ── вопросы к человеку ───────────────────────────────────────────────────
+   Два блока, как в движке: сначала функционал (смысл задачи), потом архитектура
+   (решения с вариантами). Что из этого дойдёт до человека, решает режим прогона:
+   в auto архитектор выбирает сам, и тогда это не вопрос, а запись в журнале. */
+function askKind(c) {
+  if (c.column !== "asking") return null;
+  if ((c.questions || 0) > 0) return "func";
+  if ((c.archPending || []).length) return "arch";
+  return "drafting";                       // агент ещё формулирует — отвечать не на что
+}
+const askLabel = { func: (c) => `${plural(c.questions, "вопрос", "вопроса", "вопросов")} по функционалу · ответь`,
+  arch: (c) => `Блок 1 готов · ${plural(c.archPending.length, "решение", "решения", "решений")} по архитектуре`,
+  drafting: () => `агент формулирует вопросы…` };
+
+/* ── ЗОНА 1 ───────────────────────────────────────────────────────────────
+   Правило приёма ОДНО, и оно с двумя условиями сразу:
+     1) работа СТОИТ — этап или прогон не двинется дальше;
+     2) снять остановку может ТОЛЬКО человек — ни время, ни агент, ни планировщик.
+   Одно условие без другого — не пропуск. Поэтому здесь нет: лимита подписки (пройдёт
+   по часам → баннер), стража (решает агент), черновиков (ничего не стояло → бэклог),
+   готового к мержу PR (доска закончила → полка) и красной приёмки (решение не срочное). */
+
+/* Как читать закрытие прогона. `awaiting-merge` в данных означает три РАЗНЫХ вещи,
+   и их надо развести, иначе штатный финал выглядит как незакрытый гейт:
+     manual  → PR это финал, доска сделала всё, что могла → полка;
+     auto    → авто-путь сломался (конфликт или нет PR) → зона. */
+function closeState(p) {
+  const pol = p.policy || {};
+  if (!p.closeStatus) return "running";
+  if (p.closeStatus === "failed") return "failed";
+  if (p.closeStep === "awaiting-merge") return pol.merge === "manual" ? "pr-ready" : "merge-failed";
+  if (p.closeStep === "awaiting-deploy") return "deploy-hold";
+  return "closed";
+}
+const CLOSED = new Set(["pr-ready", "failed", "closed"]);
+
+function attention() {
+  const out = [];
+  for (const c of DATA.cards) {
+    if (c.column === "asking" && (c.questions || 0) > 0)
+      out.push({ k:"ask", ic:"🔔", t:shortTheme(c.theme), s:`вопросов: ${c.questions} · стоит ${since(c.lastColumnChangeAt)}`, go:"Ответить", ref:c.id });
+    /* Блок 2 — решения по архитектуре. Отдельная строка: это другой вопрос и другая цена
+       ошибки, чем «уточни поведение», и ждёт он тоже отдельно. */
+    if (c.column === "asking" && (c.archPending || []).length)
+      out.push({ k:"arch", ic:"🧩", t:shortTheme(c.theme),
+        s:`архитектор предлагает ${plural(c.archPending.length, "решение", "решения", "решений")} · стоит ${since(c.lastColumnChangeAt)}`,
+        go:"Разобрать", ref:c.id });
+    // на паузе по лимиту ждут часы, а не человека — такая карточка в зону не идёт
+    if (c.column === "blocked" && !c.paused)
+      out.push({ k:"block", ic:"⛔", t:shortTheme(c.theme), s:`${c.blockReason || "прогон остановлен"} · стоит ${since(c.lastColumnChangeAt)}`, go:"Открыть лог", ref:c.id });
+    if (c.floor)
+      out.push({ k:"floor", ic:"⚠", t:shortTheme(c.theme), s:`жёсткий пол: ${c.floor} — нужна подпись человека`, go:"Разобрать", ref:c.id });
+  }
+  for (const p of DATA.plans) {
+    const st = closeState(p);
+    if (st === "merge-failed")
+      out.push({ k:"merge", ic:"⛔", t:p.goal, ref:p.id, go:"Разобрать",
+        s:`автомерж не прошёл · ${p.pr ? "PR " + p.pr.url.split("/").pop() : "PR не создан"} — доска дальше не пойдёт` });
+    if (st === "deploy-hold")
+      out.push({ k:"floor", ic:"⚠", t:p.goal, ref:p.id, go:"Раскатать",
+        s:`смержено · деплой за человеком (жёсткий пол: боевой стенд)` });
+  }
+  return out;
+}
+function renderAtt() {
+  const items = attention(), host = document.getElementById("att");
+  const live = DATA.plans.filter((p) => !p.archived);
+  if (!items.length) {
+    const next = live.flatMap((p) => p.cardIds.map(card))
+      .find((c) => c && c.column !== "ready" && c.column !== "implementing");
+    host.innerHTML = `<div class="calm">✓ <b>Никто не ждёт.</b> ${hold === "off" ? "Конвейер идёт сам."
+      : hold === "now" ? "Конвейер остановлен тобой." : "Конвейер доигрывает и встанет."}
+      <span>${next ? "ближайшая остановка: " + esc(shortTheme(next.theme)) : "остановок впереди нет"}</span></div>`;
+  } else {
+    host.innerHTML = items.map((i) => `<div class="att__row att__row--${i.k}" data-ref="${esc(i.ref)}">
+      <span class="att__ic">${i.ic}</span>
+      <span class="att__txt"><span class="att__t">${esc(i.t)}</span><span class="att__s">${esc(i.s)}</span></span>
+      <button class="att__go" type="button">${esc(i.go)}</button></div>`).join("");
+  }
+  document.getElementById("attNote").textContent = items.length
+    ? `${items.length} — конвейер стоит и без тебя не поедет`
+    : "сюда попадает только то, что стоит и ждёт именно тебя";
+  return items.length;
+}
+
+/* ── ЗОНА 2 ─────────────────────────────────────────────────────────────── */
+function trackHTML(p) {
+  const cards = p.cardIds.map(card).filter(Boolean);
+  const parts = cards.map((c, i) => {
+    const k = nodeKind(c);
+    const dot = k === "done" ? "✓" : k === "live" ? "●" : k === "blocked" ? "!" : "";
+    const flag = (k === "wait" && p.mode === "ask") ? `<span class="node__flag" title="в режиме Ask этот этап остановится на вопросах">🚩</span>` : "";
+    const seg = i ? `<span class="seg-line${nodeKind(cards[i-1]) === "done" ? " seg-line--done" : ""}"></span>` : "";
+    return `${seg}<button class="node node--${k}" type="button" data-node="${esc(c.id)}" title="${esc(c.theme)}">
+      ${flag}<span class="node__dot">${dot}</span><span class="node__n">S${i + 1}</span></button>`;
+  }).join("");
+  const n = stops(p);
+  const verdict = n
+    ? `<span class="track__verdict track__verdict--stop">🚩 остановит тебя ${times(n)}</span>`
+    : `<span class="track__verdict track__verdict--free">✓ пройдёт сама</span>`;
+  return `<div class="track">${parts}${verdict}</div>`;
+}
+function stageHTML(c, i, p) {
+  const k = nodeKind(c);
+  if (k === "live" || k === "starting") {
+    const ask = askKind(c);
+    const askBar = !ask ? ""
+      : ask === "drafting"
+        ? `<div class="head__ask head__ask--wait"><span class="dot"></span>${esc(askLabel.drafting(c))}</div>`
+        : `<button class="head__ask" type="button" data-sheet="ask|${esc(c.id)}"><span class="dot"></span>${esc(askLabel[ask](c))}<span class="arr">→</span></button>`;
+    return `<div class="stage stage--live" data-card="${esc(c.id)}">
+      <div class="head__top"><span class="head__lamp"></span><span class="head__id">S${i + 1}</span>
+        <span class="head__phase" style="background:${k === "starting" ? "var(--s-todo)" : LAMP[c.column]}">${k === "starting" ? "запускается" : esc(PHASE[c.column])}</span>
+        <span class="head__age${stale(c.lastColumnChangeAt) ? " is-stale" : ""}">на станции ${esc(since(c.lastColumnChangeAt))}${stale(c.lastColumnChangeAt) ? " — дольше обычного" : ""}</span></div>
+      <h3 class="head__t">${esc(shortTheme(c.theme))}</h3>
+      ${cycleHTML(c)}
+      ${askBar}
+      <div class="head__facts">
+        ${c.files ? `<span class="chip">⎘ файлов: ${c.files}</span>` : ""}
+        ${c.acceptance ? `<span class="chip">✓ приёмка: ${c.acceptance} п.</span>` : ""}
+        ${c.rigor === "grace" ? `<span class="chip">grace</span>` : ""}
+        <span class="chip chip--branch">⎇ ${esc(p.branch)}</span>
+        ${(c.archDecisions || []).length ? `<button class="autochip" type="button" data-sheet="ask|${esc(c.id)}">🤖 решено без тебя: ${c.archDecisions.length}</button>` : ""}
+      </div>
+      <div class="head__acts">
+        <button class="mini" type="button" data-sheet="log|${esc(c.id)}">⊟ лог</button>
+        <button class="mini" type="button" data-sheet="card|${esc(c.id)}">открыть задачу</button>
+        <button class="mini" type="button" data-toast="Прогон перезапущен">↻ перезапуск</button>
+        <button class="mini" type="button" data-toast="Этап на паузе — очередь сохранена">⏸ пауза</button>
+      </div></div>`;
+  }
+  const wait = blockers(c);
+  /* Почему этап стоит — два разных ответа, и их нельзя путать: «жду предшественника»
+     чинится порядком, «слот проекта занят» — это WIP=1 и чинится только временем. */
+  const held = hold !== "off" && (hold !== "after-run" || c.planId !== (runningPlan() || {}).id);
+  const right = k === "done"
+    ? `<span>готово · ${esc(since(c.lastColumnChangeAt))} назад</span>`
+    : wait.length
+      ? `<span class="lock">🔒 ждёт S${p.cardIds.indexOf(wait[0].id) + 1}${wait.length > 1 ? " +" + (wait.length - 1) : ""}</span>`
+      : held
+        ? `<span class="lock">⏸ не стартует · удержание</span>`
+        : c.queued
+          ? `<span>⏳ слот проекта занят</span>`
+          : `<span>—</span>`;
+  const mark = k === "done" ? "✓" : k === "blocked" ? "!" : "○";
+  return `<div class="stage stage--${k}" data-card="${esc(c.id)}">
+    <span class="stage__mark">${mark}</span>
+    <span class="stage__id">S${i + 1}</span>
+    <span class="stage__t">${esc(shortTheme(c.theme))}</span>
+    <span class="stage__r">${right}</span></div>`;
+}
+function runHTML(p, open) {
+  const cards = p.cardIds.map(card).filter(Boolean);
+  const done = cards.filter((c) => c.column === "ready").length;
+  const auto = p.mode === "auto";
+  /* Прогон между этапами — тоже состояние: предыдущий этап закрыт, следующий ещё не
+     подхвачен планировщиком. Сегодня это выглядит как «доска встала». */
+  const idle = cards.length && !cards.some((c) => nodeKind(c) === "live" || nodeKind(c) === "starting") && done < cards.length;
+  return `<article class="run${auto ? " run--auto" : ""}" data-open="${open ? 1 : 0}" data-plan="${esc(p.id)}">
+    <header class="run__head">
+      <span class="run__badge">⚡ прогон</span>
+      <h2 class="run__title">${esc(p.goal)}</h2>
+      <span class="run__meta">
+        <span class="chip chip--proj">▣ ${esc(p.project || (cards[0] || {}).project || "—")}</span>
+        <span class="chip">${done} / ${cards.length}</span>
+        <span class="chip chip--${auto ? "auto" : "ask"}">${auto ? "auto" : "ask"}</span>
+        <span class="chip chip--branch">⎇ ${esc(p.branch)}</span>
+      </span>
+      <button class="run__toggle" type="button" aria-label="Свернуть прогон">⌄</button>
+    </header>
+    ${trackHTML(p)}
+    <div class="run__body">${idle ? `<div class="between">⏱ <b>Между этапами.</b>
+      Готово ${done} из ${cards.length}, следующий этап планировщик подхватит сам — ждать человека не нужно.</div>` : ""}
+      ${cards.map((c, i) => stageHTML(c, i, p)).join("")}</div>
+  </article>`;
+}
+function renderRuns() {
+  const live = DATA.plans.filter((p) => !p.archived);
+  /* Развёрнут тот прогон, у которого есть голова. Остальные — одной строкой:
+     на экране всегда видно ВСЕ прогоны, а читается только работающий. */
+  const html = live.map((p) => {
+    const hot = p.cardIds.map(card).some((c) => c && (nodeKind(c) === "live" || nodeKind(c) === "starting"));
+    return runHTML(p, hot || live.length === 1);
+  }).join("");
+  document.getElementById("runs").innerHTML = html;
+  document.getElementById("runsNote").textContent =
+    `${live.length} живых · ${live.reduce((n, p) => n + p.cardIds.length, 0)} этапов · строго последовательно (WIP=1 на проект)`;
+}
+
+/* ── ЗОНА 3 ─────────────────────────────────────────────────────────────── */
+let soloDemo = false;
+const DEMO = [
+  { id:"d1", column:"backlog", theme:"Виноградарь · Погодный прогноз на 5 дней в карточке участка", project:"Vinogradar" },
+  { id:"d2", column:"todo", theme:"grace-board · Архивация карточек из Ready", project:"grace-board" },
+  { id:"d3", column:"implementing", theme:"Emotions · Экспорт дневника в PDF", project:"Emotions", lastColumnChangeAt:new Date(NOW - 7 * 60000).toISOString() },
+];
+function soloCard(c) {
+  return `<div class="sc" data-col="${esc(c.column)}" draggable="true">
+    <div class="sc__t">${esc(shortTheme(c.theme))}</div>
+    <div class="sc__m"><span class="col__lamp" style="color:${LAMP[c.column]}"></span>${esc(c.project)}${
+      c.lastColumnChangeAt ? " · " + esc(since(c.lastColumnChangeAt)) : ""}</div></div>`;
+}
+function renderSolo() {
+  const loose = DATA.cards.filter((c) => !c.planId).concat(soloDemo ? DEMO : []);
+  const host = document.getElementById("solo");
+  if (!loose.length) {
+    host.innerHTML = `<div class="soloempty">🧩 <b>Одиночных задач нет</b> — все 23 карточки принадлежат прогонам.
+      Заведи задачу: она встанет в Backlog и поедет через рычаг, как раньше.
+      <button class="btn btn--ghost" type="button" data-demo="task">+ Задача</button></div>`;
+    return;
+  }
+  const col = (key, name) => {
+    const cs = loose.filter((c) => c.column === key || (key === "implementing" && AGENT.has(c.column)));
+    return `<div class="col"><div class="col__head"><span class="col__lamp" style="color:${LAMP[key]}"></span>
+      <span class="col__name">${name}</span><span class="col__n">${cs.length}</span></div>
+      <div class="col__wrap">${cs.length ? cs.map(soloCard).join("") : `<div class="empty">—</div>`}</div></div>`;
+  };
+  host.innerHTML = `<div class="solo">${col("backlog", "Backlog")}
+    <div class="lever" title="перетащи карточку через рычаг — команда возьмёт задачу"><span class="lever__knob"></span><span class="lever__label">launch</span></div>
+    ${col("todo", "В очереди")}${col("implementing", "В работе")}</div>`;
+}
+
+/* ── ЗОНА 4 ─────────────────────────────────────────────────────────────── */
+/* ── ЗОНА 4 · полка закрытого ──────────────────────────────────────────────
+   Сюда попадает всё, что доска довела до конца, — включая «PR собран, мерж за тобой».
+   Это финал, а не ожидание: доска сделала всё, что позволяла политика прогона. */
+const CLOSE_WORD = {
+  "pr-ready": ["✓", "закрыт · PR за тобой", "мерж руками — политика прогона"],
+  closed:     ["✓", "закрыт", "смержено и раскатано по политике"],
+  failed:     ["✕", "провален", "приёмка красная — PR оставлен черновиком, деплоя не было"],
+};
+function renderShelf() {
+  const shelf = DATA.plans.filter((p) => CLOSED.has(closeState(p)));
+  const host = document.getElementById("shelf");
+  host.innerHTML = shelf.map((p) => {
+    const cs = p.cardIds.map(card).filter(Boolean);
+    const st = closeState(p), bad = st === "failed";
+    const [ic, word, why] = CLOSE_WORD[st];
+    const a = p.acceptance;
+    return `<article class="done${bad ? " done--failed" : ""}" data-open="0" data-plan="${esc(p.id)}">
+      <header class="done__head">
+        <span class="done__ic">${ic}</span>
+        <span class="done__t">${esc(p.goal)}</span>
+        <span class="run__meta">
+          <span class="chip chip--${bad ? "bad" : "ok"}">${esc(word)}</span>
+          ${a ? `<span class="chip chip--${a.passed ? "ok" : "bad"}">приёмка ${a.pass}/${a.total}</span>` : ""}
+          ${p.pr ? `<a class="chip${p.pr.draft ? " chip--bad" : ""}" href="${esc(p.pr.url)}" target="_blank" rel="noopener">PR ${esc(p.pr.url.split("/").pop())}${p.pr.draft ? " · черновик" : ""} →</a>` : ""}
+          ${cs.length ? `<span class="chip">${cs.length} на доске</span>` : ""}
+          <span class="chip">${esc(since(p.createdAt))} назад</span>
+        </span>
+        ${cs.length ? `<button class="mini" type="button" data-sweep="${esc(p.id)}">Убрать с доски</button>` : `<span class="chip">карточек нет</span>`}
+      </header>
+      <div class="done__body">
+        <div class="sheet__v" style="margin-bottom:7px">${esc(why)}</div>
+        ${cs.map((c) => `<div class="done__row"><span>S${p.cardIds.indexOf(c.id) + 1}</span>
+          <b>${esc(shortTheme(c.theme))}</b><span>${esc(PHASE[c.column])}</span></div>`).join("")}
+        ${p.notice ? `<div class="sheet__v" style="margin-top:9px">${esc(p.notice)}</div>` : ""}</div>
+    </article>`;
+  }).join("");
+  const n = shelf.reduce((s, p) => s + p.cardIds.filter(card).length, 0);
+  const failed = shelf.filter((p) => closeState(p) === "failed").length;
+  document.getElementById("shelfNote").textContent =
+    `${plural(shelf.length, "закрытый прогон", "закрытых прогона", "закрытых прогонов")}${failed ? `, из них ${failed} с красной приёмкой` : ""} · держат ${plural(n, "карточку", "карточки", "карточек")} в Ready`;
+}
+
+/* ── метрика: то же, что можно перемерить руками ─────────────────────────── */
+function renderGauge() {
+  const w = document.querySelector(".deck").clientWidth;
+  const rows = Math.floor((window.innerHeight - 320) / parseInt(getComputedStyle(document.body).getPropertyValue("--row")));
+  document.getElementById("gauge").innerHTML =
+    `<span>сетка v4: ширина контента <b>${w}px</b> · горизонтального скролла <b>нет</b> (было <s>≈2500px</s>)</span>
+     <span>областей прокрутки: <b>1</b> — страница (было <s>11</s>)</span>
+     <span>этапов в поле зрения: <b>≈${rows}</b> (было <s>≈2 карточки</s>)</span>
+     <span>прогон свёрнут: <b>72px</b> · рельс сегодня: <s>до 32vh</s></span>`;
+}
+
+/* ── режим примера ────────────────────────────────────────────────────────
+   На живой доске карточка стоит в Asking секунды: в режиме `ask` архитектор чаще
+   решает сам (порог эскалации), и увидеть блок вопросов «вживую» почти нельзя.
+   Кнопка переводит РЕАЛЬНУЮ карточку в состояние «ждёт решений», подставляя её же
+   настоящие решения из board.json как нерешённые. Ничего не выдумано — только
+   отмотано назад состояние, которое эта карточка уже проходила. */
+let demoOn = false, demoId = null, demoSnap = null;
+function toggleAskDemo() {
+  if (demoOn) { Object.assign(card(demoId), demoSnap); demoOn = false; demoId = null; }
+  else {
+    const target = DATA.cards.find((c) => (nodeKind(c) === "live" || nodeKind(c) === "starting") && (c.archDecisions || []).length)
+      || DATA.cards.filter((c) => (c.archDecisions || []).length).sort((a, b) => b.archDecisions.length - a.archDecisions.length)[0];
+    if (!target) return toast("В снимке нет карточки с решениями архитектора");
+    demoId = target.id;
+    demoSnap = { column:target.column, archPending:target.archPending, history:target.history,
+      lastColumnChangeAt:target.lastColumnChangeAt, dispatchedAt:target.dispatchedAt };
+    target.column = "asking";
+    target.dispatchedAt = target.dispatchedAt || new Date(NOW - 5 * 60000).toISOString();
+    target.lastColumnChangeAt = new Date(NOW - 6 * 60000).toISOString();
+    // историю тоже отматываем до Asking — иначе полоса цикла покажет уже пройденный «код»
+    const ai = target.history.findIndex((h) => h.c === "asking");
+    if (ai >= 0) target.history = target.history.slice(0, ai + 1);
+    target.archPending = target.archDecisions.map((d) => ({ q:d.q, chosen:d.chosen, why:d.why }));
+    demoOn = true;
+  }
+  document.getElementById("askDemo").textContent = demoOn ? "убрать пример" : "показать пример вопросов";
+  renderAll();
+}
+
+/* ── стоп-кран ────────────────────────────────────────────────────────────
+   Три разных «стоп», и путать их нельзя — они отличаются тем, что успеет доиграть:
+     after-stage — доигрывает текущий этап, следующий не берётся;
+     after-run   — прогон доходит до конца и закрывается, СЛЕДУЮЩИЙ не стартует;
+     now         — текущий этап на паузу немедленно, место в очереди сохраняется.
+   В движке точка ровно одна — scheduleQueued (server.js:577), где уже стоит такой же
+   ранний выход для лимита подписки: «очередь просто держится, порядок сохранён». */
+let hold = "off";
+const HOLD_WORD = { "after-stage": "после текущего этапа", "after-run": "после текущего прогона", now: "сейчас" };
+
+// Средняя длительность этапа этого прогона — из фактических историй закрытых этапов.
+function avgStageMin(p) {
+  const durs = p.cardIds.map(card).filter((c) => c && c.column === "ready")
+    .map((c) => { const h = (c.history || []).filter((x) => x.c !== "backlog" && x.c !== "todo");
+      return h.length ? (Date.parse(c.lastColumnChangeAt) - Date.parse(h[0].ts)) / 60000 : 0; })
+    .filter((m) => m > 0);
+  return durs.length ? Math.round(durs.reduce((a, b) => a + b) / durs.length) : 0;
+}
+function eta(p, stages) {
+  const a = avgStageMin(p);
+  return a ? ` · ~${a * stages} мин по средней длительности этапа (${a} мин)` : "";
+}
+const runningPlan = () => DATA.plans.find((p) => !p.archived &&
+  p.cardIds.map(card).some((c) => c && (nodeKind(c) === "live" || nodeKind(c) === "starting")));
+
+/* Цена обрыва зависит от фазы, и человек должен знать её ДО нажатия.
+   Контекст процесса не переживает обрыв нигде: каждый этап — отдельный `claude -p`,
+   без --continue. Переживает только записанное: карточка, board.json прогона и git.
+   Поэтому «заново» на арх-фазе стоит минуты, а на сборке — откат к зелёному коммиту. */
+const STOP_COST = {
+  asking: "вопросы и решения архитектора придётся собрать заново · ответы блока 1 сохранятся",
+  implementing: "вернётся к последнему зелёному коммиту · несохранённое пропадёт",
+  verifying: "проверка пойдёт заново · код на месте",
+  reviewing: "ревью пойдёт заново · код на месте",
+};
+function stopCost() {
+  const c = DATA.cards.find((x) => nodeKind(x) === "live");
+  if (!c) return "сейчас никто не работает — встанет только очередь";
+  const p = plan(c.planId), n = p ? p.cardIds.indexOf(c.id) + 1 : 0;
+  return `${n ? "S" + n + " · " : ""}${STOP_COST[c.column] || "этап начнётся заново"}`;
+}
+
+function brakeMenuHTML() {
+  const p = runningPlan();
+  const left = p ? p.cardIds.map(card).filter((c) => c && c.column !== "ready").length : 0;
+  const next = DATA.plans.filter((x) => !x.archived && (!p || x.id !== p.id)).length;
+  return `<button class="brake__opt" type="button" data-hold="after-stage"><b>Дать доработать этап</b>
+      <span>текущий этап дойдёт до конца, следующий не начнётся${p ? eta(p, 1) : ""}</span></button>
+    <button class="brake__opt" type="button" data-hold="after-run"><b>Дать доработать прогон</b>
+      <span>${p ? `осталось ${plural(left, "этап", "этапа", "этапов")}${eta(p, left)} · ` : ""}следующий прогон${next ? ` (их ${next} в очереди)` : ""} не стартует</span></button>
+    <div class="brake__sep"></div>
+    <button class="brake__opt brake__opt--now" type="button" data-hold="now"><b>Оборвать этап сейчас</b>
+      <span>${stopCost()}</span></button>
+    ${hold !== "off" ? `<div class="brake__sep"></div>
+      <button class="brake__opt" type="button" data-hold="off"><b>Отменить удержание</b>
+        <span>конвейер продолжит сам</span></button>` : ""}`;
+}
+function renderHold() {
+  const btn = document.getElementById("brakeBtn");
+  btn.classList.toggle("is-on", hold !== "off");
+  // короткая форма в шапке: полная фраза живёт в полосе, дублировать её незачем
+  btn.textContent = hold === "off" ? "⏸ Остановить"
+    : hold === "now" ? "⏸ остановлен" : hold === "after-stage" ? "⏸ после этапа" : "⏸ после прогона";
+  document.getElementById("brakeMenu").innerHTML = brakeMenuHTML();
+  const host = document.getElementById("holdHost");
+  if (hold === "off") { host.innerHTML = ""; return; }
+  const p = runningPlan();
+  const left = p ? p.cardIds.map(card).filter((c) => c && c.column !== "ready").length : 0;
+  const body = hold === "now"
+    ? `<b>Конвейер остановлен.</b><span>этап оборван · место в очереди сохранено · при возобновлении продолжит с последнего записанного шага</span>`
+    : hold === "after-stage"
+      ? `<b>Конвейер встанет после текущего этапа.</b><span>этап доигрывает${p ? eta(p, 1) : ""} · новые этапы и прогоны не запускаются</span>`
+      : `<b>Конвейер встанет после текущего прогона.</b><span>${p ? `осталось ${plural(left, "этап", "этапа", "этапов")}${eta(p, left)} · ` : ""}прогон закроется по политике, следующий не стартует</span>`;
+  host.innerHTML = `<div class="holdbar"><span class="holdbar__ic">⏸</span>
+    <span class="holdbar__b">${body}</span>
+    <span class="holdbar__acts">
+      ${hold !== "now" ? `<button class="mini" type="button" data-hold="now">Встать сейчас</button>` : ""}
+      <button class="mini" type="button" data-hold="off">Отменить</button></span></div>`;
+}
+
+/* ── мастер запуска ───────────────────────────────────────────────────────
+   Движок УЖЕ умеет автомерж (gh pr merge) и раскатку на стенд (stand.deploy_cmd),
+   а POST /api/plans принимает policy — но мастер её не спрашивает, поэтому все прогоны
+   уезжают с дефолтом {pr:always, merge:manual, deploy:off}. Три переключателя ниже —
+   это не новая фича, а доступ к тому, что уже есть.
+   Главное здесь — не сами тумблеры, а строка вердикта: чем прогон закончится. */
+const launchEl = document.getElementById("launch");
+let pol = { pr:"always", merge:"manual", deploy:"off" }, launchMode = "ask";
+function policyVerdict() {
+  const bits = [];
+  if (pol.pr === "never") bits.push("PR не собирается — результат останется в интеграционной ветке.");
+  else if (pol.merge === "manual") bits.push("Доска соберёт PR и на этом <b>закроет прогон</b>: мерж за тобой, ждать доска не будет.");
+  else bits.push("Доска соберёт PR и <b>смержит сама</b>.");
+  if (pol.merge === "auto" && pol.deploy === "after-merge") bits.push("После мержа — раскатка на стенд.");
+  if (pol.deploy === "ask") bits.push("Деплой <em>спросит тебя</em>.");
+  if (pol.merge === "manual" && pol.deploy !== "off") bits.push("<em>Деплой не сработает: без автомержа мержить нечего.</em>");
+  const stops = launchMode === "ask"
+    ? "По ходу остановится на вопросах <b>на каждом этапе</b>."
+    : "По ходу вопросы решит сама — остановит только жёсткий пол.";
+  const floor = pol.deploy !== "off"
+    ? " Если стенд помечен боевым (<code>stand.is_production</code>), деплой всё равно спросит человека — это жёсткий пол."
+    : "";
+  const red = " Красная приёмка отменяет всё: PR останется черновиком, мержа и деплоя не будет.";
+  return `<span class="verdict__ic">${pol.merge === "auto" && pol.deploy === "after-merge" ? "🚀" : pol.merge === "auto" ? "🔀" : "📄"}</span>
+    <span class="verdict__b">${bits.join(" ")} ${stops}${floor}${red}</span>`;
+}
+function paintPolicy() {
+  const set = (id, v) => document.querySelectorAll(`#${id} .seg__opt`).forEach((o) => o.classList.toggle("is-on", o.dataset.v === v));
+  set("polPr", pol.pr); set("polMerge", pol.merge); set("polDeploy", pol.deploy); set("lMode", launchMode);
+  document.getElementById("lVerdict").innerHTML = policyVerdict();
+}
+function openLaunch() {
+  const projects = [...new Set(DATA.cards.map((c) => c.project))];
+  document.getElementById("lProject").innerHTML = projects.map((p) => `<option>${esc(p)}</option>`).join("");
+  paintPolicy();
+  launchEl.dataset.open = "1";
+}
+launchEl.addEventListener("click", (e) => {
+  if (e.target.closest("[data-lclose]") || e.target.classList.contains("launch__scrim")) { launchEl.dataset.open = "0"; return; }
+  const o = e.target.closest(".seg__opt"); if (!o) return;
+  const seg = o.parentElement.id;
+  if (seg === "lMode") launchMode = o.dataset.v;
+  else if (seg === "polPr") pol.pr = o.dataset.v;
+  else if (seg === "polMerge") pol.merge = o.dataset.v;
+  else if (seg === "polDeploy") pol.deploy = o.dataset.v;
+  paintPolicy();
+});
+
+/* ── взаимодействие ─────────────────────────────────────────────────────── */
+const sheet = document.getElementById("sheet"), sheetPanel = document.getElementById("sheetPanel");
+function closeSheet() { sheet.dataset.open = "0"; }
+
+/* ── шторка вопросов: то же, что сегодня, но вход в неё есть из зоны «требует меня» ──
+   Блок 1 — функционал (смысл задачи), блок 2 — архитектура (решения). Если прогон
+   решил архитектуру сам, блок 2 превращается в журнал «решено без тебя»: вопрос никуда
+   не девается, он просто уже отвечен — и человек может увидеть, чем именно. */
+function askSheetHTML(c) {
+  const pend = c.archPending || [], auto = c.archDecisions || [];
+  const b1 = (c.questions || 0) > 0
+    ? Array.from({ length: c.questions }, (_, i) =>
+        `<div class="qrow"><span class="qrow__q"><b>${i + 1}</b>вопрос ${i + 1} по функционалу</span>
+         <textarea class="qrow__a" rows="2" placeholder="Ответ…"></textarea></div>`).join("")
+      + `<button class="qblock__send" type="button" data-toast="Ответы приняты · архитектор готовит решения">Ответить →</button>`
+    : `<div class="qblock__wait">✓ по функционалу вопросов нет — постановка карточки закрыла их</div>`;
+  const b2 = pend.length
+    ? pend.map((d, i) => `<div class="decision">
+        <div class="decision__q"><b>${i + 1}</b>${esc(d.q)}</div>
+        <label class="opt"><input type="radio" name="d${i}" checked />
+          <div class="opt__title">${esc(d.chosen)}<span class="opt__rec">предлагает архитектор</span></div>
+          <div class="opt__desc">${esc(d.why)}</div></label>
+        <label class="opt"><input type="radio" name="d${i}" />
+          <div class="opt__title">Свой вариант</div>
+          <textarea class="qrow__a" rows="2" placeholder="как лучше…" style="margin-top:6px"></textarea></label>
+      </div>`).join("")
+      + `<button class="qblock__send" type="button" data-toast="Решения приняты · сборка запущена">Принять решения и запустить сборку →</button>`
+    : auto.length
+      ? auto.map((d) => `<div class="autodec"><div class="autodec__q">${esc(d.q)}</div>
+          <div class="autodec__a">→ ${esc(d.chosen)}</div>
+          <div class="autodec__w">${esc(d.why)}</div></div>`).join("")
+        + `<div class="qblock__wait">решено без остановки прогона · порог эскалации не сработал</div>`
+      : `<div class="qblock__wait"><span class="dot"></span>архитектор ещё не предлагал решений</div>`;
+  return `<div class="sheet__head"><h2 class="sheet__title">Вопросы по карточке</h2>
+      ${demoOn && c.id === demoId ? `<span class="demo">пример</span>` : ""}
+      <button class="sheet__close" type="button" data-close>✕</button></div>
+    <div class="sheet__v" style="color:var(--ink);font-family:var(--display);font-weight:600;font-size:15px">${esc(shortTheme(c.theme))}</div>
+    ${cycleHTML(c)}
+    <div class="qblock qblock--func">
+      <div class="qblock__head"><span class="qblock__no">1</span><span class="qblock__title">Вопросы по функционалу</span></div>
+      <p class="qblock__sub">смысл задачи — что именно делаем</p>${b1}</div>
+    <div class="qblock qblock--arch">
+      <div class="qblock__head"><span class="qblock__no">2</span><span class="qblock__title">Решения по архитектуре</span></div>
+      <p class="qblock__sub">${pend.length ? "подтверди или замени — каждое решение уедет в seed этапа"
+        : auto.length ? "прогон решил сам · журнал решений" : "появятся после блока 1"}</p>${b2}</div>`;
+}
+
+function openSheet(kind, id) {
+  const c = card(id);
+  if (kind === "ask") { sheetPanel.innerHTML = askSheetHTML(c); sheet.dataset.open = "1"; return; }
+  if (kind === "log") {
+    sheetPanel.innerHTML = `<div class="sheet__head"><h2 class="sheet__title">Лог этапа</h2><button class="sheet__close" type="button" data-close>✕</button></div>
+      <div class="sheet__box"><span class="sheet__k">карточка</span><span class="sheet__v">${esc(shortTheme(c.theme))}</span>
+      <span class="sheet__k">файл</span><span class="sheet__v" style="font-family:var(--mono);font-size:11px">${esc(c.runLog || "—")}</span></div>
+      <div class="sheet__v">В прототипе лог не подключён — в доске здесь открывается тот же просмотрщик «План · Лог», что и сегодня.</div>`;
+  } else {
+    sheetPanel.innerHTML = `<div class="sheet__head"><h2 class="sheet__title">${esc(shortTheme(c.theme))}</h2><button class="sheet__close" type="button" data-close>✕</button></div>
+      ${cycleHTML(c)}
+      <div class="sheet__box">
+        <span class="sheet__k">станция</span><span class="sheet__v">${esc(PHASE[c.column])} · ${esc(since(c.lastColumnChangeAt))} на станции</span>
+        <span class="sheet__k">проект</span><span class="sheet__v">${esc(c.project)}</span>
+        ${c.files ? `<span class="sheet__k">файлов в объёме</span><span class="sheet__v">${c.files}</span>` : ""}
+        ${c.acceptance ? `<span class="sheet__k">пунктов приёмки</span><span class="sheet__v">${c.acceptance}</span>` : ""}
+      </div>
+      ${(c.archDecisions || []).length || (c.archPending || []).length || (c.questions || 0)
+        ? `<button class="mini" type="button" data-sheet="ask|${esc(c.id)}">🧩 вопросы и решения по этой карточке →</button>` : ""}
+      <div><span class="sheet__k">описание</span><div class="sheet__v">${esc(c.desc || "—")}</div></div>`;
+  }
+  sheet.dataset.open = "1";
+}
+let toastTimer = null;
+function toast(html) {
+  const t = document.getElementById("toast");
+  t.innerHTML = html; t.dataset.open = "1";
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.dataset.open = "0"), 2600);
+}
+document.addEventListener("click", (e) => {
+  const t = e.target;
+  const menu = document.getElementById("brakeMenu");
+  const hb = t.closest("[data-hold]");
+  if (hb) {
+    hold = hb.dataset.hold; menu.dataset.open = "0"; renderAll();
+    return toast(hold === "off" ? "Удержание снято — конвейер продолжит сам"
+      : hold === "now" ? "Этап на паузе · <b>место в очереди сохранено</b>"
+      : `Конвейер встанет <b>${HOLD_WORD[hold]}</b>`);
+  }
+  if (t.closest("#brakeBtn")) { menu.dataset.open = menu.dataset.open === "1" ? "0" : "1"; return; }
+  if (menu.dataset.open === "1" && !t.closest(".brake")) menu.dataset.open = "0";
+  if (t.closest("[data-close]") || t.classList.contains("sheet__scrim")) return closeSheet();
+  const toggle = t.closest(".run__head");
+  if (toggle) { const r = toggle.closest(".run"); r.dataset.open = r.dataset.open === "1" ? "0" : "1"; renderGauge(); return; }
+  const dh = t.closest(".done__head");
+  if (dh && !t.closest("[data-sweep]")) { const d = dh.closest(".done"); d.dataset.open = d.dataset.open === "1" ? "0" : "1"; return; }
+  const sw = t.closest("[data-sweep]");
+  if (sw) { const p = plan(sw.dataset.sweep); toast(`Убрано с доски: <b>${p.cardIds.filter(card).length} карточек</b> · прогон и PR остались в истории`); return; }
+  const sh = t.closest("[data-sheet]");
+  if (sh) { const [k, id] = sh.dataset.sheet.split("|"); return openSheet(k, id); }
+  const tt = t.closest("[data-toast]");
+  if (tt) return toast(esc(tt.dataset.toast));
+  const nd = t.closest("[data-node]");
+  if (nd) {
+    const row = document.querySelector(`.stage[data-card="${nd.dataset.node}"]`);
+    const run = nd.closest(".run"); run.dataset.open = "1";
+    document.querySelectorAll(".node.is-target").forEach((n) => n.classList.remove("is-target"));
+    nd.classList.add("is-target");
+    if (row) { row.scrollIntoView({ block:"center", behavior:"smooth" }); }
+    return;
+  }
+  const att = t.closest(".att__row");
+  if (att) {
+    const p = plan(att.dataset.ref);
+    if (p) return toast(`Прототип: здесь открывается гейт мержа прогона <b>${esc(p.branch)}</b>`);
+    return openSheet("card", att.dataset.ref);
+  }
+  const st = t.closest(".stage");
+  if (st && !t.closest("button")) return openSheet("card", st.dataset.card);
+  const dm = t.closest("[data-demo]");
+  if (dm) return dm.dataset.demo === "launch" ? openLaunch() : toast("Композер задачи — без изменений");
+});
+document.getElementById("collapseAll").addEventListener("click", (e) => {
+  const any = [...document.querySelectorAll(".run")].some((r) => r.dataset.open === "1");
+  document.querySelectorAll(".run").forEach((r) => (r.dataset.open = any ? "0" : "1"));
+  e.currentTarget.textContent = any ? "развернуть все" : "свернуть все";
+  renderGauge();
+});
+document.getElementById("density").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-d]"); if (!b) return;
+  document.body.dataset.d = b.dataset.d;
+  document.querySelectorAll("#density .seg__opt").forEach((o) => o.classList.toggle("is-on", o === b));
+  renderGauge();
+});
+document.getElementById("demoSolo").addEventListener("click", (e) => {
+  soloDemo = !soloDemo; e.currentTarget.textContent = soloDemo ? "убрать пример" : "показать на примере";
+  renderSolo();
+});
+const findEl = document.getElementById("find");
+findEl.addEventListener("input", () => {
+  const q = findEl.value.trim().toLowerCase();
+  document.querySelectorAll(".stage,.run,.done,.att__row").forEach((el) => {
+    el.classList.toggle("is-dim", !!q && !el.textContent.toLowerCase().includes(q));
+  });
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { closeSheet(); launchEl.dataset.open = "0"; if (findEl.value) { findEl.value = ""; findEl.dispatchEvent(new Event("input")); } }
+  if (e.key === "/" && document.activeElement !== findEl) { e.preventDefault(); findEl.focus(); }
+});
+window.addEventListener("resize", renderGauge);
+
+/* ── сборка ─────────────────────────────────────────────────────────────── */
+function renderPulse(attN) {
+  const c = DATA.cards;
+  const inwork = c.filter((x) => AGENT.has(x.column)).length;
+  const queue = c.filter((x) => x.column === "todo").length;
+  const ready = c.filter((x) => x.column === "ready").length;
+  document.getElementById("pulse").innerHTML =
+    (attN ? `<span class="pulse__k pulse__k--you"><span class="pulse__lamp" style="color:var(--s-asking);background:var(--s-asking)"></span>ждут тебя <b>${attN}</b></span>`
+          : `<span class="pulse__k pulse__k--calm"><span class="pulse__lamp" style="color:var(--s-ready);background:var(--s-ready)"></span>тебя не ждут</span>`) +
+    `<span class="pulse__k"><span class="pulse__lamp" style="color:var(--s-implementing);background:var(--s-implementing)"></span>в работе <b>${inwork}</b></span>
+     <span class="pulse__k"><span class="pulse__lamp" style="color:var(--s-todo);background:var(--s-todo)"></span>в очереди <b>${queue}</b></span>
+     <span class="pulse__k pulse__k--muted"><span class="pulse__lamp" style="color:var(--s-ready);background:var(--s-ready)"></span>закрыто <b>${ready}</b></span>`;
+}
+function renderAll() { renderHold(); renderPulse(renderAtt()); renderRuns(); renderSolo(); renderShelf(); renderGauge(); }
+document.getElementById("askDemo").addEventListener("click", toggleAskDemo);
+renderAll();
+</script>
+</body>
+</html>
