@@ -307,6 +307,31 @@ body{
 .btn--run:hover{filter:brightness(1.07);transform:translateY(-1px)}
 .btn--run[disabled]{opacity:.55;filter:none;transform:none;cursor:default}
 
+/* ══ v4 Ш5 · полка закрытого ══════════════════════════════════════════════════
+   Реюз .tag (третью систему чипов из прототипа не заводим — на доске уже есть
+   .tag и .rail__chip), плюс два модификатора исхода. */
+.tag--ok{color:#1f7a42;background:rgba(46,158,80,.1);border-color:rgba(46,158,80,.32)}
+.tag--bad{color:var(--s-blocked);background:rgba(211,63,53,.08);border-color:rgba(211,63,53,.32)}
+a.tag{text-decoration:none}
+a.tag:hover{border-color:var(--ink-soft)}
+.shelf{margin:2px 24px 22px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.shelf__head{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--ink-faint);padding:9px 15px;background:var(--surface-2);border-bottom:1px solid var(--line)}
+.done{padding:11px 15px;border-left:3px solid var(--s-ready)}
+.done+.done{border-top:1px solid var(--line)}
+.done--failed{border-left-color:var(--s-blocked)}
+.done__head{display:flex;align-items:center;gap:11px;flex-wrap:wrap}
+.done__ic{font-size:14px;line-height:1;flex:none;color:var(--s-ready)}
+.done--failed .done__ic{color:var(--s-blocked)}
+.done__t{font-family:var(--display);font-weight:600;font-size:13.5px;color:var(--ink);letter-spacing:-.01em}
+.done__meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:1;min-width:0}
+.done__act{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
+  border:1px solid var(--line-2);border-radius:9px;padding:6px 11px;cursor:pointer;white-space:nowrap;flex:none}
+.done__act:hover{border-color:var(--ink-soft);color:var(--ink)}
+.done__body{font-size:12px;line-height:1.5;color:var(--ink-faint);margin-top:5px}
+.shelf__note{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);padding:8px 15px;
+  background:var(--surface-2);border-top:1px solid var(--line)}
+
 /* ══ v4 Ш4 · зона «Требует меня» ═════════════════════════════════════════════
    Имя .attn, а НЕ .att из прототипа: .att уже занят списком вложений карточки
    (см. выше), и одноимённый класс сломал бы его молча. */
