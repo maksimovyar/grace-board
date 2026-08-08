@@ -1339,6 +1339,7 @@ function ciClassify(text) {
   let j = null;
   try { j = JSON.parse((String(text).match(/\{[\s\S]*\}/) || [""])[0]); } catch {}
   if (!j || typeof j !== "object") return { status: "unreadable", checks: [], failed: [], pending: [], raw: String(text).slice(-400) };
+  const prState = String(j.state || "").toUpperCase();
   const rollup = Array.isArray(j.statusCheckRollup) ? j.statusCheckRollup : [];
   const checks = rollup.map((c) => {
     const done = c.status ? String(c.status).toUpperCase() === "COMPLETED"
@@ -1349,11 +1350,16 @@ function ciClassify(text) {
   const failed = checks.filter((c) => c.done && CI_FAIL.has(c.verdict));
   const pending = checks.filter((c) => !c.done);
   const mergeState = String(j.mergeStateStatus || "").toUpperCase() || null;
-  const status = failed.length ? "red"
+  // Состояние PR старше состояния проверок: пока доска ждала CI, человек мог смержить его
+  // сам (так и было с PR #21) или закрыть. Мержить смерженное — гарантированная ошибка gh,
+  // которую доска потом честно, но бессмысленно назовёт «автомерж не прошёл».
+  const status = prState === "MERGED" ? "merged"
+    : prState === "CLOSED" ? "closed"
+    : failed.length ? "red"
     : mergeState === "DIRTY" ? "conflict"
     : (pending.length || mergeState === "UNKNOWN") ? "pending"
     : checks.length ? "green" : "none";
-  return { status, checks, mergeStateStatus: mergeState,
+  return { status, checks, prState: prState || null, mergeStateStatus: mergeState,
     failed: failed.map((f) => f.name), pending: pending.map((p) => p.name),
     failedUrls: failed.map((f) => f.url).filter(Boolean) };
 }
@@ -1591,6 +1597,7 @@ function planCloseTick(board) {
     // ── A1 · the CI gate: poll → classify → merge only on green ───────────────────────
     if (plan.closeStep === "ci") {
       if (plan.ciNextAt && Date.parse(plan.ciNextAt) > Date.now()) continue;   // waiting out the poll interval
+      try { fs.mkdirSync(dir, { recursive: true }); } catch {}   // шаг может быть первым после ручной чистки
       const cmd = `${GH_BIN} pr view ${shq(plan.result.pr.url)} --json state,mergeStateStatus,statusCheckRollup`;
       const st = spawnStep(projectDir, cmd, path.join(dir, "ci.out"));
       plan.ciRun = { ...st, startedAt: new Date().toISOString() };
@@ -1613,6 +1620,16 @@ function planCloseTick(board) {
       if (ci.status === "green" || ci.status === "none") {
         logPlan(plan, "plan-ci-green", { checks: ci.checks.length, waitedSec: plan.result.ci.waitedSec });
         plan.closeStep = "merge"; changed = true; continue;
+      }
+      if (ci.status === "merged") {          // человек смержил сам, пока доска ждала CI
+        plan.result.merge = { ok: true, output: "PR уже смержен (не доской)", ci: plan.result.ci };
+        plan.closeStep = "deploy"; changed = true;
+        logPlan(plan, "plan-merged", { by: "human" });
+        continue;
+      }
+      if (ci.status === "closed") {
+        stopMerge("pr-closed", `PR закрыт без мержа — доска не мержит. Код прогона остался в ветке ${plan.integrationBranch}.`);
+        changed = true; continue;
       }
       if (ci.status === "red") {
         const runId = ciRunIdOf(ci.failedUrls);
