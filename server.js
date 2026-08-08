@@ -822,8 +822,11 @@ function branchInMain(projectDir, branch) {
   if (e.probing) {
     const r = readStep(file);
     if (r) {
-      const state = /IN-MAIN/.test(r.text) ? "in-main" : /NOT-IN-MAIN/.test(r.text) ? "not-in-main"
-        : /NO-REF/.test(r.text) ? "no-ref" : "unknown";
+      // Якоря обязательны: «IN-MAIN» — подстрока «NOT-IN-MAIN», и неякорная проверка читала
+      // ответ «не в main» как «в main», то есть гейт пропускал ровно то, ради чего написан.
+      const state = /^NOT-IN-MAIN$/m.test(r.text) ? "not-in-main"
+        : /^IN-MAIN$/m.test(r.text) ? "in-main"
+        : /^NO-REF$/m.test(r.text) ? "no-ref" : "unknown";
       ancestryCache.set(key, { state, at: now, probing: false });
       return state;
     }
