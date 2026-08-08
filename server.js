@@ -3068,6 +3068,24 @@ async function handleApi(req, res, urlPath) {
     if (!plan) return sendJSON(res, 404, { error: "plan not found" });
     const withCards = new URL(req.url, `http://${HOST}`).searchParams.get("withCards") === "1";
     plan.archived = true;
+    // Прогон, снятый с доски, НЕ держит свои так и не стартовавшие этапы в заложниках. Иначе
+    // карточка остаётся с чужим planId, а POST /api/plans отказывает («a card is already part of
+    // a plan») — и работу приходится заводить заново текстом. Живое: 08.08 прогон G архивировали
+    // на первой карточке, две нетронутые карточки перестали быть пересобираемыми.
+    // Освобождаются ТОЛЬКО недиспатченные: у стартовавшей карточки есть ветка, история и seed,
+    // её место — внутри своего прогона.
+    const released = [];
+    for (const card of planCards(board, plan)) {
+      if (card.dispatchedAt || card.archived) continue;
+      card.planId = null;
+      card.integrationBranch = null;
+      card.dependsOn = [];
+      card.queued = false;
+      card.column = "backlog";
+      card.lastColumnChangeAt = new Date().toISOString();
+      card.history.push({ column: "backlog", ts: card.lastColumnChangeAt, via: "plan-archive-release" });
+      released.push(card.id);
+    }
     const archived = [];
     if (withCards) {
       const ts = new Date().toISOString();
@@ -3079,8 +3097,8 @@ async function handleApi(req, res, urlPath) {
       }
     }
     writeBoard(board);
-    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "plan-archive", planId: plan.id, cards: archived }) + "\n"); } catch {}
-    return sendJSON(res, 200, { ok: true, archived, left: planCards(board, plan).filter((c) => !c.archived).length });
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "plan-archive", planId: plan.id, cards: archived, released }) + "\n"); } catch {}
+    return sendJSON(res, 200, { ok: true, archived, released, left: planCards(board, plan).filter((c) => !c.archived).length });
   }
 
   // POST /api/plans/:id/reopen -> переиграть приёмку проваленного прогона (v4 Ш1.1). Без этой
