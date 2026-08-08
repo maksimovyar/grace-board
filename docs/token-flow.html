@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Куда уходят токены — разбор прогона «Услуги B+»</title>
+<style>
+  :root{
+    --bg:#faf9f7; --card:#fff; --line:#e6e3dd; --line2:#f0eeea;
+    --ink:#1b1a18; --ink2:#57534c; --ink3:#8a857c;
+    --warm:#c2603c;      /* прогрев / cache write */
+    --read:#3f7cac;      /* чтение / cache read  */
+    --out:#5f8a5a;       /* вывод / output       */
+    --board:#8a857c;     /* доска, не модель     */
+    --accent:#1b1a18;
+    --warm-bg:#fbeee8; --read-bg:#e9f0f6; --out-bg:#ecf2ea; --board-bg:#f2f1ee;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+    font-feature-settings:"tnum" 0;
+  }
+  .wrap{max-width:1080px; margin:0 auto; padding:56px 24px 96px}
+  h1{font-size:clamp(28px,4vw,40px); line-height:1.15; letter-spacing:-.02em; margin:0 0 12px; font-weight:650}
+  h2{font-size:22px; letter-spacing:-.01em; margin:56px 0 6px; font-weight:640}
+  h3{font-size:16px; margin:0 0 4px; font-weight:640}
+  p{margin:0 0 14px; color:var(--ink2)}
+  .lede{font-size:18px; color:var(--ink2); max-width:70ch; margin-bottom:8px}
+  .muted{color:var(--ink3); font-size:14px}
+  .sect-note{color:var(--ink3); font-size:14.5px; margin:0 0 22px; max-width:74ch}
+  code{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace; font-size:.88em;
+       background:var(--line2); padding:1px 5px; border-radius:4px}
+  .num{font-variant-numeric:tabular-nums}
+
+  /* ── шапка со сводкой ── */
+  .hero{background:var(--card); border:1px solid var(--line); border-radius:14px; padding:28px 30px; margin:28px 0 8px}
+  .kpis{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:22px; margin-top:22px}
+  .kpi .v{font-size:30px; font-weight:660; letter-spacing:-.02em; line-height:1.1}
+  .kpi .l{font-size:13px; color:var(--ink3); margin-top:3px}
+  .kpi .s{font-size:12.5px; color:var(--ink3); margin-top:1px}
+
+  /* ── три статьи ── */
+  .arts{display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px; margin:20px 0 6px}
+  .art{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; border-top:3px solid}
+  .art.w{border-top-color:var(--warm)} .art.r{border-top-color:var(--read)} .art.o{border-top-color:var(--out)}
+  .art .top{display:flex; align-items:baseline; justify-content:space-between; gap:10px; margin-bottom:6px}
+  .art .amt{font-size:24px; font-weight:660; letter-spacing:-.02em}
+  .art .pct{font-size:13px; color:var(--ink3)}
+  .art p{font-size:14px; margin:8px 0 0; color:var(--ink2)}
+  .art .price{font-size:12.5px; color:var(--ink3); margin-top:8px; padding-top:8px; border-top:1px solid var(--line2)}
+
+  /* ── распределение ── */
+  .stack{display:flex; height:38px; border-radius:8px; overflow:hidden; border:1px solid var(--line); margin:6px 0 10px}
+  .stack div{display:flex; align-items:center; justify-content:center; color:#fff; font-size:12.5px; font-weight:600}
+  .legend{display:flex; flex-wrap:wrap; gap:16px; font-size:13.5px; color:var(--ink2); margin-bottom:6px}
+  .legend i{display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:6px; vertical-align:middle}
+
+  /* ── шаги ── */
+  .steps{position:relative; margin-top:22px}
+  .steps:before{content:""; position:absolute; left:19px; top:14px; bottom:14px; width:2px; background:var(--line)}
+  .step{position:relative; padding-left:56px; margin-bottom:16px}
+  .dot{position:absolute; left:8px; top:16px; width:24px; height:24px; border-radius:50%;
+       background:var(--card); border:2px solid var(--line); display:flex; align-items:center; justify-content:center;
+       font-size:12px; font-weight:700; color:var(--ink3)}
+  .step.hot .dot{border-color:var(--warm); color:var(--warm)}
+  .step.cold .dot{border-color:var(--board); color:var(--board)}
+  .box{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px}
+  .box.free{background:var(--board-bg); border-style:dashed}
+  .bhead{display:flex; flex-wrap:wrap; align-items:baseline; gap:10px; margin-bottom:8px}
+  .bhead h3{margin:0}
+  .tag{font-size:11.5px; font-weight:650; letter-spacing:.02em; padding:2px 8px; border-radius:20px; white-space:nowrap}
+  .t-model{background:var(--warm-bg); color:var(--warm)}
+  .t-sub{background:var(--read-bg); color:var(--read)}
+  .t-board{background:var(--board-bg); color:var(--ink3); border:1px solid var(--line)}
+  .cost{margin-left:auto; font-size:17px; font-weight:660; letter-spacing:-.01em; white-space:nowrap}
+  .cost.zero{color:var(--ink3); font-weight:600; font-size:15px}
+  .box p{font-size:14.5px; margin:0 0 12px}
+  .box p:last-child{margin-bottom:0}
+  .mets{display:flex; flex-wrap:wrap; gap:0; border:1px solid var(--line2); border-radius:8px; overflow:hidden; margin-top:12px}
+  .met{flex:1 1 116px; padding:9px 12px; border-right:1px solid var(--line2); background:#fcfbfa}
+  .met:last-child{border-right:0}
+  .met .mv{font-size:15px; font-weight:640; letter-spacing:-.01em}
+  .met .ml{font-size:11.5px; color:var(--ink3); margin-top:1px}
+  .met.w .mv{color:var(--warm)} .met.r .mv{color:var(--read)} .met.o .mv{color:var(--out)}
+  .bar{height:5px; border-radius:3px; background:var(--line2); margin-top:14px; overflow:hidden}
+  .bar i{display:block; height:100%; background:var(--accent); border-radius:3px}
+  .repeat{font-size:12.5px; color:var(--ink3); margin-left:2px}
+
+  /* ── таблица ── */
+  table{width:100%; border-collapse:collapse; font-size:14px; margin-top:10px}
+  th,td{text-align:right; padding:9px 10px; border-bottom:1px solid var(--line2)}
+  th:first-child,td:first-child{text-align:left}
+  th{font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--ink3); font-weight:640;
+     border-bottom:1px solid var(--line)}
+  tbody tr:hover{background:#fcfbfa}
+  tfoot td{font-weight:660; border-top:1px solid var(--line); border-bottom:0}
+  .scroll{overflow-x:auto; -webkit-overflow-scrolling:touch}
+  .warnrow td{color:var(--warm)}
+
+  /* ── выводы ── */
+  .finds{display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:14px; margin-top:18px}
+  .find{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px}
+  .find .n{font-size:12px; font-weight:700; color:var(--ink3); letter-spacing:.06em}
+  .find h3{margin:6px 0 6px; font-size:16.5px; letter-spacing:-.01em}
+  .find p{font-size:14px; margin:0}
+  .find .fig{font-size:22px; font-weight:660; letter-spacing:-.02em; margin:8px 0 2px}
+  .find.done{border-left:3px solid var(--out)} .find.todo{border-left:3px solid var(--warm)}
+  .pill{display:inline-block; font-size:11.5px; font-weight:650; padding:2px 8px; border-radius:20px; margin-bottom:8px}
+  .pill.ok{background:var(--out-bg); color:var(--out)}
+  .pill.next{background:var(--warm-bg); color:var(--warm)}
+
+  /* ── вкладки ── */
+  .tabs{display:flex; gap:6px; margin:26px 0 0; border-bottom:1px solid var(--line); flex-wrap:wrap}
+  .tab{appearance:none; background:none; border:0; border-bottom:2px solid transparent; margin-bottom:-1px;
+       padding:11px 16px; font:inherit; font-size:15px; font-weight:600; color:var(--ink3); cursor:pointer;
+       border-radius:8px 8px 0 0; transition:color .12s, background .12s}
+  .tab:hover{color:var(--ink2); background:#f4f2ef}
+  .tab[aria-selected="true"]{color:var(--ink); border-bottom-color:var(--accent); background:none}
+  .tab .sub{display:block; font-size:12px; font-weight:500; color:var(--ink3); margin-top:1px}
+  .panel[hidden]{display:none}
+  .banner{background:var(--out-bg); border:1px solid #cfe0cb; border-left:3px solid var(--out);
+          border-radius:10px; padding:14px 18px; margin:22px 0 0; font-size:14.5px; color:var(--ink2)}
+  .banner b{color:var(--ink)}
+  .banner.warn{background:var(--warm-bg); border-color:#eccfc2; border-left-color:var(--warm)}
+  .cmp{width:100%; border-collapse:collapse; font-size:14.5px; margin-top:12px}
+  .cmp th,.cmp td{padding:10px 12px; border-bottom:1px solid var(--line2); text-align:right}
+  .cmp th:first-child,.cmp td:first-child{text-align:left; color:var(--ink2)}
+  .cmp thead th{font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--ink3);
+                border-bottom:1px solid var(--line)}
+  .cmp .win{color:var(--out); font-weight:640}
+  .cmp .lose{color:var(--warm); font-weight:640}
+
+  /* ── мини-таблица агентов внутри шага ── */
+  .agents{margin-top:14px; border:1px solid var(--line2); border-radius:8px; overflow:hidden}
+  .agents table{width:100%; border-collapse:collapse; font-size:13.5px; margin:0}
+  .agents th,.agents td{padding:7px 11px; border-bottom:1px solid var(--line2); text-align:right; white-space:nowrap}
+  .agents th:first-child,.agents td:first-child{text-align:left; white-space:normal}
+  .agents thead th{background:#f7f5f2; font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+                   color:var(--ink3); font-weight:640}
+  .agents tbody tr:last-child td{border-bottom:0}
+  .agents .who{font-weight:600; color:var(--ink)}
+  .agents .role{display:block; font-size:11.5px; font-weight:500; color:var(--ink3); margin-top:1px}
+  .agents .w{color:var(--warm)} .agents .d{color:var(--read)} .agents .o{color:var(--out)}
+  .agents tfoot td{background:#fbfaf8; font-weight:640; border-top:1px solid var(--line)}
+  .kindmark{display:inline-block; width:7px; height:7px; border-radius:2px; margin-right:7px; vertical-align:baseline}
+  .kindmark.main{background:var(--warm)} .kindmark.sub{background:var(--read)}
+
+  /* ── разворачиваемые строки таблицы карточек ── */
+  tr.crow{cursor:pointer}
+  tr.crow:hover{background:#f7f5f2}
+  tr.crow td:first-child:before{content:"›"; display:inline-block; width:14px; color:var(--ink3);
+    transform:rotate(0deg); transition:transform .15s; font-weight:700}
+  tr.crow.open td:first-child:before{transform:rotate(90deg)}
+  tr.crow.open{background:#f4f2ef}
+  tr.cdet>td{padding:0 10px 14px; background:#f9f8f6}
+  tr.cdet[hidden]{display:none}
+  .hint{font-size:13px; color:var(--ink3); margin:8px 0 0}
+
+  .foot{margin-top:64px; padding-top:20px; border-top:1px solid var(--line); font-size:13px; color:var(--ink3)}
+  .foot p{font-size:13px; color:var(--ink3)}
+  @media (max-width:620px){
+    .wrap{padding:36px 16px 64px}
+    .step{padding-left:44px} .steps:before{left:15px} .dot{left:4px}
+    .cost{margin-left:0; width:100%}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Куда уходят токены</h1>
+  <p class="lede">Пофазный разбор двух прогонов доски grace-board за 1&nbsp;августа 2026 — до и после
+  правок конвейера. Второй прогон шёл уже со слитыми гейтами и укрупнённой нарезкой карточек.</p>
+
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" aria-selected="true" aria-controls="p1" id="t1">
+      Услуги B+ <span class="sub">7 карточек · $171 · как было</span></button>
+    <button class="tab" role="tab" aria-selected="false" aria-controls="p2" id="t2">
+      A2-4 · Доставка писем <span class="sub">3 карточки · $90 · после правок</span></button>
+  </div>
+
+<section class="panel" id="p1" role="tabpanel" aria-labelledby="t1">
+
+  <div class="hero">
+    <div class="legend" style="margin-bottom:2px">
+      <span>Проект DocsInside2 · ветка <code>autodev/plan-13dc2476</code> · PR&nbsp;#6</span>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><div class="v num">$171</div><div class="l">полная стоимость прогона</div>
+        <div class="s">по прайсу API Opus</div></div>
+      <div class="kpi"><div class="v num">41</div><div class="l">сессия модели</div>
+        <div class="s">22 главных + 18 разведчиков + приёмка</div></div>
+      <div class="kpi"><div class="v num">766</div><div class="l">обращений к модели</div>
+        <div class="s">каждое перечитывает контекст</div></div>
+      <div class="kpi"><div class="v num">62 М</div><div class="l">токенов прочитано и записано</div>
+        <div class="s">из них создано нового — 343 тыс.</div></div>
+      <div class="kpi"><div class="v num">2 ч 26 м</div><div class="l">работы конвейера</div>
+        <div class="s">+ 2 ч простоя на лимите</div></div>
+      <div class="kpi"><div class="v num">6 619</div><div class="l">строк кода в 46 файлах</div>
+        <div class="s">≈ $26 на 1000 строк</div></div>
+    </div>
+  </div>
+
+  <h2>Что такое «обращение»</h2>
+  <p class="sect-note">Это единица, на которую множится всё остальное, поэтому с неё стоит начать.</p>
+  <div class="art r" style="border-top-width:3px; margin-bottom:8px">
+    <p style="margin-top:0"><b>Обращение — один запрос к модели и один её ответ.</b> Агент не работает
+    «одним куском»: он делает шаг, получает результат и снова обращается к модели. Прочитать файл —
+    обращение. Увидеть содержимое файла и решить, что править, — ещё одно. Запустить тесты — третье.
+    Увидеть, что тесты упали, — четвёртое.</p>
+    <p><b>Ключевое: при каждом обращении модель заново получает весь накопленный контекст.</b> Она
+    не помнит предыдущий шаг — ей каждый раз пересылают всю историю: инструкции, прочитанные файлы,
+    свои прежние ответы, вывод тестов. Поэтому сборка на 997 обращений — это 997 раз пересланный
+    контекст, который всё время растёт.</p>
+    <p style="margin-bottom:0" class="muted">В отчёте по сборке одной карточки может стоять «178
+    обращений» — это не 178 файлов и не 178 правок, а 178 шагов диалога агента с самим собой, пока
+    он доводил карточку до готовности.</p>
+  </div>
+
+  <h2>Три статьи расхода</h2>
+  <p class="sect-note">Токены платятся не один раз за штуку. У каждого обращения к модели три разные
+  цены, и самая большая сумма набегает там, где цена за токен наименьшая.</p>
+
+  <div class="arts">
+    <div class="art w">
+      <div class="top"><span class="amt num">$56</span><span class="pct">33% · 2,96 М токенов</span></div>
+      <h3 style="color:var(--warm)">Прогрев</h3>
+      <p>Плата за холодный старт процесса: системный промпт, <code>CLAUDE.md</code>, описания
+      инструментов и скиллов — 115–160 тыс. токенов, которые загружаются в кэш <b>заново в каждой
+      сессии</b>. Прогон запускал 41 отдельный процесс, значит платил за это 41 раз.</p>
+      <div class="price">$18,75 за миллион — самая дорогая запись</div>
+    </div>
+    <div class="art r">
+      <div class="top"><span class="amt num">$89</span><span class="pct">52% · 59,5 М токенов</span></div>
+      <h3 style="color:var(--read)">Чтение контекста</h3>
+      <p>На <b>каждом</b> ходу модель заново перечитывает весь накопленный контекст: инструкции,
+      прочитанные файлы, свои прежние ответы. Один токен стоит копейки, но множится на число ходов:
+      531 ход сборки × 97 тыс. контекста = 52 миллиона.</p>
+      <div class="price">$1,50 за миллион — в 12 раз дешевле прогрева</div>
+    </div>
+    <div class="art o">
+      <div class="top"><span class="amt num">$26</span><span class="pct">15% · 343 тыс. токенов</span></div>
+      <h3 style="color:var(--out)">Написанное моделью</h3>
+      <p>Собственно результат: код, тесты, решения, отчёты. Дороже всего за токен — и при этом самая
+      маленькая статья, потому что объём мал. <b>Полезная работа — седьмая часть счёта.</b></p>
+      <div class="price">$75 за миллион — в 50 раз дороже чтения</div>
+    </div>
+  </div>
+
+  <p class="sect-note" style="margin-top:18px"><b>Главное следствие.</b> Стоимость сессии растёт
+  быстрее её длины: с каждым ходом контекст становится больше, и каждый следующий ход перечитывает
+  уже увеличенный контекст. Сессия на 180 ходов стоит не вдвое дороже сессии на 90 ходов, а примерно
+  вчетверо. Поэтому дешевле одна карточка на 1500 строк, чем три по 500.</p>
+
+  <h2>На что ушли деньги</h2>
+  <div class="stack">
+    <div style="width:71.4%; background:#2f6d99">сборка — 71%</div>
+    <div style="width:16.8%; background:#4f93c4">разведчики — 17%</div>
+    <div style="width:6.4%; background:#c2603c">ask‑1</div>
+    <div style="width:4.5%; background:#d68b6d">ask‑2</div>
+    <div style="width:1.4%; background:#8a857c"></div>
+  </div>
+  <div class="legend">
+    <span><i style="background:#2f6d99"></i>Сборка кода — $122</span>
+    <span><i style="background:#4f93c4"></i>Субагенты-разведчики — $29</span>
+    <span><i style="background:#c2603c"></i>Гейт функционала — $11</span>
+    <span><i style="background:#d68b6d"></i>Гейт архитектуры — $8</span>
+    <span><i style="background:#8a857c"></i>Приёмка — $1,7</span>
+  </div>
+
+  <h2>Как это устроено по шагам</h2>
+  <p class="sect-note">Одна карточка проходит шаги 2–5. Затем доска берёт следующую и повторяет всё
+  с самого начала — в новом процессе, с нуля. Цифры в блоках — суммарные за все 7 карточек.</p>
+
+  <div class="steps">
+
+    <div class="step cold">
+      <div class="dot">0</div>
+      <div class="box free">
+        <div class="bhead">
+          <h3>Декомпозиция и постановка</h3>
+          <span class="tag t-board">вне прогона</span>
+          <span class="cost zero">не входит в счёт</span>
+        </div>
+        <p>Человек вместе со скиллом <code>graceboard-plan</code> разбирает требования, режет их на
+        карточки и пишет план-файл. Карточки заводятся на доску и собираются в прогон с графом
+        зависимостей. Это отдельная сессия до старта — её стоимость здесь не учтена.</p>
+      </div>
+    </div>
+
+    <div class="step cold">
+      <div class="dot">1</div>
+      <div class="box free">
+        <div class="bhead">
+          <h3>Доска-диспетчер решает, чья очередь</h3>
+          <span class="tag t-board">обычный код, не модель</span>
+          <span class="cost zero">$0</span>
+        </div>
+        <p>Сервер <code>server.js</code> раз в две секунды смотрит: свободен ли слот проекта (одна
+        карточка за раз), готовы ли зависимости, не пересекаются ли файлы. Выбирает следующую карточку,
+        создаёт ей рабочий каталог и запускает процесс.</p>
+        <p><b>Оркестратор ничего не стоит.</b> Это не агент-менеджер, который «думает» — это
+        детерминированный код на 2700 строк. Вся стоимость прогона возникает только в шагах ниже.</p>
+      </div>
+    </div>
+
+    <div class="step hot">
+      <div class="dot">2</div>
+      <div class="box">
+        <div class="bhead">
+          <h3>Гейт функционала <span class="repeat">× 7 карточек</span></h3>
+          <span class="tag t-model">свежая сессия</span>
+          <span class="cost num">$10,9</span>
+        </div>
+        <p>Отдельный процесс модели стартует <b>с чистого листа</b>: заново грузит системный промпт,
+        <code>CLAUDE.md</code> и скиллы. Читает бриф карточки, изучает код и решает — есть ли вопросы
+        к человеку по смыслу задачи (что система должна делать), или всё ясно.</p>
+        <p>За весь прогон вопросов человеку — <b>ноль</b>. Все 7 раз агент записал принятые им самим
+        решения и вышел. Внутри этого шага он запускал разведчиков — их стоимость в шаге 4.</p>
+        <div class="mets">
+          <div class="met"><div class="mv num">29</div><div class="ml">обращений</div></div>
+          <div class="met w"><div class="mv num">343 тыс.</div><div class="ml">прогрев</div></div>
+          <div class="met r"><div class="mv num">1,07 М</div><div class="ml">чтение</div></div>
+          <div class="met o"><div class="mv num">37 тыс.</div><div class="ml">написано</div></div>
+        </div>
+        <div class="agents" data-agents="b1|Гейт функционала"></div>
+        <div class="bar"><i style="width:7.6%"></i></div>
+      </div>
+    </div>
+
+    <div class="step hot">
+      <div class="dot">3</div>
+      <div class="box">
+        <div class="bhead">
+          <h3>Гейт архитектуры <span class="repeat">× 7 карточек</span></h3>
+          <span class="tag t-model">ещё одна свежая сессия</span>
+          <span class="cost num">$7,7</span>
+        </div>
+        <p><b>Второй холодный старт по той же карточке.</b> Новый процесс — значит снова полный прогрев
+        на ~35 тыс. токенов, чтобы прочитать тот же бриф и вдобавок решения, которые предыдущая сессия
+        только что записала себе в файл.</p>
+        <p>Все 7 раз результат был один: «архитектурных развилок нет». Самый короткий запуск — 34
+        секунды, 4 обращения, 218 байт текста на выходе — и $1,1 за них.</p>
+        <div class="mets">
+          <div class="met"><div class="mv num">25</div><div class="ml">обращений</div></div>
+          <div class="met w"><div class="mv num">265 тыс.</div><div class="ml">прогрев</div></div>
+          <div class="met r"><div class="mv num">894 тыс.</div><div class="ml">чтение</div></div>
+          <div class="met o"><div class="mv num">4 тыс.</div><div class="ml">написано</div></div>
+        </div>
+        <div class="agents" data-agents="b1|Гейт архитектуры"></div>
+        <div class="bar"><i style="width:5.1%"></i></div>
+      </div>
+    </div>
+
+    <div class="step hot">
+      <div class="dot">4</div>
+      <div class="box">
+        <div class="bhead">
+          <h3>Разведчики кода <span class="repeat">18 запусков за прогон</span></h3>
+          <span class="tag t-sub">субагенты</span>
+          <span class="cost num">$28,7</span>
+        </div>
+        <p>Шаги 2 и 5 не изучают код сами — они поручают это отдельным субагентам
+        (<code>gfd-explorer</code> и <code>Explore</code>, по 2–3 на карточку). Каждый разведчик —
+        <b>снова полностью новый процесс</b> со своим прогревом: 898 тыс. токенов записи на 18 запусков, по 47 тыс. на каждого.</p>
+        <p>Все они ходят по одному и тому же репозиторию. Разведка в гейте карточки и разведка в её же
+        сборке делаются <b>дважды подряд</b>, независимо друг от друга. Каждый делает всего 8 обращений — то есть у разведчика половина цены уходит на то, чтобы просто загрузиться.</p>
+        <div class="mets">
+          <div class="met"><div class="mv num">164</div><div class="ml">обращений</div></div>
+          <div class="met w"><div class="mv num">898 тыс.</div><div class="ml">прогрев</div></div>
+          <div class="met r"><div class="mv num">5,40 М</div><div class="ml">чтение</div></div>
+          <div class="met o"><div class="mv num">49 тыс.</div><div class="ml">написано</div></div>
+        </div>
+        <div class="agents" data-agents="b1|Explore|gfd-explorer"></div>
+        <div class="bar"><i style="width:21.7%"></i></div>
+      </div>
+    </div>
+
+    <div class="step hot">
+      <div class="dot">5</div>
+      <div class="box">
+        <div class="bhead">
+          <h3>Сборка кода <span class="repeat">× 7 карточек + 1 перезапуск</span></h3>
+          <span class="tag t-model">третья свежая сессия</span>
+          <span class="cost num">$121,9</span>
+        </div>
+        <p>Третий холодный старт по той же карточке. Здесь делается вся работа: архитектура → разбивка
+        на волны <code>t1/t2/t3</code> → код → тесты → ревью → коммит на каждой зелёной волне.
+        531 обращение — это 69% всех обращений прогона.</p>
+        <p><b>Почему так дорого.</b> К концу сессии контекст доходит до 146 тыс. токенов, и каждый
+        следующий ход перечитывает его целиком. 52 миллиона прочитанных токенов — это не 52 миллиона разного текста, а один и тот же контекст, прочитанный сотни раз.</p>
+        <p class="muted">Один build умер на седьмой минуте и был перезапущен с нуля: его 7,6 минуты и $6,4 ушли впустую — первая сессия не оставила ни одного коммита.</p>
+        <div class="mets">
+          <div class="met"><div class="mv num">531</div><div class="ml">обращений</div></div>
+          <div class="met w"><div class="mv num">1,43 М</div><div class="ml">прогрев</div></div>
+          <div class="met r"><div class="mv num">51,6 М</div><div class="ml">чтение</div></div>
+          <div class="met o"><div class="mv num">235 тыс.</div><div class="ml">написано</div></div>
+        </div>
+        <div class="agents" data-agents="b1|Сборка кода"></div>
+        <div class="bar"><i style="width:64.3%"></i></div>
+      </div>
+    </div>
+
+    <div class="step hot">
+      <div class="dot">6</div>
+      <div class="box">
+        <div class="bhead">
+          <h3>Приёмка прогона и PR <span class="repeat">один раз на прогон</span></h3>
+          <span class="tag t-model">сессия приёмки</span>
+          <span class="cost num">$1,7</span>
+        </div>
+        <p>Когда последняя карточка дошла до готовности, доска сама собирает манифест релиза, прогоняет
+        сценарии приёмки и открывает pull request. Работа с git и GitHub — обычные процессы, не модель,
+        поэтому платная здесь только сама приёмка.</p>
+        <p class="muted">В этом прогоне она не отработала: процесс умер на лимите аккаунта, прогон
+        помечен как проваленный, PR&nbsp;#6 открыт черновиком. Деньги потрачены, результата нет.</p>
+        <div class="mets">
+          <div class="met"><div class="mv num">17</div><div class="ml">обращений</div></div>
+          <div class="met w"><div class="mv num">31 тыс.</div><div class="ml">прогрев</div></div>
+          <div class="met r"><div class="mv num">490 тыс.</div><div class="ml">чтение</div></div>
+          <div class="met o"><div class="mv num">4 тыс.</div><div class="ml">написано</div></div>
+        </div>
+        <div class="agents" data-agents="b1|Приёмка прогона"></div>
+        <div class="bar"><i style="width:1.4%"></i></div>
+      </div>
+    </div>
+
+  </div>
+
+  <h2>По карточкам</h2>
+  <p class="sect-note">Каждая строка — три сессии модели плюс её разведчики. Цена почти не зависит от
+  объёма написанного кода: она определяется числом ходов, а не результатом.
+  <b>Нажмите на строку</b> — раскроется состав агентов этой карточки.</p>
+  <div class="scroll" data-cards="b1"></div>
+  <p class="muted" style="margin-top:10px">Разброс удельной цены — шестикратный. Дороже всего обошлись
+  две крайние строки: карточка с аварией и карточка на 137 строк, где почти вся сумма — накладные
+  расходы на три холодных старта.</p>
+
+
+  <h2>Три вывода</h2>
+  <div class="finds">
+    <div class="find">
+      <div class="n">01</div>
+      <h3>Платим за холодные старты</h3>
+      <div class="fig num" style="color:var(--warm)">41 процесс</div>
+      <p>Каждая карточка запускает три сессии модели плюс разведчиков, и каждая грузит одни и те же
+      инструкции заново. $56 — это плата за то, что процессы начинали с нуля 41 раз.</p>
+    </div>
+    <div class="find">
+      <div class="n">02</div>
+      <h3>Платим за длину, а не за результат</h3>
+      <div class="fig num" style="color:var(--read)">97 тыс. × 531</div>
+      <p>Средний контекст сборки, умноженный на число ходов, и есть 52 миллиона прочитанных токенов.
+      Мелкая карточка не экономит: она платит те же накладные, но производит впятеро меньше.</p>
+    </div>
+    <div class="find">
+      <div class="n">03</div>
+      <h3>Разведка кода дублируется</h3>
+      <div class="fig num" style="color:var(--out)">18 раз</div>
+      <p>Одну и ту же кодовую базу изучили заново 18 раз: в гейте каждой карточки и отдельно в её
+      сборке. Это $29 — шестая часть счёта — за повторное открытие уже известного.</p>
+    </div>
+  </div>
+
+</section>
+
+<section class="panel" id="p2" role="tabpanel" aria-labelledby="t2" hidden>
+
+  <div class="banner"><b>Этот прогон — контрольный замер.</b> Первая карточка успела уйти в работу
+  до правок и прошла оба гейта по-старому, двумя сессиями. Карточки 2 и 3 стартовали уже после:
+  один слитый гейт вместо двух, и нарезка пересобрана с пяти карточек на три. То есть «до» и «после»
+  лежат внутри одного прогона.</div>
+
+  <div class="hero">
+    <div class="legend" style="margin-bottom:2px">
+      <span>Проект DocsInside2 · ветка <code>autodev/plan-1c72e6a5</code> · 3 карточки</span>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><div class="v num">$90</div><div class="l">полная стоимость прогона</div>
+        <div class="s">против $171 у прошлого</div></div>
+      <div class="kpi"><div class="v num">13</div><div class="l">сессий модели</div>
+        <div class="s">10 главных + 3 разведчика</div></div>
+      <div class="kpi"><div class="v num">360</div><div class="l">обращений к модели</div>
+        <div class="s">было 1567</div></div>
+      <div class="kpi"><div class="v num">36 М</div><div class="l">токенов прочитано и записано</div>
+        <div class="s">создано нового — 176 тыс.</div></div>
+      <div class="kpi"><div class="v num">1 ч 14 м</div><div class="l">работы над карточками</div>
+        <div class="s">+ 9 м приёмка, + 3 ч 38 м простоя</div></div>
+      <div class="kpi"><div class="v num">1 499</div><div class="l">строк кода в 27 файлах</div>
+        <div class="s">≈ $60 на 1000 строк</div></div>
+    </div>
+  </div>
+
+  <h2>На что ушли деньги</h2>
+  <div class="stack">
+    <div style="width:78.1%; background:#2f6d99">сборка — 78%</div>
+    <div style="width:12.1%; background:#8a857c">приёмка — 12%</div>
+    <div style="width:7.0%; background:#c2603c">гейты — 7%</div>
+    <div style="width:2.7%; background:#4f93c4"></div>
+  </div>
+  <div class="legend">
+    <span><i style="background:#2f6d99"></i>Сборка кода — $71</span>
+    <span><i style="background:#8a857c"></i>Приёмка — $11</span>
+    <span><i style="background:#c2603c"></i>Гейты — $6</span>
+    <span><i style="background:#4f93c4"></i>Разведчики — $2,5</span>
+  </div>
+  <p class="sect-note" style="margin-top:14px">Форма расхода изменилась. Гейты с 10,9% упали до 7,0%, разведчики с 16,8% до 2,7% — но не потому, что стали дешевле: их просто запускали в шесть раз
+  реже, потому что и карточек втрое меньше. Зато приёмка выросла с 1,0% до 12,1%: в прошлый раз она
+  умерла на второй минуте, здесь отработала целиком — 44 проверки на трёх карточках.</p>
+
+  <h2>Что происходило по шагам</h2>
+  <p class="sect-note">Три карточки вместо пяти: «Постфикс-релей» и «Mailpit с тестом» слиты
+  с «SMTP-конфигурацией» в одну карточку с волнами t1–t3, потому что все три правили один
+  <code>docker-compose.yml</code> и один <code>.env.example</code>.</p>
+
+  <div class="steps">
+
+    <div class="step hot">
+      <div class="dot">1</div>
+      <div class="box">
+        <div class="bhead">
+          <h3>Регистрация Celery-задач <span class="repeat">старая схема, до правок</span></h3>
+          <span class="tag t-model">2 гейта + 3 запуска сборки</span>
+          <span class="cost num">$12,1</span>
+        </div>
+        <p>Последняя карточка, прошедшая по-старому: гейт функционала, отдельным процессом гейт
+        архитектуры («развилок нет»), затем сборка. Разведчиков не вызывала — задача точечная.</p>
+        <p class="muted">Сборку пришлось запускать <b>трижды</b>: первый процесс умер на лимите
+        аккаунта, второй остановлен вручную, третий довёл до готовности. $8,9 из $12,1 — это сборка,
+        из них две трети выброшены на оборванные попытки ради 111 строк кода.</p>
+        <div class="mets">
+          <div class="met"><div class="mv num">74</div><div class="ml">обращений</div></div>
+          <div class="met w"><div class="mv num">247 тыс.</div><div class="ml">прогрев</div></div>
+          <div class="met r"><div class="mv num">3,75 М</div><div class="ml">чтение</div></div>
+          <div class="met o"><div class="mv num">22 тыс.</div><div class="ml">написано</div></div>
+        </div>
+        <div class="agents" data-card="a24|0"></div>
+        <div class="bar"><i style="width:17%"></i></div>
+      </div>
+    </div>
+
+    <div class="step hot">
+      <div class="dot">2</div>
+      <div class="box">
+        <div class="bhead">
+          <h3>Доставка писем <span class="repeat">склеена из трёх карточек</span></h3>
+          <span class="tag t-model">1 гейт + сборка</span>
+          <span class="cost num">$35,8</span>
+        </div>
+        <p><b>Гейт прошёл одной сессией</b> — 164 секунды, 4 обращения, $1,9. Агент отчитался:
+        «оба гейта пройдены без вопросов», записал 8 принятых решений и вышел. Второго холодного
+        старта не было — в журнале доски между <code>dispatch</code> и <code>auto-build</code> пусто.</p>
+        <p>Сборка сделала три волны в одном процессе: env-шаблоны и деградация <code>/health</code> →
+        Postfix-релей с DKIM → Mailpit и интеграционный тест письма. Три коммита, 635 строк.</p>
+        <p class="muted">Контекст сборки дошёл до <b>213 тыс. токенов</b> — против 146 тыс. у самой
+        тяжёлой карточки прошлого прогона. Крупная карточка экономит на стартах, но каждый её ход
+        дороже. Плюс два хвоста отложены в бэклог отдельными карточками.</p>
+        <div class="mets">
+          <div class="met"><div class="mv num">137</div><div class="ml">обращений</div></div>
+          <div class="met w"><div class="mv num">505 тыс.</div><div class="ml">прогрев</div></div>
+          <div class="met r"><div class="mv num">14,2 М</div><div class="ml">чтение</div></div>
+          <div class="met o"><div class="mv num">62 тыс.</div><div class="ml">написано</div></div>
+        </div>
+        <div class="agents" data-card="a24|1"></div>
+        <div class="bar"><i style="width:40%"></i></div>
+      </div>
+    </div>
+
+    <div class="step hot">
+      <div class="dot">3</div>
+      <div class="box">
+        <div class="bhead">
+          <h3>Перевыпуск временного пароля <span class="repeat">своя вертикаль</span></h3>
+          <span class="tag t-model">1 гейт + сборка</span>
+          <span class="cost num">$31,5</span>
+        </div>
+        <p>Карточка, которую намеренно <b>не</b> склеивали: другой домен, свои файлы, ни одного
+        пересечения с соседями. Гейт одной сессией, дальше сборка: эндпоинт, правило Casbin, аудит,
+        тесты — 753 строки в двух волнах.</p>
+        <p class="muted">Самая дорогая сборка прогона: 83 обращения и 13,1 М чтения при контексте 200 тыс. Средний контекст хода — 158 тыс., в полтора раза выше, чем у прошлого прогона.
+        Причина не в размере карточки, а в прогонах тестов: каждый вывод <code>pytest</code> и
+        <code>mypy</code> оседает в контексте и перечитывается на всех следующих ходах.</p>
+        <div class="mets">
+          <div class="met"><div class="mv num">92</div><div class="ml">обращений</div></div>
+          <div class="met w"><div class="mv num">388 тыс.</div><div class="ml">прогрев</div></div>
+          <div class="met r"><div class="mv num">13,1 М</div><div class="ml">чтение</div></div>
+          <div class="met o"><div class="mv num">70 тыс.</div><div class="ml">написано</div></div>
+        </div>
+        <div class="agents" data-card="a24|2"></div>
+        <div class="bar"><i style="width:39%"></i></div>
+      </div>
+    </div>
+
+    <div class="step hot">
+      <div class="dot">4</div>
+      <div class="box">
+        <div class="bhead">
+          <h3>Приёмка прогона <span class="repeat">44 проверки за 9 минут</span></h3>
+          <span class="tag t-model">сессия приёмки</span>
+          <span class="cost num">$11,0</span>
+        </div>
+        <p>Все три карточки готовы — доска сама запустила закрытие: манифест релиза, сценарии приёмки,
+        pull request. В прошлый раз этот шаг умер на лимите аккаунта через две минуты; здесь отработал
+        целиком — и это единственная статья, которая выросла: 12% счёта против 1,0%.</p>
+        <p class="muted">43 проверки зелёные, одна красная — и содержательная: guard-тест реестра
+        Celery не ловит сценарий, ради которого написан, что доказано экспериментом прямо в приёмке.
+        Прогон помечен как проваленный, PR&nbsp;#7 открыт черновиком. Дорогая проверка, которая
+        нашла настоящий дефект.</p>
+        <div class="mets">
+          <div class="met"><div class="mv num">57</div><div class="ml">обращений</div></div>
+          <div class="met w"><div class="mv num">190 тыс.</div><div class="ml">прогрев</div></div>
+          <div class="met r"><div class="mv num">3,60 М</div><div class="ml">чтение</div></div>
+          <div class="met o"><div class="mv num">26 тыс.</div><div class="ml">написано</div></div>
+        </div>
+        <div class="agents" data-card="a24|3"></div>
+        <div class="bar"><i style="width:3.7%"></i></div>
+      </div>
+    </div>
+
+  </div>
+
+  <h2>По карточкам</h2>
+  <p class="sect-note">Те же три карточки в табличном виде. <b>Нажмите на строку</b> — раскроется
+  состав агентов: кто работал, сколько раз и сколько потратил.</p>
+  <div class="scroll" data-cards="a24"></div>
+
+  <h2>Два прогона рядом</h2>
+  <p class="sect-note">Слева — как было, справа — после слияния гейтов и укрупнения карточек.
+  Сравнение честное по конвейеру, но не по задаче: это разные фичи разного объёма.</p>
+  <div class="scroll">
+  <table class="cmp">
+    <thead><tr><th>Показатель</th><th>Услуги B+</th><th>A2-4</th><th>Изменение</th></tr></thead>
+    <tbody>
+      <tr><td>Карточек</td><td class="num">7</td><td class="num">3</td><td class="num">—</td></tr>
+      <tr><td>Сессий модели</td><td class="num">41</td><td class="num">13</td><td class="num win">−68%</td></tr>
+      <tr><td>Обращений к модели</td><td class="num">766</td><td class="num">360</td><td class="num win">−53%</td></tr>
+      <tr><td>Гейтов на карточку</td><td class="num">2</td><td class="num">1</td><td class="num win">−50%</td></tr>
+      <tr><td>Разведчиков</td><td class="num">18</td><td class="num">3</td><td class="num win">−83%</td></tr>
+      <tr><td>Доля гейтов в счёте</td><td class="num">10,9%</td><td class="num">7,0%</td><td class="num win">−3,9 п.п.</td></tr>
+      <tr><td>Прогрев (доля счёта)</td><td class="num">33%</td><td class="num">28%</td><td class="num win">−5 п.п.</td></tr>
+      <tr><td>Средний контекст хода в сборке</td><td class="num">97 тыс.</td><td class="num">110 тыс.</td><td class="num lose">+13%</td></tr>
+      <tr><td>Пиковый контекст</td><td class="num">169 тыс.</td><td class="num">213 тыс.</td><td class="num lose">+26%</td></tr>
+      <tr><td>Приёмка прогона</td><td class="num">$1,7 · умерла</td><td class="num">$11 · 44 проверки</td><td class="num">—</td></tr>
+      <tr><td>Стоимость 1000 строк кода</td><td class="num">$26</td><td class="num">$60</td><td class="num lose">+131%</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="banner warn" style="margin-top:20px"><b>Удельно второй прогон вышел дороже — и это
+  честный результат, а не ошибка замера.</b> Правки дали то, что обещали: холодных стартов втрое
+  меньше, лишний гейт исчез, разведка почти не дублировалась. Но выросли две другие статьи.
+  Первая — средний контекст хода: крупная карточка держит в голове больше и перечитывает это на
+  каждом ходу, а backend-задачи с прогонами <code>pytest</code> и <code>mypy</code> набивают контекст
+  выводом тестов быстрее, чем фронтовые задачи прошлого прогона. Вторая — приёмка: в прошлом прогоне она умерла через две минуты и стоила $1,7, здесь честно отработала 44 проверки за $11. Сравнивать их удельные цены строго нельзя: за $60 куплен и код, и проверка того, что он работает.</div>
+
+  <div class="finds" style="margin-top:18px">
+    <div class="find">
+      <div class="n">01</div>
+      <h3>Экономия на стартах — подтверждена</h3>
+      <div class="fig num" style="color:var(--out)">13 сессий вместо 41</div>
+      <p>Прогрев упал с 40% до 33% счёта. Гейт одной сессией отработал на обеих новых карточках,
+      второго холодного старта не случилось ни разу.</p>
+    </div>
+    <div class="find">
+      <div class="n">02</div>
+      <h3>Но появился новый потолок</h3>
+      <div class="fig num" style="color:var(--warm)">213 тыс. контекста</div>
+      <p>Склеенная карточка подошла к пределу окна. Это цена укрупнения: коридор в 8–15 файлов
+      держит размер работы, но не объём того, что агент прочитает по дороге.</p>
+    </div>
+    <div class="find">
+      <div class="n">03</div>
+      <h3>Аварии дороже нарезки</h3>
+      <div class="fig num" style="color:var(--warm)">$8,9 за 111 строк</div>
+      <p>Три запуска сборки одной карточки из-за лимита и ручной паузы стоили больше, чем весь гейт
+      прогона. Простой — 3 ч 38 м против 1 ч 15 м работы.</p>
+    </div>
+  </div>
+
+</section>
+
+  <h2>Что с этим сделано</h2>
+  <div class="finds">
+    <div class="find done">
+      <span class="pill ok">сделано и проверено</span>
+      <h3>Гейты слиты в одну сессию</h3>
+      <p>Шаги 2 и 3 теперь проходят в одном процессе: агент классифицирует оба гейта сразу. Замер на
+      живой карточке — время гейта упало с 235 до 164 секунд, прогрев на 46%, стоимость с $6,63
+      до $3,85 на карточку.</p>
+    </div>
+    <div class="find done">
+      <span class="pill ok">сделано</span>
+      <h3>Карточки режутся крупнее и вертикально</h3>
+      <p>Правила декомпозиции переписаны: 3–5 карточек на прогон вместо 6–12, разрез по сценарию,
+      а не по слоям, запрет на карточки мельче 200 строк и на пересечение файлов. Следующий прогон
+      пересобран с 5 карточек на 3.</p>
+    </div>
+    <div class="find todo">
+      <span class="pill next">предлагается</span>
+      <h3>Карта кода — одна на прогон</h3>
+      <p>Разведка один раз при старте прогона, результат — файл, путь к которому получают все карточки.
+      Ожидаемо: 18 разведчиков → 3–4, около $59 экономии на прогон. Передавать именно путём, а не
+      текстом в промпте: вложенное в промпт оплачивается на каждом ходу.</p>
+    </div>
+  </div>
+
+  <div class="foot">
+    <p><b>Поправка от 1 августа.</b> Первая версия этого разбора завышала все суммы примерно вдвое:
+    транскрипт записывает одно обращение к модели по два-три раза (одинаковый <code>requestId</code>,
+    разные <code>uuid</code>), а суммирование шло по записям. Цифры пересчитаны с дедупликацией по
+    <code>requestId</code>. Доли, пропорции и выводы не изменились — изменился масштаб.</p>
+    <p><b>Как получены цифры.</b> Источник — транскрипты сессий Claude Code в
+    <code>~/.claude/projects/</code>, включая вложенные транскрипты субагентов, и журнал диспетчера
+    <code>data/dispatch-log.ndjson</code>. Просуммированы поля <code>usage</code> всех обращений
+    в окне прогона: 07:57–10:24&nbsp;UTC плюс сессия приёмки. Стоимость пересчитана по прайсу API
+    Claude Opus ($15 / $75 / $18,75 / $1,50 за миллион токенов ввода, вывода, записи и чтения кэша) —
+    при работе по подписке это мера расхода квоты, а не выставленный счёт.</p>
+    <p>grace-board · разбор прогона <code>13dc2476</code> · 1 августа 2026</p>
+  </div>
+
+</div>
+
+<script id="rundata" type="application/json">{"b1":{"cards":[{"n":"Макеты HTML","note":"авария и перезапуск сборки","loc":265,"min":15,"$":20.27,"tot":{"n":74,"w":474346,"d":5197054,"o":46011},"a":[{"t":"Гейт функционала","r":"главная сессия","c":1,"n":7,"w":51506,"d":306678,"o":10891,"inT":9,"x":62440,"$":2.24},{"t":"Explore","r":"субагент-разведчик","c":3,"n":15,"w":185851,"d":885651,"o":5211,"inT":86,"x":0,"$":5.21},{"t":"Гейт архитектуры","r":"главная сессия","c":1,"n":6,"w":36353,"d":237042,"o":2153,"inT":8,"x":47287,"$":1.2},{"t":"Сборка кода","r":"главная сессия","c":2,"n":46,"w":200636,"d":3767683,"o":27756,"inT":8253,"x":127640,"$":11.62}]},{"n":"Каталог услуг","note":"","loc":684,"min":37,"$":22.17,"tot":{"n":111,"w":358047,"d":8205110,"o":41923},"a":[{"t":"Гейт функционала","r":"главная сессия","c":1,"n":3,"w":40341,"d":101425,"o":3235,"inT":5,"x":51275,"$":1.15},{"t":"gfd-explorer","r":"субагент-разведчик","c":2,"n":22,"w":75597,"d":604028,"o":5607,"inT":26,"x":0,"$":2.74},{"t":"Гейт архитектуры","r":"главная сессия","c":1,"n":3,"w":36306,"d":98426,"o":3142,"inT":5,"x":47240,"$":1.06},{"t":"Сборка кода","r":"главная сессия","c":1,"n":83,"w":205803,"d":7401231,"o":29939,"inT":103,"x":116385,"$":17.21}]},{"n":"Профили услуги","note":"","loc":1003,"min":21,"$":28.65,"tot":{"n":120,"w":464502,"d":10660624,"o":52391},"a":[{"t":"Гейт функционала","r":"главная сессия","c":1,"n":3,"w":40651,"d":102684,"o":2874,"inT":5,"x":51585,"$":1.13},{"t":"Explore","r":"субагент-разведчик","c":1,"n":13,"w":88053,"d":882311,"o":2889,"inT":87,"x":0,"$":3.19},{"t":"Гейт архитектуры","r":"главная сессия","c":1,"n":3,"w":37804,"d":99892,"o":3800,"inT":5,"x":48738,"$":1.14},{"t":"Сборка кода","r":"главная сессия","c":1,"n":94,"w":256685,"d":9431759,"o":39497,"inT":1235,"x":140369,"$":21.94},{"t":"gfd-explorer","r":"субагент-разведчик","c":1,"n":7,"w":41309,"d":143978,"o":3331,"inT":9,"x":0,"$":1.24}]},{"n":"Биллинг company_id","note":"","loc":1518,"min":25,"$":28.28,"tot":{"n":125,"w":439693,"d":10746167,"o":52183},"a":[{"t":"Гейт функционала","r":"главная сессия","c":1,"n":3,"w":45509,"d":105544,"o":5815,"inT":5,"x":56443,"$":1.45},{"t":"gfd-explorer","r":"субагент-разведчик","c":2,"n":26,"w":84258,"d":701797,"o":7201,"inT":30,"x":0,"$":3.17},{"t":"Гейт архитектуры","r":"главная сессия","c":1,"n":3,"w":42827,"d":105665,"o":4240,"inT":5,"x":53761,"$":1.28},{"t":"Сборка кода","r":"главная сессия","c":1,"n":93,"w":267099,"d":9833161,"o":34927,"inT":99,"x":145642,"$":22.38}]},{"n":"Транспорт X-Company-Id","note":"слишком мелкая карточка","loc":137,"min":11,"$":12.4,"tot":{"n":70,"w":242797,"d":3721615,"o":30226},"a":[{"t":"Гейт функционала","r":"главная сессия","c":1,"n":7,"w":80731,"d":258417,"o":3769,"inT":15,"x":55731,"$":2.18},{"t":"gfd-explorer","r":"субагент-разведчик","c":2,"n":17,"w":47800,"d":285983,"o":5205,"inT":21,"x":0,"$":1.72},{"t":"Гейт архитектуры","r":"главная сессия","c":1,"n":3,"w":36741,"d":99393,"o":2069,"inT":5,"x":47675,"$":0.99},{"t":"Сборка кода","r":"главная сессия","c":1,"n":43,"w":77525,"d":3077822,"o":19183,"inT":47,"x":88459,"$":7.51}]},{"n":"Модалка активации","note":"","loc":1117,"min":19,"$":25.11,"tot":{"n":115,"w":414579,"d":9165171,"o":47785},"a":[{"t":"Гейт функционала","r":"главная сессия","c":1,"n":3,"w":41625,"d":101857,"o":4770,"inT":5,"x":52559,"$":1.29},{"t":"Explore","r":"субагент-разведчик","c":3,"n":19,"w":222225,"d":762430,"o":4810,"inT":75,"x":0,"$":5.67},{"t":"Гейт архитектуры","r":"главная сессия","c":1,"n":3,"w":37662,"d":103250,"o":1172,"inT":5,"x":48596,"$":0.95},{"t":"Сборка кода","r":"главная сессия","c":1,"n":90,"w":113067,"d":8197634,"o":37033,"inT":136,"x":124001,"$":17.2}]},{"n":"Экран конструктора","note":"","loc":1895,"min":18,"$":32.31,"tot":{"n":134,"w":538998,"d":11292462,"o":68369},"a":[{"t":"Гейт функционала","r":"главная сессия","c":1,"n":3,"w":42579,"d":97925,"o":5569,"inT":3898,"x":53513,"$":1.42},{"t":"gfd-explorer","r":"субагент-разведчик","c":4,"n":45,"w":152518,"d":1134417,"o":14668,"inT":5244,"x":0,"$":5.74},{"t":"Гейт архитектуры","r":"главная сессия","c":1,"n":4,"w":37573,"d":150003,"o":1943,"inT":6,"x":48507,"$":1.08},{"t":"Сборка кода","r":"главная сессия","c":1,"n":82,"w":306328,"d":9910117,"o":46189,"inT":94,"x":169207,"$":24.07}]},{"n":"Приёмка прогона","note":"умерла на лимите аккаунта","loc":0,"min":8,"$":1.65,"tot":{"n":17,"w":31166,"d":489530,"o":4405},"a":[{"t":"Приёмка прогона","r":"главная сессия","c":1,"n":17,"w":31166,"d":489530,"o":4405,"inT":18,"x":42100,"$":1.65}]}],"byType":[{"t":"Гейт функционала","r":"главная сессия","c":7,"n":29,"w":342942,"d":1074530,"o":36923,"inT":3942,"x":62440,"$":10.86},{"t":"Explore","r":"субагент-разведчик","c":7,"n":47,"w":496129,"d":2530392,"o":12910,"inT":248,"x":0,"$":14.07},{"t":"Гейт архитектуры","r":"главная сессия","c":7,"n":25,"w":265266,"d":893671,"o":18519,"inT":39,"x":53761,"$":7.7},{"t":"Сборка кода","r":"главная сессия","c":8,"n":531,"w":1427143,"d":51619407,"o":234524,"inT":9967,"x":169207,"$":121.93},{"t":"gfd-explorer","r":"субагент-разведчик","c":11,"n":117,"w":401482,"d":2870203,"o":36012,"inT":5330,"x":0,"$":14.61},{"t":"Приёмка прогона","r":"главная сессия","c":1,"n":17,"w":31166,"d":489530,"o":4405,"inT":18,"x":42100,"$":1.65}]},"a24":{"cards":[{"n":"Регистрация Celery-задач","note":"старая схема · 3 запуска сборки","loc":111,"min":11,"$":12.1,"tot":{"n":74,"w":247036,"d":3753257,"o":24479},"a":[{"t":"Гейт функционала","r":"главная сессия","c":1,"n":4,"w":38252,"d":145943,"o":2802,"inT":6,"x":49186,"$":1.15},{"t":"Гейт архитектуры","r":"главная сессия","c":1,"n":7,"w":36285,"d":279053,"o":1763,"inT":9,"x":47219,"$":1.23},{"t":"Сборка кода","r":"главная сессия","c":3,"n":63,"w":172499,"d":3328261,"o":19914,"inT":70,"x":74424,"$":9.72}]},{"n":"Доставка писем","note":"склеена из трёх карточек","loc":635,"min":37,"$":35.76,"tot":{"n":137,"w":505159,"d":14209200,"o":63916},"a":[{"t":"Единый гейт","r":"главная сессия","c":1,"n":3,"w":47241,"d":107300,"o":4505,"inT":5012,"x":58175,"$":1.46},{"t":"gfd-explorer","r":"субагент-разведчик","c":1,"n":6,"w":26816,"d":97081,"o":2479,"inT":1356,"x":0,"$":0.85},{"t":"Сборка кода","r":"главная сессия","c":1,"n":124,"w":369260,"d":13987685,"o":50992,"inT":5391,"x":212776,"$":31.81},{"t":"Explore","r":"субагент-разведчик","c":2,"n":4,"w":61842,"d":17134,"o":5940,"inT":8,"x":0,"$":1.63}]},{"n":"Перевыпуск пароля","note":"","loc":753,"min":26,"$":31.52,"tot":{"n":92,"w":388075,"d":13075286,"o":61639},"a":[{"t":"Единый гейт","r":"главная сессия","c":1,"n":7,"w":77078,"d":396984,"o":5882,"inT":14,"x":77080,"$":2.48},{"t":"Сборка кода","r":"главная сессия","c":1,"n":85,"w":310997,"d":12678302,"o":55757,"inT":170,"x":200474,"$":29.03}]},{"n":"Приёмка прогона","note":"44 проверки · одна красная","loc":0,"min":9,"$":10.95,"tot":{"n":57,"w":190229,"d":3599918,"o":26447},"a":[{"t":"Приёмка прогона","r":"главная сессия","c":1,"n":57,"w":190229,"d":3599918,"o":26447,"inT":114,"x":97373,"$":10.95}]}],"byType":[{"t":"Гейт функционала","r":"главная сессия","c":1,"n":4,"w":38252,"d":145943,"o":2802,"inT":6,"x":49186,"$":1.15},{"t":"Гейт архитектуры","r":"главная сессия","c":1,"n":7,"w":36285,"d":279053,"o":1763,"inT":9,"x":47219,"$":1.23},{"t":"Сборка кода","r":"главная сессия","c":5,"n":272,"w":852756,"d":29994248,"o":126663,"inT":5631,"x":212776,"$":70.56},{"t":"Единый гейт","r":"главная сессия","c":2,"n":10,"w":124319,"d":504284,"o":10387,"inT":5026,"x":77080,"$":3.94},{"t":"gfd-explorer","r":"субагент-разведчик","c":1,"n":6,"w":26816,"d":97081,"o":2479,"inT":1356,"x":0,"$":0.85},{"t":"Explore","r":"субагент-разведчик","c":2,"n":4,"w":61842,"d":17134,"o":5940,"inT":8,"x":0,"$":1.63},{"t":"Приёмка прогона","r":"главная сессия","c":1,"n":57,"w":190229,"d":3599918,"o":26447,"inT":114,"x":97373,"$":10.95}]}}</script>
+<script>
+(function(){
+  const D = JSON.parse(document.getElementById("rundata").textContent);
+  const M = n => n >= 1e6 ? (n/1e6).toFixed(2).replace(".",",")+" М"
+           : n >= 1000 ? Math.round(n/1000)+" тыс." : String(n);
+  const money = v => "$"+v.toFixed(2).replace(".",",");
+  const nfmt = n => String(n).replace(/\B(?=(\d{3})+(?!\d))/g," ");
+
+  function agentTable(list, opts){
+    opts = opts || {};
+    const t = list.reduce((a,r)=>({n:a.n+r.n,w:a.w+r.w,d:a.d+r.d,o:a.o+r.o,c:a.c+r.c,$:a.$+r.$}),
+                          {n:0,w:0,d:0,o:0,c:0,$:0});
+    const rows = list.slice().sort((a,b)=>b.$-a.$).map(r=>
+      "<tr><td><span class=\"kindmark "+(r.r.indexOf("суб")===0?"sub":"main")+"\"></span>"+
+      "<span class=\"who\">"+r.t+"</span><span class=\"role\">"+r.r+"</span></td>"+
+      "<td>"+r.c+"</td><td>"+nfmt(r.n)+"</td>"+
+      "<td class=\"w\">"+M(r.w)+"</td><td class=\"d\">"+M(r.d)+"</td>"+
+      "<td class=\"o\">"+M(r.o)+"</td><td>"+money(r.$)+"</td></tr>").join("");
+    return "<div class=\"agents\"><table><thead><tr>"+
+      "<th>"+(opts.head||"Агент")+"</th><th>Запусков</th><th>Обращений</th>"+
+      "<th>Прогрев</th><th>Чтение</th><th>Написано</th><th>Стоимость</th></tr></thead>"+
+      "<tbody>"+rows+"</tbody>"+
+      "<tfoot><tr><td>Итого</td><td>"+t.c+"</td><td>"+nfmt(t.n)+"</td><td>"+M(t.w)+"</td>"+
+      "<td>"+M(t.d)+"</td><td>"+M(t.o)+"</td><td>"+money(t.$)+"</td></tr></tfoot></table></div>";
+  }
+
+  // таблицы агентов внутри шагов
+  document.querySelectorAll("[data-agents]").forEach(el=>{
+    const p = el.getAttribute("data-agents").split("|"), run = p.shift();
+    const list = D[run].byType.filter(r=>p.indexOf(r.t)>=0);
+    if(list.length) el.outerHTML = agentTable(list);
+  });
+  document.querySelectorAll("[data-card]").forEach(el=>{
+    const p = el.getAttribute("data-card").split("|");
+    const card = D[p[0]].cards[+p[1]];
+    if(card) el.outerHTML = agentTable(card.a);
+  });
+
+  // таблица по карточкам с раскрытием
+  document.querySelectorAll("[data-cards]").forEach(host=>{
+    const run = host.getAttribute("data-cards"), cards = D[run].cards;
+    const tot = cards.reduce((a,c)=>({n:a.n+c.tot.n,w:a.w+c.tot.w,d:a.d+c.tot.d,
+      loc:a.loc+c.loc,$:a.$+c.$,ag:a.ag+c.a.reduce((s,x)=>s+x.c,0),min:a.min+(c.loc?c.min:0)}),
+      {n:0,w:0,d:0,loc:0,$:0,ag:0,min:0});
+    let body="";
+    cards.forEach((c,i)=>{
+      const per = c.loc ? "$"+(c.$/c.loc*100).toFixed(1).replace(".",",") : "—";
+      const warn = /авари|мелкая|умерла|запуска сборки/.test(c.note||"") ? " warnrow" : "";
+      body += "<tr class=\"crow"+warn+"\" data-i=\""+i+"\"><td>"+c.n+
+        (c.note?" <span class=\"muted\">· "+c.note+"</span>":"")+"</td>"+
+        "<td>"+(c.loc?c.min+" м":"—")+"</td><td>"+c.a.reduce((s,x)=>s+x.c,0)+"</td>"+
+        "<td>"+nfmt(c.tot.n)+"</td><td>"+M(c.tot.w)+"</td><td>"+M(c.tot.d)+"</td>"+
+        "<td>"+(c.loc?nfmt(c.loc):"—")+"</td><td>"+money(c.$)+"</td><td>"+per+"</td></tr>"+
+        "<tr class=\"cdet\" hidden><td colspan=\"9\">"+agentTable(c.a,{head:"Кто работал"})+"</td></tr>";
+    });
+    host.innerHTML = "<table><thead><tr><th>Карточка</th><th>Время</th><th>Агентов</th>"+
+      "<th>Обращений</th><th>Прогрев</th><th>Чтение</th><th>Строк кода</th>"+
+      "<th>Стоимость</th><th>$ / 100 строк</th></tr></thead><tbody>"+body+"</tbody>"+
+      "<tfoot><tr><td>Всего</td><td>"+tot.min+" м</td><td>"+tot.ag+"</td><td>"+nfmt(tot.n)+"</td>"+
+      "<td>"+M(tot.w)+"</td><td>"+M(tot.d)+"</td><td>"+nfmt(tot.loc)+"</td><td>"+money(tot.$)+"</td>"+
+      "<td>$"+(tot.$/tot.loc*100).toFixed(1).replace(".",",")+"</td></tr></tfoot></table>";
+    host.querySelectorAll("tr.crow").forEach(tr=>{
+      tr.addEventListener("click",()=>{
+        const det = tr.nextElementSibling;
+        det.hidden = !det.hidden; tr.classList.toggle("open", !det.hidden);
+      });
+    });
+  });
+
+  // вкладки
+  const tabs = document.querySelectorAll(".tab");
+  tabs.forEach(tab=>tab.addEventListener("click",()=>{
+    tabs.forEach(t=>{
+      const on = t===tab;
+      t.setAttribute("aria-selected", on ? "true" : "false");
+      document.getElementById(t.getAttribute("aria-controls")).hidden = !on;
+    });
+    window.scrollTo({top:0,behavior:"smooth"});
+  }));
+})();
+</script>
+
+</body>
+</html>

@@ -685,20 +685,29 @@ function hasActiveForProject(board, project, exceptId) {
   return board.cards.some((c) =>
     c.id !== exceptId && c.project === project && c.dispatchedAt && !c.queued && OCCUPYING_COLUMNS.has(c.column));
 }
-// May this card start its run right now? Three gates (all must pass):
+// May this card start its run right now, and if not — WHICH gate holds it? Returns null when
+// every gate is open. The named reason is what lets the queue say «ждёт предыдущий прогон»
+// instead of silently standing still (A2).
 //   1) the per-project WIP=1 slot is free (S0), 2) every dependsOn card is `ready` (S1),
-//   3) no files[] conflict with an active sibling (S1 — subsumed by WIP=1, forward-compat).
-function canDispatchNow(board, card) {
-  return !card.paused                            // S4 §2.2: paused keeps its place in the queue
-    && dispatchBlock(card) === null              // S3 §4.2: draft / incomplete brief never starts
-    && !hasActiveForProject(board, card.project, card.id)
-    && depsSatisfied(board, card)
-    && !filesConflict(board, card);
+//   3) no files[] conflict with an active sibling (S1 — subsumed by WIP=1, forward-compat),
+//   4) A2: no EARLIER plan of the same project whose code is not yet in `main`.
+function dispatchGate(board, card) {
+  if (card.paused) return { gate: "paused" };                  // S4 §2.2: paused keeps its place in the queue
+  const veto = dispatchBlock(card);                            // S3 §4.2: draft / incomplete brief never starts
+  if (veto) return { gate: "brief", ...veto };
+  if (hasActiveForProject(board, card.project, card.id)) return { gate: "wip" };
+  if (!depsSatisfied(board, card)) return { gate: "deps" };
+  if (filesConflict(board, card)) return { gate: "files" };
+  const order = planOrderHold(board, card);
+  if (order) return { gate: "plan-order", ...order };
+  return null;
 }
+const canDispatchNow = (board, card) => dispatchGate(board, card) === null;
 // Actually start the card's run: clear the queued flag, stamp it live, seed + spawn.
 // Shared by the PATCH (lever) path and the tick scheduler so both dispatch identically.
 function dispatchNow(board, card, via) {
   card.queued = false;
+  card.orderHold = null;                          // A2: whatever it was waiting for has arrived
   inheritContracts(board, card);   // S3 §4.1: dep contracts are frozen onto the card at dispatch
   card.dispatchedAt = new Date().toISOString();
   card.dispatch = dispatch(card);
@@ -721,7 +730,13 @@ function scheduleQueued(board) {
   for (const card of board.cards) {
     if (!card.queued) continue;
     if (holding && !(card.planId && holding.has(card.planId))) continue;
-    if (!canDispatchNow(board, card)) continue;
+    const gate = dispatchGate(board, card);
+    if (gate) {
+      // A2: the plan-order gate is the only one that is invisible on the board — WIP, deps and
+      // files all show as a live sibling card. Write it down once per blocking plan.
+      if (gate.gate === "plan-order" && noteOrderHold(card, gate)) changed = true;
+      continue;
+    }
     dispatchNow(board, card, "queue-dispatch");
     try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.dispatchedAt, event: "queue-dispatch", cardId: card.id, project: card.project }) + "\n"); } catch {}
     changed = true;
@@ -764,6 +779,91 @@ function filesConflict(board, card) {
     OCCUPYING_COLUMNS.has(c.column) && Array.isArray(c.files) && c.files.some((f) => mine.has(f)));
 }
 // endregion FUNC_dagGates
+
+// region FUNC_planOrderGate — a plan does not start until the PREVIOUS one is in `main` (A2)
+// ## @purpose Between two PLANS of one project there was no link at all: WIP=1 serializes cards,
+// ##   `dependsOn` serializes stages inside a run — but the moment the last stage of run N hit
+// ##   `ready`, run N+1 was free to start against a working tree whose code had never been
+// ##   merged. It happened twice (06.08 A/B/C and 07.08 D/E): the next run branched off a tree
+// ##   still carrying the previous run's unmerged work, and its stages wrote into the wrong branch.
+// ## ## @io (board, card) -> null | {planId, branch, state} · plus a detached `git` probe per branch
+// ## @invariants
+// ## - The check is FACTUAL, not a flag: `git merge-base --is-ancestor <branch> origin/main`
+// ##   after a fetch. A plan marked «done» whose PR was never merged still holds the queue.
+// ## - UNKNOWN (probe not finished yet) reads as NOT-in-main: the safe side is to wait.
+// ## - A blocked plan does NOT fall into `blocked` — it waits exactly like the WIP=1 queue, so
+// ##   the moment the PR lands the next run starts by itself, with no human kick.
+// ## - Single cards (planId: null) are NEVER held: a fixup card (C3) must be able to overtake a
+// ##   stuck plan — otherwise the very thing that unblocks the queue is blocked by the queue.
+// ## - Escape hatches for a plan that will never merge: `archived` (dismissed by hand) or an
+// ##   explicit `orderGateWaived: true`. Without them an abandoned run would hold the project
+// ##   forever — and it would do so LOUDLY, via plan-order-hold in the journal.
+// ## @rationale Q: why a detached probe with a TTL cache instead of a sync `git` call?
+// ##   A: dispatchGate runs inside the 2 s tick and inside PATCH; a `git fetch` there would
+// ##   block the whole board (and the UI) for seconds at a time.
+// GREP_SUMMARY: A2, plan order, previous plan, merge-base, is-ancestor, origin/main, order hold
+const ANCESTRY_DIR = path.join(DATA_DIR, "ancestry");
+const ANCESTRY_TTL_MS = Number(process.env.GRACE_ANCESTRY_TTL_SEC || 120) * 1000;
+const ANCESTRY_PROBE_MS = 5 * 60 * 1000;          // a probe stuck longer than this may be re-armed
+const ancestryCache = new Map();                  // key → { state, at, probing, startedAt }
+// "in-main" | "not-in-main" | "no-ref" (branch exists nowhere → nothing to wait for) | "unknown"
+function branchInMain(projectDir, branch) {
+  if (!branch) return "no-ref";
+  const key = crypto.createHash("sha1").update(projectDir + "\n" + branch).digest("hex").slice(0, 16);
+  const file = path.join(ANCESTRY_DIR, key + ".out");
+  const e = ancestryCache.get(key) || {};
+  const now = Date.now();
+  if (e.probing) {
+    const r = readStep(file);
+    if (r) {
+      const state = /IN-MAIN/.test(r.text) ? "in-main" : /NOT-IN-MAIN/.test(r.text) ? "not-in-main"
+        : /NO-REF/.test(r.text) ? "no-ref" : "unknown";
+      ancestryCache.set(key, { state, at: now, probing: false });
+      return state;
+    }
+    if (now - (e.startedAt || 0) > ANCESTRY_PROBE_MS) ancestryCache.set(key, { ...e, probing: false });
+    return e.state || "unknown";
+  }
+  if (e.at && now - e.at < ANCESTRY_TTL_MS) return e.state;
+  try { fs.mkdirSync(ANCESTRY_DIR, { recursive: true }); } catch {}
+  const sh = `git fetch -q origin 2>/dev/null; for r in ${shq("origin/" + branch)} ${shq(branch)}; do `
+    + `if git rev-parse --verify -q "$r" >/dev/null 2>&1; then `
+    + `git merge-base --is-ancestor "$r" origin/main && echo IN-MAIN || echo NOT-IN-MAIN; exit 0; fi; done; echo NO-REF`;
+  const st = spawnStep(projectDir, sh, file);
+  ancestryCache.set(key, { state: e.state || "unknown", at: e.at || 0, probing: !!st.started, startedAt: now });
+  return e.state || "unknown";
+}
+// Which EARLIER plan of this project still holds the queue, if any.
+function planOrderHold(board, card) {
+  if (!card || !card.planId) return null;                       // одиночная карточка не ждёт никого
+  const mine = planById(board, card.planId);
+  if (!mine) return null;
+  const projectDir = resolveProjectDir(card.project);
+  if (!isInsideRoot(projectDir)) return null;
+  const mineAt = Date.parse(mine.createdAt || "") || 0;
+  for (const p of board.plans || []) {
+    if (p.id === mine.id || p.project !== card.project) continue;
+    if (!(p.cardIds || []).length) continue;
+    if (p.archived || p.orderGateWaived) continue;
+    if ((Date.parse(p.createdAt || "") || 0) >= mineAt) continue;   // только СТАРШИЕ прогоны
+    const state = branchInMain(projectDir, p.integrationBranch);
+    if (state === "in-main" || state === "no-ref") continue;
+    return { planId: p.id, branch: p.integrationBranch, state, goal: p.goal || null };
+  }
+  return null;
+}
+// One journal line per (card → blocking plan), not per tick: the hold can last hours.
+function noteOrderHold(card, hold) {
+  if (card.orderHold && card.orderHold.planId === hold.planId) return false;
+  card.orderHold = { planId: hold.planId, branch: hold.branch, state: hold.state, since: new Date().toISOString() };
+  try {
+    fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.orderHold.since, event: "plan-order-hold",
+      cardId: card.id, planId: card.planId, waitsFor: hold.planId, branch: hold.branch, state: hold.state,
+      note: "предыдущий прогон проекта ещё не доехал до main" }) + "\n");
+  } catch {}
+  return true;
+}
+// endregion FUNC_planOrderGate
 
 // region FUNC_releaseManifest — «Результат» aggregate + 5-section release manifest (roadmap §6/§6.1)
 // ## @purpose Turn what a card ALREADY reports (branchLink, finishNote, blockReason,
@@ -1094,7 +1194,7 @@ function launchPlanAcceptance(board, plan) {
     `   passed:true ТОЛЬКО если ни одного "fail". Пиши файл ДАЖЕ если всё упало — молчание = провал приёмки.`, ``,
     `ЗАПРЕТЫ: не мержь, не деплой, не правь код и не коммить в интеграционную ветку. Приёмка только читает.`,
   ].join("\n");
-  return spawnRun(projectDir, runDir, prompt, "plan-acceptance.log");
+  return spawnRun(projectDir, runDir, prompt, "plan-acceptance.log", { model: modelFor(plan) });
 }
 // A plain child process for the deterministic steps (gh / deploy): stdout+stderr into one file the
 // next tick reads. No model, no tokens, and the output IS the evidence.
@@ -1205,6 +1305,123 @@ function normalizeAcceptance(raw) {
     notes: raw && raw.notes ? String(raw.notes).slice(0, 2000) : null,
     evidence: checks.filter((c) => c.evidence).map((c) => c.evidence) };
 }
+
+// region FUNC_ciGate — `merge=auto` means «смержить, КОГДА CI зелёный», not «смержить» (A1)
+// ## @purpose 08.08 at 05:05 the CI of PR #17 was red; at 05:14 the board merged it — because the
+// ##   closing phase ran `gh pr merge` the moment the acceptance turned green and never looked at
+// ##   a single check. Red `main` then lived unnoticed until the morning. The gate makes the CI
+// ##   status a PRECONDITION of the merge and a FIELD of plan.result, so the board can say why it
+// ##   did not merge instead of merging blind.
+// ## @io (text of `gh pr view --json …`) -> {status, checks[], failed[], mergeStateStatus}
+// ## @invariants
+// ## - The board merges ONLY on `green` or `none` (a repo with no checks at all — nothing to
+// ##   gate on). EVERY other outcome, including an unreadable answer from `gh`, does NOT merge.
+// ## - `pending` is a CLOCK, not a failure — the same shape as the quota hold: re-poll every
+// ##   CI_POLL_MS until CI_BUDGET_MS runs out, then stop with `ci-timeout` and hand the merge over.
+// ## - `--json` is used instead of `gh pr checks --watch`: gh 2.45 on the box has no `--json` for
+// ##   `pr checks`, exit codes there are ambiguous (8 = pending, 1 = failed AND 1 = no checks),
+// ##   and a `--watch` child would hold the step open for the whole CI run with no visible state.
+// ## - `mergeStateStatus: DIRTY` (a conflict) is reported as such — that is exactly what the
+// ##   silent «мерж не прошёл (код 1)» of PR #21 was, and a conflict is not a red CI.
+// ## @rationale Q: why not `gh pr merge --auto`? A: it needs branch protection (unavailable on
+// ##   Free+private here) and would leave the board with no status of its own to report.
+// GREP_SUMMARY: CI gate, merge auto, statusCheckRollup, ci-red, ci-timeout, conflict, A1
+const CI_POLL_MS = Number(process.env.GRACE_CI_POLL_SEC || 60) * 1000;
+const CI_BUDGET_MS = Number(process.env.GRACE_CI_WAIT_MIN || 90) * 60 * 1000;
+const CI_FAIL = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"]);
+function ciClassify(text) {
+  let j = null;
+  try { j = JSON.parse((String(text).match(/\{[\s\S]*\}/) || [""])[0]); } catch {}
+  if (!j || typeof j !== "object") return { status: "unreadable", checks: [], failed: [], pending: [], raw: String(text).slice(-400) };
+  const rollup = Array.isArray(j.statusCheckRollup) ? j.statusCheckRollup : [];
+  const checks = rollup.map((c) => {
+    const done = c.status ? String(c.status).toUpperCase() === "COMPLETED"
+      : !["PENDING", "EXPECTED"].includes(String(c.state || "").toUpperCase());
+    return { name: c.name || c.context || "проверка", done,
+      verdict: String(c.conclusion || c.state || "").toUpperCase(), url: c.detailsUrl || c.targetUrl || null };
+  });
+  const failed = checks.filter((c) => c.done && CI_FAIL.has(c.verdict));
+  const pending = checks.filter((c) => !c.done);
+  const mergeState = String(j.mergeStateStatus || "").toUpperCase() || null;
+  const status = failed.length ? "red"
+    : mergeState === "DIRTY" ? "conflict"
+    : (pending.length || mergeState === "UNKNOWN") ? "pending"
+    : checks.length ? "green" : "none";
+  return { status, checks, mergeStateStatus: mergeState,
+    failed: failed.map((f) => f.name), pending: pending.map((p) => p.name),
+    failedUrls: failed.map((f) => f.url).filter(Boolean) };
+}
+// The workflow run behind a failed check — the only thing that makes `ci-red` actionable is the
+// tail of THAT job's log, and it is one `gh run view` away.
+const ciRunIdOf = (urls) => {
+  for (const u of urls || []) { const m = String(u).match(/\/actions\/runs\/(\d+)/); if (m) return m[1]; }
+  return null;
+};
+// endregion FUNC_ciGate
+
+// region FUNC_planMetrics — во что обошёлся прогон, машинно и без ручного разбора (A5)
+// ## @purpose Стоимость и время прогона восстанавливались только ручным разбором 77 МБ
+// ##   транскриптов. Метрика, которую снимают руками, снимается один раз и больше никогда —
+// ##   а без неё нечем измерить эффект B3′/B7/B2. Поэтому по закрытии прогона доска сама
+// ##   считает токены/деньги/время и кладёт их в plan.result.metrics.
+// ## @io (board) -> spawns ≤1 child per tick · reads its metrics.json on a later tick
+// ## @invariants
+// ## - Считает ОТДЕЛЬНЫЙ процесс (lib/plan-metrics.js): разбор транскриптов — это десятки
+// ##   мегабайт JSON.parse, в 2-секундном тике он заморозил бы очередь и UI.
+// ## - Запускается для ЛЮБОГО прогона с терминальным закрытием, включая `merge-failed` и
+// ##   `awaiting-*`: прогон, который не смержился, стоил денег ровно так же.
+// ## - Две попытки, потом честная запись об ошибке — молчание хуже пустых метрик.
+// ## - Прайс лежит в config/model-prices.json, не в коде (GRACE_PRICES переопределяет).
+// GREP_SUMMARY: A5, метрики прогона, plan.result.metrics, стоимость, токены, транскрипты
+const METRICS_STEPS = new Set(["closed", "pr-ready", "merge-failed", "awaiting-merge", "awaiting-deploy"]);
+const METRICS_SCRIPT = path.join(__dirname, "lib", "plan-metrics.js");
+const NODE_BIN = process.execPath;
+function planMetricsTick(board) {
+  let changed = false;
+  for (const plan of (board.plans || [])) {
+    if (!METRICS_STEPS.has(plan.closeStep || "")) continue;
+    if (plan.result && plan.result.metrics) continue;
+    if (!(plan.cardIds || []).length) continue;
+    const dir = planDir(plan), outFile = path.join(dir, "metrics.json");
+    const run = plan.metricsRun || null;
+    if (!run) {
+      if (!fs.existsSync(METRICS_SCRIPT)) continue;
+      try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+      const cmd = `${shq(NODE_BIN)} ${shq(METRICS_SCRIPT)} --plan ${shq(plan.id)} --board ${shq(BOARD_FILE)} `
+        + `--dispatch ${shq(DISPATCH_LOG)} --projects-root ${shq(PROJECTS_ROOT_ABS)} --out ${shq(outFile)}`;
+      const st = spawnStep(__dirname, cmd, path.join(dir, "metrics.out"));
+      plan.metricsRun = { ...st, startedAt: new Date().toISOString(), attempts: 1 };
+      changed = true;
+      continue;
+    }
+    const r = readStep(path.join(dir, "metrics.out"));
+    const started = Date.parse(run.startedAt || "") || 0;
+    if (!r && Date.now() - started < 10 * 60 * 1000 && run.started) continue;
+    let m = null;
+    try { m = JSON.parse(fs.readFileSync(outFile, "utf8")); } catch {}
+    if (m && typeof m === "object") {
+      plan.result = plan.result || {};
+      plan.result.metrics = m;
+      logPlan(plan, "plan-metrics", { costUsd: m.costUsd, sessions: m.sessions, wallSeconds: m.wallSeconds, loops: m.loops });
+      changed = true;
+      continue;
+    }
+    if ((run.attempts || 1) < 2) {
+      plan.metricsRun = { ...run, attempts: (run.attempts || 1) + 1, startedAt: null, started: false };
+      // следующая итерация сочтёт `!run.started` истёкшей и пересоберёт шаг
+      plan.metricsRun.startedAt = new Date(0).toISOString();
+      changed = true;
+      continue;
+    }
+    plan.result = plan.result || {};
+    plan.result.metrics = { error: "не удалось посчитать метрики прогона",
+      output: r ? String(r.text).slice(-400) : "процесс метрик не отчитался", computedAt: new Date().toISOString() };
+    logPlan(plan, "plan-metrics-failed", {});
+    changed = true;
+  }
+  return changed;
+}
+// endregion FUNC_planMetrics
 
 // The closing state machine. ONE step per plan per tick: every step either spawns a child and
 // parks, or reads that child's output file. The tick itself never waits on anything.
@@ -1354,10 +1571,82 @@ function planCloseTick(board) {
         logPlan(plan, "plan-merge-failed", { reason: "no-pr" });
         changed = true; continue;
       }
+      // A1: merge=auto is a promise to merge WHEN CI IS GREEN. The gate runs first and owns
+      // the branch to `merge`; nothing else in this machine calls `gh pr merge`.
+      plan.closeStep = "ci";
+      plan.ciSince = new Date().toISOString();
+      plan.ciNextAt = null; plan.ciRun = null;
+      changed = true;
+      continue;
+    }
+
+    // ── A1 · the CI gate: poll → classify → merge only on green ───────────────────────
+    if (plan.closeStep === "ci") {
+      if (plan.ciNextAt && Date.parse(plan.ciNextAt) > Date.now()) continue;   // waiting out the poll interval
+      const cmd = `${GH_BIN} pr view ${shq(plan.result.pr.url)} --json state,mergeStateStatus,statusCheckRollup`;
+      const st = spawnStep(projectDir, cmd, path.join(dir, "ci.out"));
+      plan.ciRun = { ...st, startedAt: new Date().toISOString() };
+      plan.closeStep = "ci-wait"; changed = true;
+      continue;
+    }
+    if (plan.closeStep === "ci-wait") {
+      const r = readStep(path.join(dir, "ci.out"));
+      const started = Date.parse((plan.ciRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.ciRun || {}).started) continue;
+      const ci = r ? ciClassify(r.text) : { status: "unreadable", checks: [], failed: [], pending: [], raw: "gh не ответил" };
+      const sinceMs = Date.now() - (Date.parse(plan.ciSince || "") || Date.now());
+      plan.result.ci = { ...ci, checkedAt: new Date().toISOString(), waitedSec: Math.round(sinceMs / 1000) };
+      const stopMerge = (reason, text) => {
+        plan.closeStatus = "done"; plan.closeStep = "merge-failed";
+        plan.result.merge = { ok: false, error: reason, ci: plan.result.ci };
+        planNotice(plan, text, "error");
+        logPlan(plan, "plan-merge-failed", { reason, ci: ci.status, failed: ci.failed });
+      };
+      if (ci.status === "green" || ci.status === "none") {
+        logPlan(plan, "plan-ci-green", { checks: ci.checks.length, waitedSec: plan.result.ci.waitedSec });
+        plan.closeStep = "merge"; changed = true; continue;
+      }
+      if (ci.status === "red") {
+        const runId = ciRunIdOf(ci.failedUrls);
+        if (runId) {   // fetch the tail of the failing job — a bare «CI красный» is not actionable
+          const st = spawnStep(projectDir, `${GH_BIN} run view ${runId} --log-failed 2>&1 | tail -n 40`, path.join(dir, "ci-log.out"));
+          plan.ciLogRun = { ...st, runId, startedAt: new Date().toISOString() };
+          plan.closeStep = "ci-log"; changed = true; continue;
+        }
+        stopMerge("ci-red", `CI красный — доска НЕ мержит. Упало: ${ci.failed.join(", ")}. Мерж за человеком после починки.`);
+        changed = true; continue;
+      }
+      if (ci.status === "conflict") {
+        stopMerge("conflict", `Ветка прогона конфликтует с main (mergeStateStatus: DIRTY) — доска не мержит. Нужно свести руками или карточкой-починкой.`);
+        changed = true; continue;
+      }
+      // pending / unreadable → это часы, а не провал: ждём и переспрашиваем, пока есть бюджет
+      if (sinceMs > CI_BUDGET_MS) {
+        stopMerge("ci-timeout", `CI не завершился за ${Math.round(CI_BUDGET_MS / 60000)} мин (${ci.status === "unreadable" ? "gh отвечал нечитаемо" : "в ожидании: " + ci.pending.join(", ")}) — мерж за человеком.`);
+        changed = true; continue;
+      }
+      plan.ciNextAt = new Date(Date.now() + CI_POLL_MS).toISOString();
+      plan.closeStep = "ci"; changed = true;
+      logPlan(plan, "plan-ci-hold", { status: ci.status, pending: ci.pending, waitedSec: plan.result.ci.waitedSec });
+      continue;
+    }
+    if (plan.closeStep === "ci-log") {
+      const r = readStep(path.join(dir, "ci-log.out"));
+      const started = Date.parse((plan.ciLogRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.ciLogRun || {}).started) continue;
+      const tail = r ? r.text.slice(-2000) : "(лог упавшего job получить не удалось)";
+      plan.result.ci = { ...(plan.result.ci || {}), logTail: tail, runId: (plan.ciLogRun || {}).runId || null };
+      plan.closeStatus = "done"; plan.closeStep = "merge-failed";
+      plan.result.merge = { ok: false, error: "ci-red", ci: plan.result.ci };
+      planNotice(plan, `CI красный — доска НЕ мержит. Упало: ${(plan.result.ci.failed || []).join(", ")}. Хвост лога job'а — в результате прогона.`, "error");
+      logPlan(plan, "plan-merge-failed", { reason: "ci-red", runId: plan.result.ci.runId, failed: plan.result.ci.failed });
+      changed = true; continue;
+    }
+    if (plan.closeStep === "merge") {
       const st = spawnStep(projectDir, `${GH_BIN} pr merge ${shq(plan.result.pr.url)} --merge --delete-branch=false`, path.join(dir, "merge.out"));
       plan.mergeRun = { ...st, startedAt: new Date().toISOString() };
       plan.closeStep = "merge-wait"; changed = true;
-      logPlan(plan, "plan-merge", { started: st.started });
+      logPlan(plan, "plan-merge", { started: st.started, ci: (plan.result.ci || {}).status || null });
       continue;
     }
     if (plan.closeStep === "merge-wait") {
@@ -1436,7 +1725,10 @@ function dispatch(card) {
   const projectDir = resolveProjectDir(card.project);
   const rigor = card.rigor === "grace" ? "grace" : "off";
   const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);
-  const event = { ts: new Date().toISOString(), event: "dispatch", cardId: card.id, project: card.project, slug: card.slug, rigor };
+  // B2: with nobody waiting for answers the ask stage is a paid no-op — merge it into build.
+  const merged = effAutonomy(card) === "auto";
+  const event = { ts: new Date().toISOString(), event: "dispatch", cardId: card.id, project: card.project, slug: card.slug,
+    rigor, buildMode: buildModeFor(card), model: modelFor(card) || null, merged };
 
   try {
     fs.mkdirSync(runDir, { recursive: true });
@@ -1461,9 +1753,18 @@ function dispatch(card) {
     event.seedError = String(e.message || e);
   }
 
-  // Asking · block 1 — ask the FUNCTIONAL questions, then stop.
-  event.launch = launchAskFunctional(card, projectDir, runDir);
-  recordLaunch(card, event.launch, "ask-functional");
+  // Asking · block 1 — ask the FUNCTIONAL questions, then stop. In AUTO (B2) the same session
+  // classifies both gates AND builds: `askBuildMerged` tells the supervisor to keep its hands
+  // off the build launch while that one process is alive.
+  if (merged) {
+    card.askBuildMerged = true;
+    event.launch = launchAskBuild(card, projectDir, runDir, rigor);
+    recordLaunch(card, event.launch, "ask-build");
+  } else {
+    card.askBuildMerged = false;
+    event.launch = launchAskFunctional(card, projectDir, runDir, rigor);
+    recordLaunch(card, event.launch, "ask-functional");
+  }
   try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify(event) + "\n"); } catch {}
   return event;
 }
@@ -1515,8 +1816,92 @@ function planDecisionsBlock(card) {
 }
 // endregion FUNC_autonomy
 
+// region FUNC_leanContext — drop the user-level harness from every headless run
+// ## @purpose EVERY spawned run pays for its start context TWICE: once as a cache write, and then
+// ##   again as a cache read on every single turn of that session. Measured on this machine with
+// ##   three identical probe runs (`claude -p "ответь одним словом"`, DocsInside2):
+// ##     as-is                                    34 659 tokens
+// ##     + --strict-mcp-config                    33 458   (−1 201 — MCP is NOT the problem,
+// ##                                                        its tools load lazily by name)
+// ##     + --setting-sources project              22 598   (−12 061, −35%)
+// ##   The 12k is the USER-level harness a build agent never needs: 23 personal skills
+// ##   (brandkit, caveman, logo-design…), 8 global subagents (post-writer, wave-trading-agent…),
+// ##   the global CLAUDE.md and personal hooks. On run 13dc2476 that is 41 sessions × 12k of
+// ##   cache write PLUS 766 turns × 12k of cache read ≈ 13% of the whole run.
+// ## @io (projectDir) -> string[] of extra CLI flags (empty = today's behaviour, byte-identical)
+// ## @invariants
+// ## - NEVER trims a project that isn't prepared. `--setting-sources project` also hides the
+// ##   USER-level copies of the pipeline's own skill, its gfd-* agents AND the /grace-feature-dev
+// ##   COMMAND, so the flags are added only when the project carries all three of its own —
+// ##   otherwise the run would start without the very thing it is invoked with.
+// ## - The COMMAND check is not decoration: measured on the dev box 08.08 with a probe command,
+// ##   `claude -p "/probe-cmd" --setting-sources project` answers «Unknown command: /probe-cmd»
+// ##   while the same call without the flag answers the command body. A project trimmed without
+// ##   its own commands/ would get the dispatch prompt's first line as PLAIN TEXT — the B6 bug,
+// ##   just caused by us instead of by a missing install. See scripts/prepare-project.sh.
+// ## - GRACE_LEAN=0 turns it off wholesale — one env var to roll back without a code change.
+// ## - Probe existence per spawn, not once at boot: a project can be prepared mid-session.
+// ## @rationale Q: inject the agents with --agents JSON instead, so no project prep is needed?
+// ##   A: five agent bodies on the command line is unreadable in logs and in `ps`; the file
+// ##   check degrades safely and costs one stat() per spawn.
+// GREP_SUMMARY: lean context, start context, setting-sources, strict-mcp-config, harness trim
+const LEAN = process.env.GRACE_LEAN !== "0";
+function leanFlags(projectDir) {
+  if (!LEAN) return [];
+  const has = (...p) => fs.existsSync(path.join(projectDir, ".claude", ...p));
+  const prepared = has("skills", "grace-feature-dev") && has("agents", "gfd-coder.md") && has("commands", `${GRACE_COMMAND}.md`);
+  return prepared ? ["--setting-sources", "project", "--strict-mcp-config"] : [];
+}
+// endregion FUNC_leanContext
+
+// region FUNC_runModel — which model the MAIN thread of a run gets (B3′)
+// ## @purpose The board spawned every run without `--model`, i.e. on the account default (Opus).
+// ##   The main thread is not an architect here — it is the implementer (measured over the
+// ##   health-intelligence batch: 1 201 file edits, 1 678 Bash calls, 52 delegations), and it
+// ##   accounted for $963 of $1 026. The model must therefore be a SETTING of the run, not an
+// ##   accident of the account.
+// ## @io (card|plan) -> string|null · null means «pass no --model», i.e. today's behaviour
+// ## @invariants
+// ## - Nothing configured ⇒ null ⇒ byte-identical to the pre-B3′ command line.
+// ## - Per-run override wins over the global env: a heavy domain stage can stay on Opus while
+// ##   screens/configs/tails ride Sonnet (the escape hatch the plan explicitly asks for).
+// ## - Plan-level `model` is stamped onto every stage card at assembly (see POST /api/plans),
+// ##   so the prompt builders need only the card.
+// GREP_SUMMARY: model, --model, GRACE_CLAUDE_MODEL, sonnet, opus, main thread cost
+const CLAUDE_MODEL_DEFAULT = (process.env.GRACE_CLAUDE_MODEL || "").trim() || null;
+const modelFor = (owner) => (owner && typeof owner.model === "string" && owner.model.trim()) || CLAUDE_MODEL_DEFAULT;
+// endregion FUNC_runModel
+
+// region FUNC_buildMode — how the pipeline's build loop executes its cards (B7)
+// ## @purpose The dispatch prompt hard-coded nothing about `--mode`, so the agent guessed —
+// ##   over the whole batch it guessed `inline` every single time (0 gfd-coder spawns against
+// ##   45 gfd-reviewer spawns), which is why the main thread wrote all the code itself.
+// ## @invariants
+// ## - Default stays `inline`: the pre-B7 behaviour, chosen by the command's own default.
+// ## - hybrid/fanout hand cards to gfd-coder, but ALL of them share ONE working tree (the board
+// ##   spawns every run in the same projectDir), and a concurrent checkout was already observed
+// ##   flipping that tree to `main` mid-run. So a non-inline mode ships with a hard prompt
+// ##   constraint: one coder at a time, never switch the working tree's branch.
+const BUILD_MODES = ["inline", "hybrid", "fanout"];
+const BUILD_MODE_DEFAULT = BUILD_MODES.includes((process.env.GRACE_BUILD_MODE || "").trim()) ? process.env.GRACE_BUILD_MODE.trim() : "inline";
+// NB: `plan.mode` is the AUTONOMY of a run (ask|auto) and predates this — hence `buildMode`.
+const buildModeFor = (card) => (card && BUILD_MODES.includes(card.buildMode)) ? card.buildMode : BUILD_MODE_DEFAULT;
+function buildModeBlock(card, branch) {
+  const mode = buildModeFor(card);
+  if (mode === "inline") return "";
+  return [
+    `РЕЖИМ СБОРКИ «${mode}»: декомпозированные карточки отдавай субагенту gfd-coder (свежий контекст), сам`,
+    `не пиши их код. ЖЁСТКОЕ ОГРАНИЧЕНИЕ ПАРАЛЛЕЛИЗМА: рабочее дерево проекта ОДНО и общее — спавни`,
+    `СТРОГО ОДНОГО кодера за раз и дожидайся его возврата, прежде чем брать следующую карточку. НИКОГДА не`,
+    `переключай ветку рабочего каталога (никаких "git checkout main"/"switch") — работай только в "${branch}".`,
+    `Кодеру передавай ТОЛЬКО файлы из его card.files[]; пересечение файлов между одновременными карточками`,
+    `запрещено (инвариант §2.2 скилла).`,
+  ].join("\n");
+}
+// endregion FUNC_buildMode
+
 // region FUNC_spawnRun — detached headless Claude run (dir-scoped, logged)
-function spawnRun(projectDir, runDir, prompt, logName) {
+function spawnRun(projectDir, runDir, prompt, logName, opts) {
   if (!AUTORUN) return { launched: false, reason: "GRACE_AUTORUN=0" };
   if (!fs.existsSync(CLAUDE_BIN)) return { launched: false, error: "claude bin not found: " + CLAUDE_BIN };
   try {
@@ -1525,14 +1910,46 @@ function spawnRun(projectDir, runDir, prompt, logName) {
     let from = 0; try { from = fs.statSync(path.join(runDir, logName)).size; } catch {}
     const out = fs.openSync(path.join(runDir, logName), "a");
     const env = { ...process.env, PATH: `${BIN_PATH_HINT}:${process.env.PATH || ""}` };
-    const args = ["-p", prompt, "--permission-mode", "bypassPermissions", "--add-dir", projectDir];
+    const lean = leanFlags(projectDir);
+    const model = (opts && opts.model) || null;      // B3′: null ⇒ no --model ⇒ account default
+    const args = ["-p", prompt, "--permission-mode", "bypassPermissions", "--add-dir", projectDir,
+      ...(model ? ["--model", model] : []), ...lean];
     const child = spawn(CLAUDE_BIN, args, { cwd: projectDir, env, detached: true, stdio: ["ignore", out, out] });
     child.unref();
-    return { launched: true, pid: child.pid, log: path.join(runDir, logName), from };
+    return { launched: true, pid: child.pid, log: path.join(runDir, logName), from, lean: lean.length > 0, model };
   } catch (e) {
     return { launched: false, error: String(e.message || e) };
   }
 }
+// region FUNC_graceCommand — the first line of every dispatch prompt (B6 + B7)
+// ## @purpose Two separate defects lived in this one line.
+// ##   B7: the board wrote only the feature text, so `--rigor` and `--mode` were GUESSED by the
+// ##   agent — over the whole batch it guessed mode=inline every time (0 gfd-coder spawns).
+// ##   B6: `/grace-feature-dev` never reached the COMMAND at all. A SKILL of the same name wins
+// ##   the `/name` resolution — verified on the box with a deliberate collision probe
+// ##   (command says FROM-COMMAND, skill says FROM-SKILL → the answer was FROM-SKILL). So the
+// ##   agent was handed the format spec and never the orchestration control flow. Hence a
+// ##   distinct name, `/grace-run`, which nothing shadows.
+// ## @invariants
+// ## - An UNKNOWN slash command kills the whole run: `claude -p "/nope тема …"` answers
+// ##   «Unknown command: /nope» and never reads the rest of the prompt (measured). So the name
+// ##   is emitted ONLY when the file actually exists where this run will look for it, and the
+// ##   fallback is the old line — degradation to «команда резолвится в скилл», never a dead run.
+// ## - Under lean flags the run sees ONLY the project's commands (`--setting-sources project`),
+// ##   so the probe looks in the project first and at user level only for a non-lean run.
+// GREP_SUMMARY: grace-run, slash command, command vs skill collision, unknown command, rigor, mode
+const GRACE_COMMAND = (process.env.GRACE_COMMAND_NAME || "grace-run").trim();
+function commandInstalled(projectDir) {
+  const inProject = fs.existsSync(path.join(projectDir, ".claude", "commands", `${GRACE_COMMAND}.md`));
+  if (leanFlags(projectDir).length) return inProject;                 // lean: user level is invisible
+  return inProject || fs.existsSync(path.join(os.homedir(), ".claude", "commands", `${GRACE_COMMAND}.md`));
+}
+function graceCommand(card, rigor, projectDir) {
+  const r = rigor === "grace" ? "grace" : "off";
+  const name = commandInstalled(projectDir) ? GRACE_COMMAND : "grace-feature-dev";
+  return `/${name} ${featureLine(card)} --rigor ${r} --mode ${buildModeFor(card)}`;
+}
+// endregion FUNC_graceCommand
 
 // Asking · block 1 (FUNCTIONAL) — ask up to 8 questions about WHAT to build, then stop.
 // ## @purpose Block 1 ALSO classifies the architecture gate, so a card with nothing to ask
@@ -1550,14 +1967,14 @@ function spawnRun(projectDir, runDir, prompt, logName) {
 // ##   mid-flight, whose runDir board.json predates this prompt).
 // ## @rationale Q: why not delete block 2 outright? A: the human-answered path genuinely needs a
 // ##   second session — its input (the answers) does not exist when block 1 runs.
-function launchAskFunctional(card, projectDir, runDir) {
+function launchAskFunctional(card, projectDir, runDir, rigor) {
   const reqs = compiledRequirements(card);
   const dirs = directivesBlock(card);
   const auto = autonomyBlock(card);
   const planDec = planDecisionsBlock(card);
   const brief = briefBlock(card);
   const prompt = [
-    `/grace-feature-dev ${featureLine(card)}`, ``,
+    graceCommand(card, rigor, projectDir), ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
     brief ? `${brief}\n` : ``,
     dirs ? `${dirs}\n` : ``,
@@ -1596,8 +2013,68 @@ function launchAskFunctional(card, projectDir, runDir) {
     `  САМ, НЕ строй его здесь.`,
     `Твой board.json: ${path.join(runDir, "board.json")}.`,
   ].join("\n");
-  return spawnRun(projectDir, runDir, prompt, "ask-functional.log");
+  return spawnRun(projectDir, runDir, prompt, "ask-functional.log", { model: modelFor(card) });
 }
+
+// region FUNC_askBuildMerged — one session for the whole card when nobody is waiting (B2)
+// ## @purpose With autonomy=auto the asking stage asks NOBODY: over the batch it cost 31 extra
+// ##   sessions × ~$4 = $114 to answer «нечего спрашивать» and exit, after which a SECOND process
+// ##   re-warmed ~44k of start context to read the same brief and start building. The gate is not
+// ##   removed — it MOVES inside the build session, which is what the comment above already
+// ##   promised («asking→build in ONE session») but the dispatcher never delivered.
+// ## @io (card, projectDir, runDir, rigor) -> spawnRun result · sets nothing on the card itself
+// ## @invariants
+// ## - autonomy=ask is untouched: there the ask stage genuinely waits for a human.
+// ## - The classification still happens FIRST and is still written to board.json (`answers`,
+// ##   `archDecisions`), so «Результат» and the PR keep showing what was decided without a human.
+// ## - A REAL fork (functional question, or a hard-floor architecture fork) still stops the
+// ##   session — it writes the questions, stays in `asking` and exits. The dispatcher then walks
+// ##   the ordinary two-block path, so nothing is lost, it just isn't paid for by default.
+// ## - The session writes `column:"implementing"` and `askStage:"done"` in ONE board.json write
+// ##   before it starts building, so a tick can never see «done + asking» and launch a duplicate
+// ##   build. The dispatcher additionally holds off while a merged run is alive (syncFromPipeline).
+// GREP_SUMMARY: B2, merged ask build, one session, autonomy auto, askBuildMerged, ask gate inline
+function launchAskBuild(card, projectDir, runDir, rigor) {
+  const reqs = compiledRequirements(card);
+  const dirs = directivesBlock(card);
+  const auto = autonomyBlock(card);
+  const planDec = planDecisionsBlock(card);
+  const brief = briefBlock(card);
+  const prompt = [
+    graceCommand(card, rigor, projectDir), ``,
+    reqs ? `Контекст задачи:\n${reqs}\n` : ``,
+    brief ? `${brief}\n` : ``,
+    dirs ? `${dirs}\n` : ``,
+    auto ? `${auto}\n` : ``,
+    planDec ? `${planDec}\n` : ``,
+    `AUTONOMOUS HEADLESS — ОДНА СЕССИЯ НА ВСЮ КАРТОЧКУ (autonomy=auto: человека, который ждал бы ответов,`,
+    `здесь нет). Сначала гейты, потом сразу сборка — БЕЗ второго процесса.`,
+    ``,
+    `ШАГ 1. Discovery + краткая разведка, классифицируй ОБА гейта (функционал и архитектура).`,
+    `ПОРОГ ЭСКАЛАЦИИ — человека беспокоим ТОЛЬКО если решение: (а) меняет ПОВЕДЕНИЕ продукта или объём,`,
+    `ЛИБО (б) это настоящая развилка с внешними последствиями (стоимость, vendor lock-in, юридика/комплаенс/`,
+    `резидентность/провайдер, необратимость, форма модели данных, влияющая на контракт), ЛИБО (в) по нему`,
+    `реально может быть мнение у НЕ-разработчика. «Как» (расположение кода, имена, паттерн, структура файлов,`,
+    `глубина тестов, формат логов) — НЕ развилка: решай САМ и записывай решение с обоснованием.`,
+    ``,
+    `ШАГ 2 — РАЗВИЛКА ИСПОЛНЕНИЯ, выбери РОВНО ОДИН исход:`,
+    `• ЕСТЬ что спросить человека (функциональный вопрос ЛИБО развилка из ЖЁСТКОГО ПОЛА) → запиши top-level`,
+    `  "questions" (3–8 строк) и/или "archQuestions" (элемент { "id","q","options":[{ "id","title","desc",`,
+    `  "pros":[],"cons":[],"recommended":true|false }] }, ровно один вариант recommended; развилку из пола`,
+    `  помечай "floor":true), выставь "column":"asking" и соответствующий "askStage", перезапиши board.json`,
+    `  и ВЫЙДИ. Код НЕ пиши — дальше решает человек.`,
+    `• СПРАШИВАТЬ НЕЧЕГО (типичный случай для core/infra-этапов — норма 0 вопросов) → ОДНОЙ записью в`,
+    `  board.json зафиксируй: "answers":[{"q":"…","a":"… + обоснование"}] (принятые тобой решения),`,
+    `  "questions":[], "archQuestions":[], "archDecisions":[{"q":"…","chosenTitle":"…","ownText":"<обоснование>"}]`,
+    `  (пустой массив = «выбирать было нечего»), "askStage":"done" И СРАЗУ "column":"implementing" —`,
+    `  ИМЕННО ОДНИМ записыванием файла, не двумя. После этого ПРОДОЛЖАЙ В ЭТОЙ ЖЕ СЕССИИ и выполни`,
+    `  полный build по правилам ниже. НЕ выходи после гейта: второй процесс на эту карточку не придёт.`,
+    ``,
+    ...buildDirectives(card, runDir, rigor),
+  ].join("\n");
+  return spawnRun(projectDir, runDir, prompt, "ask-build.log", { model: modelFor(card) });
+}
+// endregion FUNC_askBuildMerged
 
 // Asking · block 2 (ARCHITECTURE) — launched after functional answers. EITHER propose
 // architecture DECISIONS (variant options with pros/cons) and stop, OR (if none are
@@ -1610,7 +2087,7 @@ function launchAskArchitecture(card, projectDir, runDir, funcQA, rigor) {
   const planDec = planDecisionsBlock(card);
   const brief = briefBlock(card);
   const prompt = [
-    `/grace-feature-dev ${featureLine(card)}`, ``,
+    graceCommand(card, rigor, projectDir), ``,
     reqs ? `Контекст задачи:\n${reqs}\n` : ``,
     brief ? `${brief}\n` : ``,
     `Ответы по функционалу (блок 1):\n${qa}\n`,
@@ -1635,37 +2112,25 @@ function launchAskArchitecture(card, projectDir, runDir, funcQA, rigor) {
     `  перезапиши board.json и ВЫЙДИ. Полный build до "ready" диспетчер запустит САМ — НЕ строй его здесь.`,
     `Твой board.json: ${path.join(runDir, "board.json")}.`,
   ].join("\n");
-  return spawnRun(projectDir, runDir, prompt, "ask-architecture.log");
+  return spawnRun(projectDir, runDir, prompt, "ask-architecture.log", { model: modelFor(card) });
 }
 
-// BUILD — launched after the architecture decisions are chosen. Architect honors them.
-function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, recovery) {
-  const fq = (funcQA || []).map((p) => `Q: ${p.q}\nA: ${p.a || "(нет ответа)"}`).join("\n");
-  const ad = (archDecisions || []).map((d) => `• ${d.q}\n  → ВЫБРАНО: ${d.chosenTitle || d.choice}${d.ownText ? " — " + d.ownText : ""}`).join("\n");
+// The build half of the dispatch prompt — the rules a run must follow from `implementing` to
+// `ready`. Extracted so the merged ask+build session (B2) issues EXACTLY the same instructions
+// as the two-session path: one prompt body, two entry points, no drift between them.
+function buildDirectives(card, runDir, rigor) {
   const rigorLine = `Rigor: ${rigor || "off"}. Apply markup per grace-feature-dev SKILL §3 — grace = full semantic exoskeleton (MODULE/FUNCTION_CONTRACT) + LDD [IMP:N] logs; off = the repo's own idiom, no GRACE markers.`;
-  const reqs = compiledRequirements(card);
-  const dirs = directivesBlock(card);
-  const auto = autonomyBlock(card);
-  const planDec = planDecisionsBlock(card);
-  const brief = briefBlock(card);
   // S4: a plan stage commits to the plan's SHARED integration branch (base = its tip → sees
   // predecessors' commits, §4); a single card keeps its own autodev/<slug>. branchFor() is the
   // single source of the branch name across green-checkpoints, the final push, and resume.
   const branch = branchFor(card);
+  const modeBlock = buildModeBlock(card, branch);
   const baseLine = card.integrationBranch
     ? `ЭТАП ПРОГОНА: работай в ОБЩЕЙ интеграционной ветке "${branch}" (одна на весь прогон). Если её нет — создай от свежего main; иначе checkout и продолжай С ЕЁ TIP — ты ВИДИШЬ коммиты предыдущих этапов (§4). НЕ ответвляй заново от main на каждом этапе.`
     : `работай в выделенной ветке "${branch}" — ответви её от свежего main в начале.`;
-  const prompt = [
-    `/grace-feature-dev ${featureLine(card)}`, ``,
-    reqs ? `Контекст задачи:\n${reqs}\n` : ``,
-    brief ? `${brief}\n` : ``,
-    fq ? `Ответы по функционалу:\n${fq}\n` : ``,
-    ad ? `Принятые архитектурные решения (человек выбрал — СОБЛЮДАЙ их):\n${ad}\n` : ``,
-    dirs ? `${dirs}\n` : ``,
-    auto ? `${auto}\n` : ``,
-    planDec ? `${planDec}\n` : ``,
+  return [
     rigorLine,
-    recovery ? `${recovery}\n` : ``,
+    modeBlock ? `${modeBlock}\n` : ``,
     `AUTONOMOUS HEADLESS BUILD. Resume from board.json. Запусти полный процесс: architecture (СОБЛЮДАЯ выбранные`,
     `решения выше; недостающие детали выбирает архитектор и обосновывает) → decompose → implement → verify → review.`,
     `BOARD SYNC IS MANDATORY AND HAPPENS AT THE *START* OF EACH PHASE, NOT THE END — the kanban mirrors`,
@@ -1715,8 +2180,31 @@ function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, rec
     `вынесено"}. Эти пункты доска автоматически заведёт карточками в backlog. Продублируй их разделом "Отложенное:"`,
     `в "finishNote" (или "Отложенное: нет", если deferred пуст). Не прячь отложенное внутри TODO в коде done-карточки.`,
     `Твой board.json: ${path.join(runDir, "board.json")}.`,
+  ];
+}
+
+// BUILD — launched after the architecture decisions are chosen. Architect honors them.
+function launchBuild(card, projectDir, runDir, funcQA, archDecisions, rigor, recovery) {
+  const fq = (funcQA || []).map((p) => `Q: ${p.q}\nA: ${p.a || "(нет ответа)"}`).join("\n");
+  const ad = (archDecisions || []).map((d) => `• ${d.q}\n  → ВЫБРАНО: ${d.chosenTitle || d.choice}${d.ownText ? " — " + d.ownText : ""}`).join("\n");
+  const reqs = compiledRequirements(card);
+  const dirs = directivesBlock(card);
+  const auto = autonomyBlock(card);
+  const planDec = planDecisionsBlock(card);
+  const brief = briefBlock(card);
+  const prompt = [
+    graceCommand(card, rigor, projectDir), ``,
+    reqs ? `Контекст задачи:\n${reqs}\n` : ``,
+    brief ? `${brief}\n` : ``,
+    fq ? `Ответы по функционалу:\n${fq}\n` : ``,
+    ad ? `Принятые архитектурные решения (человек выбрал — СОБЛЮДАЙ их):\n${ad}\n` : ``,
+    dirs ? `${dirs}\n` : ``,
+    auto ? `${auto}\n` : ``,
+    planDec ? `${planDec}\n` : ``,
+    recovery ? `${recovery}\n` : ``,
+    ...buildDirectives(card, runDir, rigor),
   ].join("\n");
-  return spawnRun(projectDir, runDir, prompt, "build.log");
+  return spawnRun(projectDir, runDir, prompt, "build.log", { model: modelFor(card) });
 }
 // endregion FUNC_spawnRun
 
@@ -2112,9 +2600,15 @@ function resumeRun(card, projectDir, runDir, rigor, recovery) {
     target = "asking"; kind = "ask-architecture";
     launch = launchAskArchitecture(card, projectDir, runDir, answers, rigor);
     card.autoArchLaunched = true; card.buildLaunched = false;
+  } else if (card.askBuildMerged) {
+    // B2: a merged card resumes as merged — otherwise a crash before the gate would silently
+    // demote the card back to the two-session path it was dispatched to avoid.
+    target = "asking"; kind = "ask-build";
+    launch = launchAskBuild(card, projectDir, runDir, rigor);
+    card.autoArchLaunched = false; card.buildLaunched = false;
   } else {
     target = "asking"; kind = "ask-functional";
-    launch = launchAskFunctional(card, projectDir, runDir);
+    launch = launchAskFunctional(card, projectDir, runDir, rigor);
     card.autoArchLaunched = false; card.buildLaunched = false;
   }
   try {
@@ -2227,7 +2721,11 @@ function syncFromPipeline() {
     //   "run to ready") so a no-fork stage finishes instead of dying as a stub.
     //   Each transition fires at most once per card (idempotent via the *Launched
     //   flags), so the watchdog below ends up guarding the NEW build pid, not a dead ask.
-    if (pip && card.column === "asking" && !card.buildLaunched) {
+    // B2: while a MERGED session (autonomy=auto) is alive it owns the whole card — it classifies
+    // the gates and then builds in the SAME process. Launching anything here would be a second
+    // build against the same working tree. If it dies, the guard falls away and the ordinary
+    // recovery below/here takes over from the furthest recorded point.
+    if (pip && card.column === "asking" && !card.buildLaunched && !(card.askBuildMerged && isAlive(card.runPid))) {
       const rigor = pip.rigor || (card.rigor && card.rigor !== "auto" ? card.rigor : "off");
       const archEmpty = !Array.isArray(pip.archQuestions) || pip.archQuestions.length === 0;
       if (pip.askStage === "done" && archEmpty) {
@@ -2384,7 +2882,11 @@ function syncFromPipeline() {
           || (quotaOpen(board, now) ? { until: board.quota.until, exact: board.quota.exact, raw: board.quota.raw } : null);
         if (stop) { pauseForQuota(board, card, stop, "вопросы не записаны"); changed = true; continue; }
       }
-      if (cooldownOk && (crashed || sinceMove > ASK_STALL_MS)) {
+      // B2: a MERGED ask+build session stays in `asking` until it writes `implementing` itself —
+      // it is working, not waiting on a human, so «стоит в asking > 30 мин» is not a stall for it
+      // while its process is alive. Death still reaches the warden through `crashed` above.
+      const mergedAlive = card.askBuildMerged && isAlive(card.runPid);
+      if (cooldownOk && (crashed || (sinceMove > ASK_STALL_MS && !mergedAlive))) {
         if (fireWardenEvent(board, card, {
           kind: crashed ? "crash-before-write" : "asking-stalled",
           hint: crashed ? "crash-before-write" : "needs-human",
@@ -2418,6 +2920,9 @@ function syncFromPipeline() {
   // S5 §5.2: the closing phase runs itself once every stage of a plan is `ready`. Last, so it
   // sees the transitions this pass produced (the final stage reaching `ready` closes the run).
   if (planCloseTick(board)) changed = true;
+  // A5: последним — счёт денег и времени по закрытым прогонам. Ничего не запускает и не мержит,
+  // только читает транскрипты в отдельном процессе, поэтому стоит после всех переходов.
+  if (planMetricsTick(board)) changed = true;
   if (changed) writeBoard(board);
   flushWardenQueue();   // strictly after the write — see the note on WARDEN_QUEUE
 }
@@ -2618,9 +3123,15 @@ async function handleApi(req, res, urlPath) {
       merge: [wanted.merge, cfgPol.merge, DEPLOY_POLICY_DEFAULT.merge].find((v) => MERGE_MODES.includes(v)),
       deploy: [wanted.deploy, cfgPol.deploy, DEPLOY_POLICY_DEFAULT.deploy].find((v) => DEPLOY_MODES.includes(v)),
     };
+    // B3′/B7: a run may pin the main thread's model and the build mode. Unset = the board's env
+    // default (GRACE_CLAUDE_MODEL / GRACE_BUILD_MODE), which is what makes «тяжёлые доменные
+    // карточки на Opus, экраны на Sonnet» a per-run switch instead of a code change.
+    const planModel = typeof b.model === "string" && b.model.trim() ? b.model.trim() : null;
+    const planBuildMode = BUILD_MODES.includes(b.buildMode) ? b.buildMode : null;
     const plan = {
       id, project, goal: String(b.goal || "").trim().slice(0, MAX_DESC) || null,
       integrationBranch, mode, cardIds: ids, status: "running", policy,
+      model: planModel, buildMode: planBuildMode,
       decisions, createdAt: new Date().toISOString(), result: null,
     };
     board.plans.push(plan);
@@ -2631,6 +3142,10 @@ async function handleApi(req, res, urlPath) {
       card.planId = id;
       card.integrationBranch = integrationBranch;
       card.autonomy = mode;
+      // The stage keeps its OWN pin if it has one (a heavy stage on Opus inside a Sonnet run);
+      // otherwise it inherits the run's, so the prompt builders only ever look at the card.
+      if (!card.model && planModel) card.model = planModel;
+      if (!card.buildMode && planBuildMode) card.buildMode = planBuildMode;
       card.planDecisions = decisions; // S5: plan-level gate answers ride the stage seed
       card.dependsOn = Array.isArray(s.dependsOn) ? s.dependsOn.filter((x) => idset.has(x) && x !== s.cardId) : [];
       card.column = "todo";
@@ -2677,6 +3192,9 @@ async function handleApi(req, res, urlPath) {
       dependsOn: Array.isArray(b.dependsOn) ? b.dependsOn.filter((x) => typeof x === "string") : [],
       files: Array.isArray(b.files) ? b.files.filter((x) => typeof x === "string") : [],
       autonomy: AUTONOMIES.includes(b.autonomy) ? b.autonomy : null,   // S3: null = inherit the global default (§5.3)
+      // B3′/B7: per-card pins. null = inherit the run's, then the board's env default.
+      model: (typeof b.model === "string" && b.model.trim()) ? b.model.trim() : null,
+      buildMode: BUILD_MODES.includes(b.buildMode) ? b.buildMode : null,
       // S3 · statement of work (§4.1). Defaults = today's card: origin "human" → no checks.
       outOfScope: null, acceptance: [], contract: null, sources: [], origin: "human", draft: false,
       ...normalizeBrief(b),
@@ -2981,6 +3499,8 @@ async function handleApi(req, res, urlPath) {
     if (b.designLink !== undefined) card.designLink = String(b.designLink).trim() || null;
     if (b.requirementsLink !== undefined) card.requirementsLink = String(b.requirementsLink).trim() || null;
     if (b.rigor !== undefined && RIGORS.includes(b.rigor)) card.rigor = b.rigor;
+    if (b.model !== undefined) card.model = (typeof b.model === "string" && b.model.trim()) ? b.model.trim() : null;
+    if (b.buildMode !== undefined) card.buildMode = BUILD_MODES.includes(b.buildMode) ? b.buildMode : null;
     if (b.autonomy !== undefined) card.autonomy = AUTONOMIES.includes(b.autonomy) ? b.autonomy : null; // null = inherit global (§5.3)
     if (Array.isArray(b.files)) card.files = b.files.filter((x) => typeof x === "string");
     Object.assign(card, normalizeBrief(b, card));   // S3 §4.1 — incl. clearing the draft flag
