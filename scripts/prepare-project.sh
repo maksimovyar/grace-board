@@ -14,13 +14,21 @@
 # лежат все три вещи: skills/grace-feature-dev, agents/gfd-coder.md и commands/<команда>.md.
 # Этот скрипт кладёт их все разом — не клади их по частям руками.
 #
+# ОТКУДА БЕРУТСЯ СКИЛЛ И АГЕНТЫ. По умолчанию — из этого репозитория (он источник правды).
+# Но если машина живёт на своём снимке пайплайна (например, на боксе ~/.claude-libs/grace
+# старше репозитория), подготовка проекта НЕ должна заодно подменить контракт verify/review
+# посреди партии: укажи GRACE_LIB_SRC и получишь ровно то же, что видят нетощие раны.
+# Команда всегда берётся из репозитория — в снимках её нет по определению (B6).
+#
 # Использование:
 #   ./scripts/prepare-project.sh ~/Projects/health-intelligence
 #   GRACE_COMMAND_NAME=grace-run ./scripts/prepare-project.sh <dir>     # имя команды доски
+#   GRACE_LIB_SRC=~/.claude-libs/grace ./scripts/prepare-project.sh <dir>
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$REPO/.claude"
+LIB="${GRACE_LIB_SRC:-$SRC}"
 CMD="${GRACE_COMMAND_NAME:-grace-run}"
 DST="${1:?укажи каталог проекта}"
 DST="$(cd "$DST" && pwd)"
@@ -34,10 +42,11 @@ link() {  # символическая ссылка на копию из реп�
 }
 
 echo "Готовлю проект: $DST"
-link "$SRC/commands/$CMD.md"             "$DST/.claude/commands/$CMD.md"
+echo "  команда из: $SRC/commands · скилл и агенты из: $LIB"
+link "$SRC/commands/$CMD.md"              "$DST/.claude/commands/$CMD.md"
 link "$SRC/commands/grace-feature-dev.md" "$DST/.claude/commands/grace-feature-dev.md"
-link "$SRC/skills/grace-feature-dev"     "$DST/.claude/skills/grace-feature-dev"
-for a in "$SRC"/agents/gfd-*.md; do link "$a" "$DST/.claude/agents/$(basename "$a")"; done
+link "$LIB/skills/grace-feature-dev"      "$DST/.claude/skills/grace-feature-dev"
+for a in "$LIB"/agents/gfd-*.md; do link "$a" "$DST/.claude/agents/$(basename "$a")"; done
 
 # .claude/ проекта — служебная оснастка контура, а не код продукта: она не должна попасть
 # в коммит агента (он коммитит строго по card.files[], но исключение дешевле надежды).
