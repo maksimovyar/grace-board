@@ -832,9 +832,13 @@ function branchInMain(projectDir, branch) {
   }
   if (e.at && now - e.at < ANCESTRY_TTL_MS) return e.state;
   try { fs.mkdirSync(ANCESTRY_DIR, { recursive: true }); } catch {}
-  const sh = `git fetch -q origin 2>/dev/null; for r in ${shq("origin/" + branch)} ${shq(branch)}; do `
+  // NB: никакого `exit` внутри — spawnStep дописывает в конец `echo "__EXIT__:$?"`, и выход из
+  // оболочки посреди строки съедает этот маркер. Тогда readStep вечно возвращает null, состояние
+  // навсегда остаётся "unknown", а "unknown" — это «ждать»: гейт держал бы КАЖДЫЙ прогон намертво.
+  // Поймано на живом сценарии A2 (проба вернула IN-MAIN, а карточка не стартовала).
+  const sh = `git fetch -q origin 2>/dev/null; ans=NO-REF; for r in ${shq("origin/" + branch)} ${shq(branch)}; do `
     + `if git rev-parse --verify -q "$r" >/dev/null 2>&1; then `
-    + `git merge-base --is-ancestor "$r" origin/main && echo IN-MAIN || echo NOT-IN-MAIN; exit 0; fi; done; echo NO-REF`;
+    + `if git merge-base --is-ancestor "$r" origin/main; then ans=IN-MAIN; else ans=NOT-IN-MAIN; fi; break; fi; done; echo "$ans"`;
   const st = spawnStep(projectDir, sh, file);
   ancestryCache.set(key, { state: e.state || "unknown", at: e.at || 0, probing: !!st.started, startedAt: now });
   return e.state || "unknown";
