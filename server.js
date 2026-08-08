@@ -121,9 +121,15 @@ function readBoard() {
     return b;
   } catch { return { updatedAt: null, cards: [] }; }
 }
+// Atomic: write a sibling temp file, then rename over the target. board.json is ~200 KB and is
+// read by OTHER processes (the metrics child, gb.mjs, a human with jq) — a plain writeFileSync
+// let one of them see a half-written file, which is exactly how the first metrics run died
+// («Unterminated string in JSON at position 193101»). rename(2) inside one directory is atomic.
 function writeBoard(board) {
   board.updatedAt = new Date().toISOString();
-  fs.writeFileSync(BOARD_FILE, JSON.stringify(board, null, 2));
+  const tmp = BOARD_FILE + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(board, null, 2));
+  fs.renameSync(tmp, BOARD_FILE);
 }
 // Unicode-aware slug (keeps Cyrillic etc.); falls back to a short id when empty.
 function slugify(s, fallback) {
@@ -1378,14 +1384,16 @@ const METRICS_SCRIPT = path.join(__dirname, "lib", "plan-metrics.js");
 const NODE_BIN = process.execPath;
 function planMetricsTick(board) {
   let changed = false;
-  for (const plan of (board.plans || [])) {
+  let spawned = 0;                 // ≤1 разбор транскриптов за тик: 13 закрытых прогонов разом
+  for (const plan of (board.plans || [])) {   // подняли бы 13 процессов по сотне мегабайт каждый
     if (!METRICS_STEPS.has(plan.closeStep || "")) continue;
     if (plan.result && plan.result.metrics) continue;
     if (!(plan.cardIds || []).length) continue;
     const dir = planDir(plan), outFile = path.join(dir, "metrics.json");
     const run = plan.metricsRun || null;
     if (!run) {
-      if (!fs.existsSync(METRICS_SCRIPT)) continue;
+      if (!fs.existsSync(METRICS_SCRIPT) || spawned) continue;
+      spawned++;
       try { fs.mkdirSync(dir, { recursive: true }); } catch {}
       const cmd = `${shq(NODE_BIN)} ${shq(METRICS_SCRIPT)} --plan ${shq(plan.id)} --board ${shq(BOARD_FILE)} `
         + `--dispatch ${shq(DISPATCH_LOG)} --projects-root ${shq(PROJECTS_ROOT_ABS)} --out ${shq(outFile)}`;
