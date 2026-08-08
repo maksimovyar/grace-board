@@ -1406,8 +1406,18 @@ function planMetricsTick(board) {
     const run = plan.metricsRun || null;
     if (!run) {
       if (!fs.existsSync(METRICS_SCRIPT) || spawned) continue;
+      if ((plan.metricsAttempts || 0) >= 2) {          // две попытки — потолок, дальше честная запись
+        plan.result = plan.result || {};
+        plan.result.metrics = { error: "не удалось посчитать метрики прогона за две попытки",
+          output: (plan.metricsLastOutput || "").slice(-400), computedAt: new Date().toISOString() };
+        logPlan(plan, "plan-metrics-failed", {});
+        changed = true;
+        continue;
+      }
+      plan.metricsAttempts = (plan.metricsAttempts || 0) + 1;
       spawned++;
       try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+      try { fs.unlinkSync(outFile); } catch {}   // иначе повтор прочитал бы старый файл как свой результат
       const cmd = `${shq(NODE_BIN)} ${shq(METRICS_SCRIPT)} --plan ${shq(plan.id)} --board ${shq(BOARD_FILE)} `
         + `--dispatch ${shq(DISPATCH_LOG)} --projects-root ${shq(PROJECTS_ROOT_ABS)} --out ${shq(outFile)}`;
       const st = spawnStep(__dirname, cmd, path.join(dir, "metrics.out"));
@@ -1427,17 +1437,11 @@ function planMetricsTick(board) {
       changed = true;
       continue;
     }
-    if ((run.attempts || 1) < 2) {
-      plan.metricsRun = { ...run, attempts: (run.attempts || 1) + 1, startedAt: null, started: false };
-      // следующая итерация сочтёт `!run.started` истёкшей и пересоберёт шаг
-      plan.metricsRun.startedAt = new Date(0).toISOString();
-      changed = true;
-      continue;
-    }
-    plan.result = plan.result || {};
-    plan.result.metrics = { error: "не удалось посчитать метрики прогона",
-      output: r ? String(r.text).slice(-400) : "процесс метрик не отчитался", computedAt: new Date().toISOString() };
-    logPlan(plan, "plan-metrics-failed", {});
+    // Не отчитался или отдал мусор — обнуляем ран, и следующий тик ПЕРЕЗАПУСТИТ счёт (пока
+    // не исчерпан потолок попыток выше). Раньше здесь стояла «попытка», которая ничего не
+    // перезапускала: план просто уходил в ошибку тиком позже.
+    plan.metricsLastOutput = r ? String(r.text) : "процесс метрик не отчитался";
+    plan.metricsRun = null;
     changed = true;
   }
   return changed;
