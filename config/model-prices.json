@@ -1,0 +1,21 @@
+{
+  "_": "Прайс за 1M токенов, по API-прайсу (на подписке платится квотой — цифра нужна как мера, а не как счёт). Правится здесь, не в коде: server.js и lib/plan-metrics.js читают этот файл. Переопределить путь — GRACE_PRICES=/path/to.json",
+  "currency": "USD",
+  "perMillion": {
+    "claude-opus-4-8":   { "in": 5,    "out": 25,  "cacheWrite": 6.25, "cacheRead": 0.5  },
+    "claude-opus-4-1":   { "in": 15,   "out": 75,  "cacheWrite": 18.75, "cacheRead": 1.5 },
+    "claude-sonnet-5":   { "in": 3,    "out": 15,  "cacheWrite": 3.75, "cacheRead": 0.30 },
+    "claude-sonnet-4-5": { "in": 3,    "out": 15,  "cacheWrite": 3.75, "cacheRead": 0.30 },
+    "claude-haiku-4-5":  { "in": 1,    "out": 5,   "cacheWrite": 1.25, "cacheRead": 0.10 }
+  },
+  "_match": "Подстрока в id модели → ключ прайса. Проверяется сверху вниз, если точного совпадения нет.",
+  "match": [
+    ["opus-4-8", "claude-opus-4-8"],
+    ["opus-4-1", "claude-opus-4-1"],
+    ["opus", "claude-opus-4-8"],
+    ["sonnet-4-5", "claude-sonnet-4-5"],
+    ["sonnet", "claude-sonnet-5"],
+    ["haiku", "claude-haiku-4-5"]
+  ],
+  "default": "claude-sonnet-5"
+}
