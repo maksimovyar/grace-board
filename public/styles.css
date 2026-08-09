@@ -575,11 +575,14 @@ button.tag--auto:hover{border-color:var(--ink-soft)}
 .close__state--verifying{color:#6a3fc0;background:rgba(139,83,224,.10)}
 .close__state--done{color:#1f7a42;background:rgba(46,158,80,.10)}
 .close__state--failed{color:#a8362e;background:rgba(211,63,53,.10)}
+.close__state--broken{color:#8a5e08;background:rgba(214,158,20,.14)}
 .close__step{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
 .close__chip{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
   border:1px solid var(--line);border-radius:6px;padding:3px 9px;text-decoration:none}
 .close__chip--ok{color:#1f7a42;border-color:rgba(46,158,80,.4);background:rgba(46,158,80,.07)}
 .close__chip--bad{color:#a8362e;border-color:rgba(211,63,53,.45);background:rgba(211,63,53,.07)}
+.close__chip--act{cursor:pointer;color:#6a3fc0;border-color:rgba(139,83,224,.45);background:rgba(139,83,224,.08)}
+.close__chip--act:hover{background:rgba(139,83,224,.16)}
 .close__note{flex-basis:100%;font-size:12.5px;line-height:1.5;color:var(--ink-soft)}
 .close__note--error{color:#a8362e}
 .close__note--warn{color:#8a5e08}

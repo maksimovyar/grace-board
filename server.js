@@ -1141,12 +1141,12 @@ function preflightPlan(board, project, cardIds) {
 const DEPLOY_POLICY_DEFAULT = { pr: "always", merge: "manual", deploy: "off" };
 const PR_MODES = ["always", "never"], MERGE_MODES = ["manual", "auto"], DEPLOY_MODES = ["off", "after-merge", "ask"];
 const GH_BIN = process.env.GRACE_GH_BIN || "gh";
-const ACCEPT_GRACE_MS = 60 * 1000;   // don't judge the acceptance run dead in its first minute
+const ACCEPT_GRACE_MS = Number(process.env.GRACE_ACCEPT_GRACE_SEC || 60) * 1000;   // don't judge the acceptance run dead in its first minute
 // v4 Ш1: closing steps that must NOT be collapsed into "closed". Two of them say what is still
 // owed by the human (`awaiting-*`), two say HOW the run ended (`pr-ready` = closed, the merge is
-// yours by policy · `merge-failed` = the board promised to merge and could not). Collapsing any
-// of them loses the only difference the human acts on.
-const CLOSE_KEEP_STEPS = new Set(["awaiting-merge", "awaiting-deploy", "pr-ready", "merge-failed"]);
+// yours by policy · `merge-failed` = the board promised to merge and could not), и `acceptance-broken`
+// говорит, что проверок НЕ БЫЛО вовсе. Collapsing any of them loses the only difference the human acts on.
+const CLOSE_KEEP_STEPS = new Set(["awaiting-merge", "awaiting-deploy", "pr-ready", "merge-failed", "acceptance-broken"]);
 
 // Release policy of a run: what was passed at assembly wins, then the project's
 // `deploy_policy`, then the built-in default (§5.1).
@@ -1248,6 +1248,43 @@ function planQuotaHold(board, plan, stop, where, retryStep) {
   try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts, event: "plan-quota-hold", planId: plan.id, step: where, until: stop.until }) + "\n"); } catch {}
 }
 
+// Ш1.2 · финал прогона, приёмку которого доска НЕ СМОГЛА ПРОВЕСТИ. Не `failed`: провален — это
+// вердикт о работе, а вердикта нет. Что человек получает вместо него: сколько раз и как умирал
+// процесс проверок, сколько этапов доехало до ready и что говорит CI на собранном PR. Красный CI
+// — единственный случай, когда прогон всё-таки красный: это факт о коде, а не о нашем процессе.
+function planAcceptanceBroken(board, plan, ci) {
+  const cards = planCards(board, plan);
+  const ready = cards.filter((c) => c.column === TERMINAL).length;
+  const deaths = plan.acceptanceDeaths || [];
+  const why = deaths.length ? deaths[deaths.length - 1].why : "процесс приёмки не отчитался";
+  if (ci) plan.result.ci = { ...ci, checkedAt: new Date().toISOString(), forAcceptance: true };
+  plan.result.acceptanceBroken = { attempts: deaths.length, why, ci: ci ? ci.status : null,
+    ready, stages: cards.length, at: new Date().toISOString() };
+  const url = (plan.result.pr || {}).url;
+  const ciWord = !ci ? "CI не спрашивали (PR не создан)"
+    : ci.status === "green" ? `CI на PR зелёный (проверок: ${ci.checks.length})`
+    : ci.status === "none" ? "проверок CI в репозитории нет"
+    : ci.status === "red" ? `CI на PR КРАСНЫЙ: ${ci.failed.join(", ")}`
+    : ci.status === "pending" ? `CI ещё идёт (${ci.pending.join(", ") || "не завершён"})`
+    : ci.status === "merged" ? "PR уже смержен человеком"
+    : ci.status === "closed" ? "PR закрыт без мержа"
+    : ci.status === "conflict" ? "ветка конфликтует с main"
+    : "статус CI прочитать не удалось";
+  const head = `Приёмка НЕ ПРОВЕДЕНА: ${deaths.length} попыт${deaths.length === 1 ? "ка" : "ки"} — ${why}. `
+    + `Это отказ процесса проверок, а не вердикт о коде. Этапов в ready: ${ready} из ${cards.length}; ${ciWord}.`;
+  if (ci && ci.status === "red") {
+    plan.closeStatus = "failed"; plan.closeStep = "closed";
+    planNotice(plan, `${head} Прогон красный ПО CI, не по приёмке — PR остаётся черновиком: ${url || "PR не создан"}`, "error");
+    logPlan(plan, "plan-acceptance-broken", { attempts: deaths.length, ci: "red", failed: ci.failed, verdict: "failed-by-ci" });
+    return;
+  }
+  plan.closeStatus = "done"; plan.closeStep = "acceptance-broken";
+  planNotice(plan, `${head} Деплоя не было, PR оставлен черновиком${url ? ": " + url : ""}. `
+    + `Решение за человеком: добить прогон (сверить итоги этапов и CI, снять черновик, смержить) `
+    + `или переиграть приёмку кнопкой «↻ переиграть приёмку».`, "warn");
+  logPlan(plan, "plan-acceptance-broken", { attempts: deaths.length, ci: ci ? ci.status : null, ready, stages: cards.length, verdict: "needs-human" });
+}
+
 // The PR body (§5.4). Assembled from what the board already knows — this is the single
 // human-readable trace of a run, and it is written whether the merge is manual or auto.
 function prBody(board, plan, pol) {
@@ -1272,7 +1309,11 @@ function prBody(board, plan, pol) {
   L.push(``, `## Приёмка`);
   if (!acc) L.push(`_не проводилась_`);
   else {
-    L.push(acc.passed ? `✅ **зелёная** — все проверки прошли` : `❌ **красная** — провалено: ${(acc.failed || []).join(", ") || "см. ниже"}`);
+    // Ш1.2: «не смогли проверить» — это не «проверили и упало». Смешивать их в PR нельзя: по этой
+    // строке человек решает, чинить код или добивать прогон руками.
+    L.push(acc.inconclusive
+      ? `⚠️ **не проведена** — процесс проверок умер ${acc.attempts || 1} раз(а): ${(acc.deaths || []).slice(-1).map((d) => d.why).join("") || "см. ниже"}. О коде это НИЧЕГО не говорит.`
+      : acc.passed ? `✅ **зелёная** — все проверки прошли` : `❌ **красная** — провалено: ${(acc.failed || []).join(", ") || "см. ниже"}`);
     for (const c of (acc.checks || [])) L.push(`- ${c.status === "pass" ? "✅" : c.status === "skip" ? "⏭" : "❌"} [${c.kind || "?"}] ${c.title || c.id}${c.output ? ` — \`${String(c.output).slice(0, 200).replace(/\n/g, " ")}\`` : ""}${c.evidence ? ` · доказательство: ${c.evidence}` : ""}`);
     if (acc.notes) L.push(``, `Риски по итогам приёмки: ${acc.notes}`);
   }
@@ -1392,7 +1433,7 @@ const ciRunIdOf = (urls) => {
 // ## - Две попытки, потом честная запись об ошибке — молчание хуже пустых метрик.
 // ## - Прайс лежит в config/model-prices.json, не в коде (GRACE_PRICES переопределяет).
 // GREP_SUMMARY: A5, метрики прогона, plan.result.metrics, стоимость, токены, транскрипты
-const METRICS_STEPS = new Set(["closed", "pr-ready", "merge-failed", "awaiting-merge", "awaiting-deploy"]);
+const METRICS_STEPS = new Set(["closed", "pr-ready", "merge-failed", "awaiting-merge", "awaiting-deploy", "acceptance-broken"]);
 const METRICS_SCRIPT = path.join(__dirname, "lib", "plan-metrics.js");
 const NODE_BIN = process.execPath;
 function planMetricsTick(board) {
@@ -1448,6 +1489,69 @@ function planMetricsTick(board) {
 }
 // endregion FUNC_planMetrics
 
+// region FUNC_acceptRetry — «процесс проверок не запустился» ≠ «проверки провалились» (Ш1.2)
+// ## @purpose 08→09.08 `claude -p` четырежды за сутки умер мгновенно, записав в лог ровно одну
+// ##   строку «Execution error». Карточки такое переживают (авто-исцеление LA4), приёмка — нет:
+// ##   мёртвый ран безусловно превращался в `checks:[{id:"run",status:"fail"}]` и терминальный
+// ##   `failed`. Так прогон 3679210d (9 коммитов, три этапа в ready, CI зелёный по всем job'ам)
+// ##   записан проваленным и простоял ночь; утром его добивали руками — reopen, ручная сверка CI,
+// ##   снять черновик, смержить. Прогон умер не кодом, а вспомогательным процессом.
+// ## @io (лог рана + <log>.exit) -> {kind, exit, tail} · plan.acceptanceDeaths[] · plan.acceptanceRetryAt
+// ## @invariants
+// ## - Ретраится ТОЛЬКО молчание рана. Записанный acceptance.json с fail — настоящий красный и
+// ##   терминален как прежде: переигрывать проверки, которые честно провалились, нельзя.
+// ## - Лимит подписки разбирается РАНЬШЕ (planQuotaHold) и попыток не тратит — это часы, а не сбой.
+// ## - Исчерпав попытки, доска НЕ хоронит прогон: приёмка помечается `inconclusive`, развилка §5.5
+// ##   уводит его в `acceptance-broken` («нужна рука»), а не в `failed`. Разница между «код плохой»
+// ##   и «наш процесс не смог проверить» обязана быть видна — иначе вахта пропустит такую ночь.
+// GREP_SUMMARY: Execution error, приёмка, ретрай, acceptance-broken, inconclusive, Ш1.2
+// STRUCTURE: ▶ ран замолчал → ⊕ runFailure(log) → ⚡ ретрай ×N → ⎋ acceptance-broken + проба CI
+const ACCEPT_MAX_TRIES = Math.max(1, Number(process.env.GRACE_ACCEPT_TRIES || 3));
+const ACCEPT_RETRY_MS = Number(process.env.GRACE_ACCEPT_RETRY_SEC || 180) * 1000;
+// Ровно то, что печатал умирающий CLI: одна строка и ничего больше. Отдельный класс нужен не
+// ради красоты — он говорит «отказ снаружи кода», то есть ретрай осмыслен.
+const EXEC_ERROR_RE = /^\s*(?:error:\s*)?execution error\s*$/i;
+// Код возврата ушедшего рана. Пишется обработчиком exit в spawnRun рядом с логом: у detached
+// процесса это единственный способ узнать код, а без кода «Execution error» неотличим от OOM.
+function readRunExit(logFile, pid) {
+  if (!logFile) return null;
+  try {
+    const j = JSON.parse(fs.readFileSync(logFile + ".exit", "utf8"));
+    if (pid && j.pid && j.pid !== pid) return null;    // файл от предыдущей попытки — не наш
+    return j;
+  } catch { return null; }
+}
+// Почему ран замолчал — по его собственному хвосту, начиная с байта, на котором он стартовал
+// (лог дописывается между попытками). Три класса, и каждый читается по-разному.
+function runFailure(logFile, fromBytes, pid) {
+  const exit = readRunExit(logFile, pid);
+  let text = "";
+  if (logFile) try {
+    const size = fs.statSync(logFile).size;
+    const start = Math.min(Math.max(Number(fromBytes) || 0, Math.max(0, size - 64 * 1024)), size);
+    const fd = fs.openSync(logFile, "r");
+    const buf = Buffer.alloc(size - start);
+    if (buf.length) fs.readSync(fd, buf, 0, buf.length, start);
+    fs.closeSync(fd);
+    text = buf.toString("utf8");
+  } catch {}
+  const lines = text.split(/\r?\n/).map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("===== grace:"));      // служебные маркеры не в счёт
+  const kind = !lines.length ? "silent"
+    : (lines.length <= 5 && lines.some((l) => EXEC_ERROR_RE.test(l))) ? "exec-error" : "other";
+  return { kind, exit: exit ? exit.code : null, signal: exit ? exit.signal : null,
+    lines: lines.length, tail: lines.slice(-40).join("\n") };
+}
+// Одна фраза для человека — она уходит и в notice прогона, и в журнал.
+function runFailureWord(f) {
+  const code = f.exit === null || f.exit === undefined ? "код неизвестен"
+    : `код ${f.exit}${f.signal && f.signal !== "null" ? ", сигнал " + f.signal : ""}`;
+  if (f.kind === "exec-error") return `CLI умер мгновенно с «Execution error» (${code}) — отказ вне кода прогона`;
+  if (f.kind === "silent") return `процесс не написал в лог ни строки (${code})`;
+  return `процесс оборвался, не записав acceptance.json (${code})`;
+}
+// endregion FUNC_acceptRetry
+
 // The closing state machine. ONE step per plan per tick: every step either spawns a child and
 // parks, or reads that child's output file. The tick itself never waits on anything.
 function planCloseTick(board) {
@@ -1479,7 +1583,8 @@ function planCloseTick(board) {
         tails: planTails(board, plan), closingStartedAt: new Date().toISOString() };
       const launch = launchPlanAcceptance(board, plan);
       plan.acceptanceRun = { pid: launch.pid || null, log: launch.log || null, launched: !!launch.launched,
-        error: launch.error || null, startedAt: new Date().toISOString() };
+        from: launch.from || 0, error: launch.error || null, startedAt: new Date().toISOString() };
+      plan.acceptanceDeaths = []; plan.acceptanceRetryAt = null;
       logPlan(plan, "plan-closing", { stages: cards.length, policy: pol, launched: !!launch.launched });
       changed = true;
       continue;
@@ -1491,16 +1596,19 @@ function planCloseTick(board) {
       continue;
     }
 
-    // ── acceptance (§5.3): wait for acceptance.json; a silent/dead run is a RED acceptance ──
+    // ── acceptance (§5.3): wait for acceptance.json. Написанный файл — вердикт приёмки, каким
+    //    бы он ни был. Молчание — Ш1.2: это отказ ПРОЦЕССА, он ретраится и не красит прогон.
     if (plan.closeStep === "acceptance") {
-      // v4 Ш1.1: приёмка без рана — это приёмка, которую сняли лимитом (или ручкой /reopen).
-      // Запускаем заново; окно лимита уже закрылось, иначе тик сюда не дошёл бы.
+      // v4 Ш1.1: приёмка без рана — это приёмка, которую сняли лимитом, ручкой /reopen или
+      // ретраем Ш1.2. Запускаем заново, выдержав паузу между попытками.
       if (!plan.acceptanceRun) {
+        if (plan.acceptanceRetryAt && Date.parse(plan.acceptanceRetryAt) > Date.now()) continue;
+        plan.acceptanceRetryAt = null;
         try { fs.unlinkSync(path.join(dir, "acceptance.json")); } catch {}
         const relaunch = launchPlanAcceptance(board, plan);
         plan.acceptanceRun = { pid: relaunch.pid || null, log: relaunch.log || null, launched: !!relaunch.launched,
-          error: relaunch.error || null, startedAt: new Date().toISOString() };
-        logPlan(plan, "plan-acceptance-relaunch", { launched: !!relaunch.launched });
+          from: relaunch.from || 0, error: relaunch.error || null, startedAt: new Date().toISOString() };
+        logPlan(plan, "plan-acceptance-relaunch", { launched: !!relaunch.launched, deaths: (plan.acceptanceDeaths || []).length });
         changed = true; continue;
       }
       let raw = null;
@@ -1511,24 +1619,56 @@ function planCloseTick(board) {
         logPlan(plan, "plan-acceptance", { passed: plan.result.acceptance.passed, failed: plan.result.acceptance.failed.length });
         changed = true;
       } else {
-        const started = Date.parse((plan.acceptanceRun || {}).startedAt || "") || 0;
-        const dead = !plan.acceptanceRun || !plan.acceptanceRun.launched
-          || (!isAlive(plan.acceptanceRun.pid) && Date.now() - started > ACCEPT_GRACE_MS);
+        const run = plan.acceptanceRun || {};
+        const started = Date.parse(run.startedAt || "") || 0;
+        const dead = !run.launched || (!isAlive(run.pid) && Date.now() - started > ACCEPT_GRACE_MS);
         const tooLong = Date.now() - started > STALL_MS;
+        if (!dead && !tooLong) continue;
         // Прежде чем назвать молчание провалом — прочитать, ПОЧЕМУ ран замолчал. Лимит подписки
         // выглядит точно так же, как сдохший ран, и красит прогон красным ни за что.
-        if (dead || tooLong) {
-          const stop = detectQuotaStop((plan.acceptanceRun || {}).log, Date.now(), 0);
-          if (stop) { planQuotaHold(board, plan, stop, "приёмка", "acceptanceRun"); changed = true; continue; }
+        const stop = detectQuotaStop(run.log, Date.now(), run.from || 0);
+        if (stop) { planQuotaHold(board, plan, stop, "приёмка", "acceptanceRun"); changed = true; continue; }
+        if (tooLong && isAlive(run.pid)) { try { process.kill(run.pid, "SIGTERM"); } catch {} }
+        const f = tooLong && !dead ? { kind: "stall", exit: null, signal: null, lines: 0,
+          tail: tailLog(run.log || "", 40) } : runFailure(run.log, run.from || 0, run.pid);
+        const why = f.kind === "stall"
+          ? `приёмка не отчиталась за ${Math.round(STALL_MS / 60000)} мин, процесс остановлен`
+          : runFailureWord(f);
+        plan.acceptanceDeaths = [...(plan.acceptanceDeaths || []), { ts: new Date().toISOString(),
+          reason: f.kind, exit: f.exit, signal: f.signal, why, tail: (f.tail || run.error || "").slice(-1500) }].slice(-10);
+        const tries = plan.acceptanceDeaths.length;
+        // S4 §2.3: смерть рана приёмки — такая же смерть процесса на аккаунте, как смерть рана
+        // карточки. В общий счётчик её тоже: кластер смертей за минуту — признак глобального
+        // события, и варден классифицирует карточки именно по нему.
+        if (dead) {
+          board.recentDeaths = (board.recentDeaths || []).filter((d) => Date.now() - (Date.parse(d.ts || "") || 0) < 10 * 60 * 1000);
+          board.recentDeaths.push({ ts: new Date().toISOString(), planId: plan.id, column: "acceptance", kind: f.kind });
+          if (board.recentDeaths.length > 20) board.recentDeaths = board.recentDeaths.slice(-20);
         }
-        if (dead || tooLong) {
-          plan.result.acceptance = normalizeAcceptance({ passed: false, checks: [{ id: "run", title: "Ран приёмки не отчитался", kind: "deterministic", status: "fail",
-            output: tailLog((plan.acceptanceRun || {}).log || "", 40) || ((plan.acceptanceRun || {}).error || "") }],
-            notes: dead ? "процесс приёмки умер, не записав acceptance.json" : "приёмка превысила бюджет времени" });
-          plan.closeStep = "pr";
-          logPlan(plan, "plan-acceptance", { passed: false, reason: dead ? "dead" : "timeout" });
-          changed = true;
+        logPlan(plan, "plan-acceptance-death", { kind: f.kind, exit: f.exit, try: tries, max: ACCEPT_MAX_TRIES });
+        if (tries < ACCEPT_MAX_TRIES) {
+          // Ровно то авто-исцеление, что уже работает на станции implementing: смерть процесса —
+          // не вердикт о коде, а повод перезапустить проверку.
+          plan.acceptanceRun = null;
+          plan.acceptanceRetryAt = new Date(Date.now() + ACCEPT_RETRY_MS).toISOString();
+          const pause = ACCEPT_RETRY_MS < 60000 ? `${Math.round(ACCEPT_RETRY_MS / 1000)} сек` : `${Math.round(ACCEPT_RETRY_MS / 60000)} мин`;
+          planNotice(plan, `Приёмка не прогналась (попытка ${tries} из ${ACCEPT_MAX_TRIES}): ${why}. `
+            + `Это отказ процесса проверок, а не провал работы — доска переиграет приёмку через ${pause} сама.`, "warn");
+          changed = true; continue;
         }
+        // Попытки исчерпаны. Приёмка НЕ красная — она НЕ ПРОВЕДЕНА, и это разные вещи: PR всё
+        // равно собирается (черновиком), а исход разводит развилка post-pr.
+        plan.result.acceptance = normalizeAcceptance({ passed: false, checks: [{ id: "run",
+          title: `Приёмка не смогла прогнаться за ${tries} попыт${tries === 1 ? "ку" : "ки"}`,
+          kind: "deterministic", status: "fail", output: (f.tail || run.error || "").slice(-2000) }],
+          notes: `${why}. Проверки НЕ выполнялись — о коде это ничего не говорит.` });
+        plan.result.acceptance.inconclusive = true;
+        plan.result.acceptance.reason = f.kind;
+        plan.result.acceptance.attempts = tries;
+        plan.result.acceptance.deaths = plan.acceptanceDeaths.map((d) => ({ ts: d.ts, reason: d.reason, exit: d.exit, why: d.why }));
+        plan.closeStep = "pr";
+        logPlan(plan, "plan-acceptance-inconclusive", { attempts: tries, kind: f.kind, exit: f.exit });
+        changed = true;
       }
       continue;
     }
@@ -1573,6 +1713,14 @@ function planCloseTick(board) {
     // ── §5.5 branching table ────────────────────────────────────────────────────────────
     if (plan.closeStep === "post-pr") {
       const a = acc();
+      // Ш1.2 · приёмка НЕ ПРОВЕДЕНА (процесс проверок умер N раз) — до вердикта о коде дело не
+      // дошло. Хоронить прогон нечем: спрашиваем CI на собранном PR и зовём человека с фактами.
+      if (a && a.inconclusive) {
+        if (plan.result.pr && plan.result.pr.ok && plan.result.pr.url) {
+          plan.closeStep = "accept-ci"; plan.accCiRun = null; changed = true; continue;
+        }
+        planAcceptanceBroken(board, plan, null); changed = true; continue;
+      }
       if (!a || !a.passed) {                       // красная приёмка · любой merge · любой deploy
         plan.closeStatus = "failed"; plan.closeStep = "closed";
         planNotice(plan, `Приёмка красная — PR оставлен черновиком, деплоя не было. Провалено: ${(a && a.failed || []).join(", ") || "см. PR"}`, "error");
@@ -1603,6 +1751,24 @@ function planCloseTick(board) {
       plan.ciNextAt = null; plan.ciRun = null;
       changed = true;
       continue;
+    }
+
+    // ── Ш1.2 · проба CI при непроведённой приёмке. Один опрос, без ожидания: конвейер по
+    //    этому прогону уже стоит на человеке, а CI здесь — не гейт мержа, а ФАКТ в вердикте.
+    if (plan.closeStep === "accept-ci") {
+      try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+      const cmd = `${GH_BIN} pr view ${shq(plan.result.pr.url)} --json state,mergeStateStatus,statusCheckRollup`;
+      const st = spawnStep(projectDir, cmd, path.join(dir, "acc-ci.out"));
+      plan.accCiRun = { ...st, startedAt: new Date().toISOString() };
+      plan.closeStep = "accept-ci-wait"; changed = true;
+      continue;
+    }
+    if (plan.closeStep === "accept-ci-wait") {
+      const r = readStep(path.join(dir, "acc-ci.out"));
+      const started = Date.parse((plan.accCiRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.accCiRun || {}).started) continue;
+      planAcceptanceBroken(board, plan, r ? ciClassify(r.text) : null);
+      changed = true; continue;
     }
 
     // ── A1 · the CI gate: poll → classify → merge only on green ───────────────────────
@@ -1943,16 +2109,28 @@ function spawnRun(projectDir, runDir, prompt, logName, opts) {
   try {
     // Where THIS run's output starts. Logs are appended across relaunches, so without the offset
     // a stale «hit your limit» from an earlier attempt would keep re-arming the quota wait (S6).
-    let from = 0; try { from = fs.statSync(path.join(runDir, logName)).size; } catch {}
-    const out = fs.openSync(path.join(runDir, logName), "a");
+    const logFile = path.join(runDir, logName);
+    let from = 0; try { from = fs.statSync(logFile).size; } catch {}
+    const out = fs.openSync(logFile, "a");
     const env = { ...process.env, PATH: `${BIN_PATH_HINT}:${process.env.PATH || ""}` };
     const lean = leanFlags(projectDir);
     const model = (opts && opts.model) || null;      // B3′: null ⇒ no --model ⇒ account default
     const args = ["-p", prompt, "--permission-mode", "bypassPermissions", "--add-dir", projectDir,
       ...(model ? ["--model", model] : []), ...lean];
     const child = spawn(CLAUDE_BIN, args, { cwd: projectDir, env, detached: true, stdio: ["ignore", out, out] });
+    // Ш1.2 · чёрный ящик рана. «Execution error» одной строкой не говорит НИЧЕГО: ни кода
+    // возврата, ни сигнала, ни того, чем ран вообще был. Оба маркера пишет доска (у detached
+    // процесса код возврата больше взять неоткуда), а `.exit` рядом с логом читает машина.
+    const stamp = (line) => { try { fs.appendFileSync(logFile, line); } catch {} };
+    stamp(`\n===== grace: старт ${new Date().toISOString()} · pid ${child.pid} · ${CLAUDE_BIN}`
+      + `${model ? " --model " + model : ""}${lean.length ? " (lean)" : ""} =====\n`);
+    child.on("exit", (code, signal) => {
+      stamp(`\n===== grace: выход ${new Date().toISOString()} · pid ${child.pid} · код ${code} · сигнал ${signal || "—"} =====\n`);
+      try { fs.writeFileSync(logFile + ".exit", JSON.stringify({ pid: child.pid, code, signal, ts: new Date().toISOString() })); } catch {}
+    });
+    child.on("error", (e) => stamp(`\n===== grace: ошибка запуска · ${String(e && e.message || e)} =====\n`));
     child.unref();
-    return { launched: true, pid: child.pid, log: path.join(runDir, logName), from, lean: lean.length > 0, model };
+    return { launched: true, pid: child.pid, log: logFile, from, lean: lean.length > 0, model };
   } catch (e) {
     return { launched: false, error: String(e.message || e) };
   }
@@ -3113,12 +3291,17 @@ async function handleApi(req, res, urlPath) {
     const board = readBoard();
     const plan = planById(board, decodeURIComponent(mreopen[1]));
     if (!plan) return sendJSON(res, 404, { error: "plan not found" });
-    if (plan.closeStatus !== "failed") return sendJSON(res, 409, { error: "переиграть можно только проваленный прогон" });
+    // Ш1.2: переигрывать можно и прогон, чью приёмку доска не смогла провести — это ровно тот
+    // случай, ради которого ручка и заводилась, только причина не лимит, а смерть процесса.
+    if (plan.closeStatus !== "failed" && plan.closeStep !== "acceptance-broken")
+      return sendJSON(res, 409, { error: "переиграть можно только проваленный прогон или прогон с непроведённой приёмкой" });
     plan.closeStatus = "verifying";
     plan.closeStep = "acceptance";
     plan.acceptanceRun = null;                 // тик перезапустит приёмку сам
+    plan.acceptanceDeaths = [];                // человек переигрывает — счётчик попыток с нуля
+    plan.acceptanceRetryAt = null;
     plan.archived = false;
-    if (plan.result) plan.result.acceptance = null;
+    if (plan.result) { plan.result.acceptance = null; plan.result.acceptanceBroken = null; }
     planNotice(plan, "Приёмка переигрывается по просьбе человека — прогон снова в закрытии.", "warn");
     writeBoard(board);
     try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "plan-reopen", planId: plan.id }) + "\n"); } catch {}
