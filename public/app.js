@@ -507,6 +507,9 @@ const CLOSE_STEP_RU = { acceptance: "идёт приёмка прогона", pr
   "post-pr": "разбираю результат", "merge-wait": "мержу", deploy: "деплой", "deploy-wait": "деплой идёт",
   "pr-ready": "закрыт · PR собран, мерж за тобой", "merge-failed": "автомерж не прошёл — мерж за человеком",
   "awaiting-deploy": "деплой ждёт человека", closed: "закрыт",
+  // Ш1.2 · приёмку не смогли ПРОВЕСТИ (умирал процесс проверок) — это не красная приёмка
+  "accept-ci": "спрашиваю CI", "accept-ci-wait": "спрашиваю CI",
+  "acceptance-broken": "приёмка не прогналась — нужна рука",
   // читается только у прогонов, собранных до v4 — closeState() разводит его по политике
   "awaiting-merge": "закрыт · мерж за тобой" };
 // v4 Ш1 · ЕДИНАЯ трактовка закрытия для всей доски. `awaiting-merge` раньше означал три разные
@@ -516,6 +519,7 @@ const CLOSE_STEP_RU = { acceptance: "идёт приёмка прогона", pr
 function closeState(plan) {
   if (!plan.closeStatus) return "running";
   if (plan.closeStatus === "failed") return "failed";
+  if (plan.closeStep === "acceptance-broken") return "acceptance-broken";
   if (plan.closeStep === "awaiting-merge") return (plan.policy || {}).merge === "manual" ? "pr-ready" : "merge-failed";
   if (plan.closeStep === "pr-ready") return "pr-ready";
   if (plan.closeStep === "merge-failed") return "merge-failed";
@@ -529,13 +533,24 @@ function closeHTML(plan) {
   if (!plan.closeStatus) return "";
   const r = plan.result || {}, a = r.acceptance, pr = r.pr, note = r.notice;
   const bits = [];
-  bits.push(`<span class="close__state close__state--${esc(plan.closeStatus)}">${plan.closeStatus === "verifying" ? "⏳ закрытие" : plan.closeStatus === "done" ? "✓ закрыт" : "✕ провален"}</span>`);
+  // Ш1.2: «✓ закрыт» на прогоне, работу которого никто не проверял, — то самое враньё, из-за
+  // которого ночь простояла. Такой прогон закрыт лишь в смысле «доска дальше не пойдёт».
+  const broken = plan.closeStep === "acceptance-broken";
+  bits.push(`<span class="close__state close__state--${broken ? "broken" : esc(plan.closeStatus)}">${broken ? "⚠ приёмки не было" : plan.closeStatus === "verifying" ? "⏳ закрытие" : plan.closeStatus === "done" ? "✓ закрыт" : "✕ провален"}</span>`);
   bits.push(`<span class="close__step">${esc(CLOSE_STEP_RU[plan.closeStep] || plan.closeStep || "")}</span>`);
-  if (a) bits.push(`<span class="close__chip close__chip--${a.passed ? "ok" : "bad"}" title="${esc((a.checks || []).map((c) => `${c.status}: ${c.title}`).join("\n"))}">приёмка: ${a.passed ? "зелёная" : "красная"} · ${(a.checks || []).filter((c) => c.status === "pass").length}/${(a.checks || []).length}</span>`);
+  // Ш1.2 · «не прогналась» ≠ «красная»: в первом случае проверок НЕ БЫЛО, и это единственное,
+  // что человеку нужно знать, прежде чем идти чинить якобы сломанный код.
+  if (a && a.inconclusive) bits.push(`<span class="close__chip close__chip--bad" title="${esc((a.deaths || []).map((d) => `${d.ts}: ${d.why}`).join("\n"))}">приёмка: не прогналась · попыток ${a.attempts || 1}</span>`);
+  else if (a) bits.push(`<span class="close__chip close__chip--${a.passed ? "ok" : "bad"}" title="${esc((a.checks || []).map((c) => `${c.status}: ${c.title}`).join("\n"))}">приёмка: ${a.passed ? "зелёная" : "красная"} · ${(a.checks || []).filter((c) => c.status === "pass").length}/${(a.checks || []).length}</span>`);
+  if (r.ci && r.ci.forAcceptance) bits.push(`<span class="close__chip close__chip--${r.ci.status === "green" ? "ok" : r.ci.status === "red" ? "bad" : ""}" title="${esc((r.ci.checks || []).map((c) => `${c.verdict}: ${c.name}`).join("\n"))}">CI на PR: ${esc(r.ci.status)}</span>`);
   if (pr && pr.url) bits.push(`<a class="close__chip" href="${esc(safeUrl(pr.url) || "#")}" target="_blank" rel="noopener">PR${pr.draft ? " (draft)" : ""} →</a>`);
   else if (pr && pr.error) bits.push(`<span class="close__chip close__chip--bad" title="${esc(pr.error)}">PR не создан</span>`);
   if (r.deploy) bits.push(`<span class="close__chip${r.deploy.status === "failed" ? " close__chip--bad" : ""}" title="${esc(r.deploy.reason || r.deploy.cmd || "")}">деплой: ${esc(r.deploy.status)}</span>`);
   if ((r.tails || []).length) bits.push(`<span class="close__chip" title="${esc(r.tails.map((t) => t.theme).join("\n"))}">хвостов: ${r.tails.length}</span>`);
+  // Прогон с непроведённой приёмкой висит в треке (доска по нему стоит) — значит и выход из
+  // этого состояния должен быть здесь, а не только на полке закрытого.
+  if (plan.closeStep === "acceptance-broken")
+    bits.push(`<button class="close__chip close__chip--act" type="button" data-planreopen="${esc(plan.id)}" title="перезапустить приёмку прогона">↻ переиграть приёмку</button>`);
   return `<div class="close">${bits.join("")}${note ? `<div class="close__note close__note--${esc(note.level)}">${esc(note.text)}</div>` : ""}</div>`;
 }
 // S6 · the account-wide limit, said once and plainly: WHY the board stands still, that nothing
@@ -708,6 +723,14 @@ function attention() {
     if (st === "merge-failed")
       rows.push({ k: "merge", ic: "⛔", t: p.goal || "Прогон " + p.id, plan: p.id,
         s: `автомерж не прошёл · ${p.result && p.result.pr && p.result.pr.url ? "PR собран" : "PR не создан"} — доска дальше не пойдёт`, go: "Разобрать" });
+    // Ш1.2 · работа сделана, а проверить её доска не смогла. Это ровно та ночь 08→09.08, когда
+    // прогон с зелёным CI и тремя этапами в ready простоял до утра под ярлыком «провален».
+    if (st === "acceptance-broken") {
+      const ab = (p.result || {}).acceptanceBroken || {};
+      rows.push({ k: "merge", ic: "⚠", t: p.goal || "Прогон " + p.id, plan: p.id,
+        s: `приёмка не прогналась (${ab.attempts || "?"} попыт.) · этапов в ready ${ab.ready ?? "?"}/${ab.stages ?? "?"}`
+          + ` · CI: ${ab.ci || "не спрошен"} — код НЕ проверен, PR черновик`, go: "Разобрать" });
+    }
     if (st === "deploy-hold")
       rows.push({ k: "floor", ic: "⚠", t: p.goal || "Прогон " + p.id, plan: p.id,
         s: "смержено · деплой за человеком (жёсткий пол: боевой стенд)", go: "Раскатать" });
