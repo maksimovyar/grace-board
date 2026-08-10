@@ -4174,7 +4174,12 @@ function syncFromPipeline() {
       const sig = loopSignals(board, card);
       const last = card.loopBudget || null;
       // Повтор только на РОСТЕ сигнала: иначе пробитый порог звал бы стража каждые 2 с.
-      const fresh = sig.over.length && (!last || sig.loops > (last.loops || 0) || sig.logMB >= (last.logMB || 0) * 2);
+      // A6 · пилот: при пустом (или не растущем) логе `logMB >= last.logMB * 2` — это `0 >= 0`,
+      // то есть ИСТИНА на каждом тике: страж звался каждые 2 с, а карточка забивалась
+      // одинаковыми заметками до предела в 20. Рост лога считается ростом только если лог есть.
+      const grewLog = sig.logMB > 0 && sig.logMB >= Math.max(0.01, (last && last.logMB) || 0) * 2
+        && sig.logMB > ((last && last.logMB) || 0);
+      const fresh = sig.over.length && (!last || sig.loops > (last.loops || 0) || grewLog);
       if (fresh) {
         const why = [];
         if (sig.over.includes("loops")) why.push(`возвратов на доработку: ${sig.loops} (порог ${sig.limit.loops})`);
