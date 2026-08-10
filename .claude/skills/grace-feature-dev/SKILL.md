@@ -1,5 +1,5 @@
 ---
-version: 2026.08.10
+version: 2026.08.10.1
 name: grace-feature-dev
 description: Canonical board + phase + markup spec for the grace-feature-dev pipeline. Load when the /grace-feature-dev command (or its agents) needs the board.json schema, the kanban lifecycle (how a card moves through build phases), the run-level phase state machine, the GRACE semantic-exoskeleton markup template, the LDD log format, or the Anti-Loop signature rule. This file is the single source of truth for those formats.
 ---
@@ -67,8 +67,8 @@ TodoWrite — it is read from / written to this file. Anything else describing
   "createdAt": "<iso>",
   "phase": "build",                       // run-level phase (§1)
   "column": "implementing",               // current kanban column — the dispatch board mirrors THIS (§2.4)
-  "rigor": "grace",                       // grace | light | off  (§3)
-  "mode": "inline",                       // inline | hybrid | fanout  (§ command)
+  "rigor": "grace",                       // grace | off  (§3) — set by the board from the card's type
+  "mode": "inline",                       // inline | hybrid | fanout  (§ command) — likewise (§3.1)
   "verifyGate": "npx tsc --noEmit && npm test && npm run build",  // reproduced strict gate run in the clean snapshot (§2.1, §6); resolved per stack at Decompose
   "gates": { "clarify": "approved", "architecture": "approved" },
   "antiLoop": { "max": 3 },               // §4 — ПИШЕТ ЭТОТ ПАЙПЛАЙН, не доска (A1.2: доска поле
@@ -248,16 +248,45 @@ signature) — verification without a contract is untrusted.
 
 ## 3. GRACE markup — conditional by `rigor`
 
-`rigor` is chosen at intake and stored in `board.rigor`:
+`rigor` arrives with the run (`--rigor` on the command line) and is stored in
+`board.rigor`. **You do not choose it and must not change it**: when the run was
+dispatched by grace-board, `rigor` is derived from the card's **type** (§3.1), and a
+run that rewrites it makes the board's table and the code disagree.
 
 | `rigor` | When | Markup applied |
 |---|---|---|
 | `grace` | greenfield, or a repo already using GRACE markers | full exoskeleton + LDD |
-| `light` | you want navigability without noise | GREP_SUMMARY + STRUCTURE + BUG_FIX_CONTEXT only |
-| `off` | established 3rd-party repo with its own idiom | **none** — write in the repo's style |
+| `off` | established 3rd-party repo with its own idiom, or a fix card | **none** — write in the repo's style |
 
-> **Never vandalize an existing codebase.** Default to `off` when working inside a
-> mature repo with an established style; default to `grace` on greenfield.
+> **Never vandalize an existing codebase.** Outside the board (a hand-started run in a
+> mature repo with an established style) default to `off`; `grace` on greenfield.
+> `light` is not a live level — nothing consumes it; do not emit it.
+
+### 3.1 Card type — where `rigor` and `--mode` come from (board runs)
+
+A board card carries ONE execution knob: `type`. The board resolves the rest from its
+own table at dispatch and passes the result on the command line — the run receives the
+answer, never the question.
+
+| `type` | what it is | `rigor` | coder subagent | `--mode` | fuse budget |
+|---|---|---|---|---|---|
+| `backend` | server logic, domain layer, state machines | grace | `gfd-coder` | inline | ×1.0 |
+| `screen` | a screen / UI slice | grace | **`gfd-coder-frontend`** (Opus + `Skill(frontend-design)`) | hybrid | ×0.8 |
+| `integration` | seam with an external system | grace | `gfd-coder` | inline | ×1.0 |
+| `foundation` | scaffolding, data schema, migrations, UI kit | grace | `gfd-coder` | inline | ×0.7 |
+| `fix` | a repair against one named failure | **off** | `gfd-coder` | inline | ×0.5 |
+
+Two consequences for the orchestrator:
+
+- **A screen card's code goes to `gfd-coder-frontend`, not to `gfd-coder` and not to
+  you.** That agent has its own model and the design skill; substituting the general
+  coder (or writing the screen inline) throws away the only reason the card was routed.
+- **The fuse budget** scales the board's runaway thresholds (returns to `implementing`
+  and run-log size) for that card. A `fix` card gets a tight one on purpose: a repair
+  that loops is not a repair.
+
+A **mixed** card takes the type of its dominant work: a screen slice includes the thin
+server wiring it reads. A true 50/50 split is two cards joined by a `contract`.
 
 ### Semantic exoskeleton template (rigor = grace)
 

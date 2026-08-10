@@ -213,12 +213,8 @@
     <label class="field"><span class="field__label">Источники <span class="field__opt">по одному на строку, в порядке приоритета</span></span>
       <textarea class="field__input field__input--area" name="sources" rows="3" placeholder="docs/plans/xxx.md — главный&#10;макет v3.3 — устарел в части списков"></textarea></label>
 
-    <div class="field-row">
-      <label class="field"><span class="field__label">Макеты <span class="field__opt">ссылка</span></span>
-        <input class="field__input" name="designLink" type="url" placeholder="https://figma.com/…" /></label>
-      <label class="field"><span class="field__label">Требования <span class="field__opt">ссылка</span></span>
-        <input class="field__input" name="requirementsLink" type="url" placeholder="https://…/spec" /></label>
-    </div>
+<!-- A5.3: отдельных полей «макеты» и «требования» больше нет — ссылка на макет и ссылка на
+     спеку это ИСТОЧНИКИ и живут в поле выше, в порядке приоритета, рядом с остальными. -->
 
     <div class="field"><span class="field__label">Вложения <span class="field__opt">скриншоты / файлы требований</span></span>
       <label class="dropzone" id="dropzone">
@@ -228,13 +224,19 @@
       <ul class="att-list" id="attList"></ul>
     </div>
 
-    <div class="sheet__divider">Настройки прогона</div>
-    <label class="field"><span class="field__label">GRACE‑разметка</span>
-      <div class="seg" id="rigorSeg">
-        <button type="button" class="seg__opt is-on" data-rigor="grace">Включена</button>
-        <button type="button" class="seg__opt" data-rigor="off">Выключена</button>
+    <div class="sheet__divider">Тип работы</div>
+    <!-- A5.1 · ЕДИНСТВЕННАЯ ручка исполнения. Строгость разметки, кто пишет код, режим сборки и
+         порог предохранителя доска выводит из типа по своей таблице — по отдельности их больше
+         не выставляют: их выставлял тот, кто нарезал задачу, то есть никто осознанно. -->
+    <label class="field"><span class="field__label">Тип карточки</span>
+      <div class="seg seg--type" id="typeSeg">
+        <button type="button" class="seg__opt is-on" data-type="backend">⚙ Бэкенд</button>
+        <button type="button" class="seg__opt" data-type="screen">▢ Экран</button>
+        <button type="button" class="seg__opt" data-type="integration">⇄ Интеграция</button>
+        <button type="button" class="seg__opt" data-type="foundation">▤ Фундамент</button>
+        <button type="button" class="seg__opt" data-type="fix">✚ Починка</button>
       </div>
-      <span class="field__note">семантический экзоскелет + LDD‑логи в коде</span></label>
+      <span class="field__note" id="typeHint">серверная логика · разметка grace · обычный кодер · порог ×1.0</span></label>
 
     <div class="sheet__actions">
       <button class="btn btn--ghost" type="button" data-close>Отмена</button>

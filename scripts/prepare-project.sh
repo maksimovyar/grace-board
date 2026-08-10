@@ -58,6 +58,10 @@ echo "  команда из: $SRC/commands · скилл и агенты из: $
 link "$SRC/commands/$CMD.md"              "$DST/.claude/commands/$CMD.md"
 link "$SRC/commands/grace-feature-dev.md" "$DST/.claude/commands/grace-feature-dev.md"
 link "$LIB/skills/grace-feature-dev"      "$DST/.claude/skills/grace-feature-dev"
+# A5.2: кодер экранов (gfd-coder-frontend) читает скилл frontend-design, а lean-ран видит ТОЛЬКО
+# проектные копии — без этой ссылки агент на экране остался бы без своего единственного скилла.
+# Источник копии — официальный плагин claude-plugins-official/frontend-design (вендорим как есть).
+link "$LIB/skills/frontend-design"        "$DST/.claude/skills/frontend-design"
 for a in "$LIB"/agents/gfd-*.md; do link "$a" "$DST/.claude/agents/$(basename "$a")"; done
 # A3.2: линтер разметки — детерминированная замена ревьюеру «Conventions / GRACE markup».
 # Команда зовёт его по пути .claude/scripts/, поэтому он обязан лежать в проекте, а не в репо доски.

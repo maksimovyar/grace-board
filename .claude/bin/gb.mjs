@@ -4,8 +4,8 @@
 //
 // Usage:
 //   gb board [--project X] [--column backlog|todo|...]   list cards (filtered), id · column · theme
-//   gb card  --project X --theme "T" [desc opts] [--rigor off|grace] [--autonomy ask|auto]
-//            [--design-link URL] [--req-link URL] [--requirements "..."]
+//   gb card  --project X --theme "T" --type backend|screen|integration|foundation|fix [desc opts]
+//            [--design-link URL] [--req-link URL]
 //            [--origin human|skill|agent] [--out-of-scope "..." | --out-of-scope-file PATH]
 //            [--contract "..." | --contract-file PATH | --contract TBD]
 //            [--acceptance "сквозной пункт" ...] [--acceptance-card "пункт карточки" ...]
@@ -13,6 +13,11 @@
 //       --acceptance      — сквозной критерий: проверяет ПРИЁМКА всего прогона (умолчание, как было)
 //       --acceptance-card — покарточный: проверяет верификатор карточки, в приёмку не идёт (С4)
 //       desc opts (pick one): --desc "text" | --desc-file PATH | --desc-stdin
+//       --type (A5.1) — ЕДИНСТВЕННАЯ ручка исполнения. Строгость разметки, кто пишет код, режим
+//       сборки и порог предохранителя доска берёт из своей таблицы типов. Без флага — backend.
+//       Покарточных --rigor/--model/--build-mode/--autonomy больше нет: их выставлял тот, кто
+//       нарезал задачу, и во всех прошедших прогонах там стояло умолчание.
+//       --design-link/--req-link складываются в sources[] — это источники, а не отдельные поля.
 //       origin skill/agent ⇒ the board REQUIRES out-of-scope + acceptance + sources + contract
 //       (design §4.2) and refuses to dispatch the card otherwise.
 //   gb preflight --project X --card ID [--card ID ...]
@@ -123,11 +128,19 @@ async function cmdCard(args) {
     console.error(`gb: warning — description is ${description.length} chars, server caps at ${MAX_DESC}; the tail will be dropped SILENTLY.`);
   const payload = { project, theme };
   if (description !== undefined) payload.description = description;
-  if (args["--requirements"]) payload.requirements = args["--requirements"];
+  // A5.1 · тип. Валидацию значения делает доска (400 на неизвестный) — здесь не дублируем
+  // таблицу, чтобы список типов жил в ОДНОМ месте.
+  if (args["--type"]) payload.type = args["--type"];
+  // A5.3 · ссылки уезжают в sources[] на стороне доски; поля карточки под них больше нет.
   if (args["--design-link"]) payload.designLink = args["--design-link"];
   if (args["--req-link"]) payload.requirementsLink = args["--req-link"];
-  if (args["--rigor"]) payload.rigor = args["--rigor"];
-  if (args["--autonomy"]) payload.autonomy = args["--autonomy"];
+  // A5.3 · снятые ручки: молча проглотить их значило бы «доска приняла и учла». Не приняла.
+  for (const dead of ["--rigor", "--model", "--build-mode", "--autonomy", "--requirements", "--depends-on"]) {
+    if (args[dead] !== undefined) die(`${dead} снят (A5.3): исполнение карточки задаёт --type `
+      + `(backend|screen|integration|foundation|fix)`
+      + (dead === "--depends-on" ? "; зависимости задаются при сборке прогона: gb run --stage ID:dep" : "")
+      + (dead === "--requirements" ? "; текст требований — в --desc, ссылки — в --source/--req-link" : ""));
+  }
   // statement of work (design §4.1) — required for --origin skill|agent
   if (args["--origin"]) payload.origin = args["--origin"];
   const oos = args["--out-of-scope-file"] ? fs.readFileSync(args["--out-of-scope-file"], "utf8") : args["--out-of-scope"];
@@ -146,6 +159,7 @@ async function cmdCard(args) {
   const sent = description ? description.length : 0;
   const got = card.description ? card.description.length : 0;
   console.log(`created card ${card.id}  [${card.column}]  ${card.theme}`);
+  console.log(`type: ${card.type}` + (args["--type"] ? "" : "  (по умолчанию — бэкенд)"));
   console.log(`description: sent ${sent} chars, stored ${got} chars` + (sent === got ? "  ✓" : "  ✗ TRUNCATED"));
   // Say it NOW, not at dispatch: an agent-authored card with a gap will be refused by the lever.
   const strict = card.origin === "skill" || card.origin === "agent";
@@ -165,6 +179,8 @@ async function cmdPreflight(args) {
   for (const b of r.blockers || []) {
     console.log(`БЛОКЕР ${b.id}: ${b.q}`);
     for (const s of b.stale || []) console.log(`   · ${s.what}: ${s.path}${s.version ? ` (${s.version} против ${s.refVersion})` : ""}`);
+    // A5.1 · исключения таблицы типов, которые доска НЕ применила (клетка без причины)
+    for (const o of b.ignored || []) console.log(`   · ${o.type}${(o.cells || []).length ? ` (${o.cells.join(", ")})` : ""} — ${o.why}`);
     for (const o of b.options || []) console.log(`   → ${o.title}${o.recommended ? "  ←рекомендовано" : ""}`);
   }
   for (const f of r.floor || []) console.log(`ЖЁСТКИЙ ПОЛ [${f.class}]: ${f.detail} (этап ${f.stage})`);

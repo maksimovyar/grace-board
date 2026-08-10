@@ -82,6 +82,16 @@ function renderPulse(attN) {
     + k(" pulse__k--muted", "var(--s-ready)", `закрыто <b>${c.filter((x) => x.column === "ready").length}</b>`);
 }
 
+// A5.1 · тип карточки — единственная ручка исполнения. Подсказка говорит ровно то, что доска
+// из типа выведет: строгость разметки, кто пишет код, режим сборки, порог предохранителя.
+const CARD_TYPES = ["backend", "screen", "integration", "foundation", "fix"];
+const CARD_TYPE = {
+  backend:     { ru: "бэкенд",    icon: "⚙", hint: "серверная логика · разметка grace · обычный кодер · порог ×1.0" },
+  screen:      { ru: "экран",     icon: "▢", hint: "UI-слайс · разметка grace · кодер-фронтендер (Opus + frontend-design) · порог ×0.8" },
+  integration: { ru: "интеграция", icon: "⇄", hint: "стык систем · разметка grace · обычный кодер · порог ×1.0" },
+  foundation:  { ru: "фундамент", icon: "▤", hint: "каркас/миграции · разметка grace · обычный кодер · порог ×0.7" },
+  fix:         { ru: "починка",   icon: "✚", hint: "правка по конкретному провалу · без разметки · порог ×0.5" },
+};
 // S3 §4.2: who wrote this card decides how strictly the board checks it. `human` is the
 // default and needs no badge — it is the normal case on a live board.
 const ORIGIN_BADGE = { skill: ["◇ скилл", "заведена скиллом graceboard-plan — доска требует полную постановку"],
@@ -146,7 +156,13 @@ function cardTags(card) {
   if (rl) t.push(`<a class="tag" href="${esc(rl)}" target="_blank" rel="noopener" data-stop>▤ требования</a>`);
   else if (card.requirements) t.push(`<span class="tag" title="${esc(card.requirements)}">▤ требования</span>`);
   if ((card.attachments || []).length) t.push(`<span class="tag">📎 ${card.attachments.length}</span>`);
-  if (card.rigor === "grace") t.push(`<span class="tag">grace</span>`);
+  // A5.1/A5.4: тип — единственная ручка исполнения, и по нему читается ВСЁ остальное (строгость,
+  // кодер, режим, порог предохранителя). Показываем его, а не производную «grace».
+  // Старая карточка без типа так и говорит о себе своей строгостью — там типа и правда нет.
+  if (CARD_TYPES.includes(card.type)) {
+    const ct = CARD_TYPE[card.type];
+    t.push(`<span class="tag tag--type tag--type-${esc(card.type)}" title="${esc(ct.hint)}">${esc(ct.icon + " " + ct.ru)}</span>`);
+  } else if (card.rigor === "grace") t.push(`<span class="tag" title="карточка старого образца: строгость задана на ней самой, без типа">grace</span>`);
   return t.length ? `<div class="card__tags">${t.join("")}</div>` : "";
 }
 
@@ -203,7 +219,9 @@ function cardHTML(card) {
   const working = WORKING.has(card.column) ? ` data-working="1"` : "";
   const ignite = card.id === igniteId ? " is-ignite" : "";
   const planAttr = plan ? ` data-plan="${esc(plan.id)}"` : "";
-  const projectLabel = plan ? "⚡ Plan Run" : card.project;
+  // A5.4: проект — обязательное поле карточки, и он обязан быть виден. Раньше у карточки прогона
+  // его подменяло «⚡ Plan Run», и на доске с пятью проектами понять, куда поедет этап, было нельзя.
+  const projectLabel = (plan ? "⚡ " : "") + (card.project || "—");
   const stagePrefix = stage ? `<span class="card__stage">S${stage.n} ·</span>` : "";
 
   // Asking banner — clickable, opens the questionnaire drawer
@@ -1349,7 +1367,9 @@ async function sendArchitecture(id, btn) {
 const form = document.getElementById("composerForm");
 let editId = null;        // null → new task; else editing this backlog card
 let pendingFiles = [];    // staged uploads for a NEW task (uploaded after create)
-let rigorVal = "grace";
+// A5.1: вместо ручки «GRACE-разметка» композер выбирает ТИП. Строгость, кодера, режим сборки и
+// порог предохранителя доска выводит из него сама — выбирать их по отдельности больше нечем.
+let typeVal = "backend";
 
 function openComposer(card) {
   closeAll();
@@ -1361,16 +1381,14 @@ function openComposer(card) {
   form.project.readOnly = !!card; // project drives the run dir slug — don't move it on edit
   form.theme.value = card ? (card.theme || "") : "";
   form.description.value = card ? (card.description || "") : "";
-  form.designLink.value = card ? (card.designLink || "") : "";
-  form.requirementsLink.value = card ? (card.requirementsLink || "") : "";
   // S3 §4.1 — statement of work. Lists are edited as one-per-line text.
   form.outOfScope.value = card ? (card.outOfScope || "") : "";
   form.contract.value = card ? (card.contract || "") : "";
   form.acceptance.value = card ? (card.acceptance || []).join("\n") : "";
   form.sources.value = card ? (card.sources || []).join("\n") : "";
   document.getElementById("cnt").textContent = form.description.value.length;
-  rigorVal = card ? (card.rigor === "grace" ? "grace" : "off") : "grace";
-  setRigor(rigorVal);
+  typeVal = (card && CARD_TYPES.includes(card.type)) ? card.type : "backend";
+  setType(typeVal);
   renderAttList();
   sheets.composer.hidden = false;
   form.project.focus();
@@ -1378,8 +1396,12 @@ function openComposer(card) {
 document.getElementById("openComposer").addEventListener("click", () => openComposer(null));
 form.description.addEventListener("input", () => (document.getElementById("cnt").textContent = form.description.value.length));
 
-function setRigor(v) { rigorVal = v; document.querySelectorAll("#rigorSeg .seg__opt").forEach((o) => o.classList.toggle("is-on", o.dataset.rigor === v)); }
-document.querySelectorAll("#rigorSeg .seg__opt").forEach((o) => o.addEventListener("click", () => setRigor(o.dataset.rigor)));
+function setType(v) {
+  typeVal = CARD_TYPES.includes(v) ? v : "backend";
+  document.querySelectorAll("#typeSeg .seg__opt").forEach((o) => o.classList.toggle("is-on", o.dataset.type === typeVal));
+  document.getElementById("typeHint").textContent = CARD_TYPE[typeVal].hint;
+}
+document.querySelectorAll("#typeSeg .seg__opt").forEach((o) => o.addEventListener("click", () => setType(o.dataset.type)));
 
 // attachments in composer
 const dropzone = document.getElementById("dropzone"), fileInput = document.getElementById("fileInput"), attListEl = document.getElementById("attList");
@@ -1421,7 +1443,7 @@ async function removeAtt(ref) {
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const payload = { project: form.project.value.trim(), theme: form.theme.value.trim(), description: form.description.value.trim(), designLink: form.designLink.value.trim(), requirementsLink: form.requirementsLink.value.trim(), rigor: rigorVal,
+  const payload = { project: form.project.value.trim(), theme: form.theme.value.trim(), description: form.description.value.trim(), type: typeVal,
     outOfScope: form.outOfScope.value.trim(), contract: form.contract.value.trim(),
     acceptance: form.acceptance.value, sources: form.sources.value };
   const btn = document.getElementById("composerSubmit"); btn.disabled = true;

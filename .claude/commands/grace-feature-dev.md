@@ -1,6 +1,6 @@
 ---
 description: feature-dev's engine + GRACE markup + an autonomous kanban board. Interactive understand/clarify/architecture up front, then the feature rides a board.json through build phases autonomously.
-argument-hint: Optional feature description (and optionally --rigor grace|light|off, --mode inline|hybrid|fanout)
+argument-hint: Optional feature description (and optionally --rigor grace|off, --mode inline|hybrid|fanout)
 ---
 
 # grace-feature-dev
@@ -31,13 +31,17 @@ Initial request: $ARGUMENTS
 
 ## Settings (resolve once, store in board.json)
 
-- `--rigor grace|light|off` — markup intensity. **Default: `off` inside a mature
-  repo with its own style; `grace` on greenfield.** If unclear, ask once.
+- `--rigor grace|off` — markup intensity. **Default: `off` inside a mature repo with
+  its own style; `grace` on greenfield.** If unclear, ask once. (`light` is not a live
+  level — nothing consumes it.) A run dispatched by grace-board gets this value from
+  the card's TYPE and must not change it (Skill §3.1).
 - `--mode inline|hybrid|fanout` — how the build loop executes cards.
   **Default: `inline`** (you write every card with full context — preserves
-  feature-dev quality). `hybrid` = first wave inline, then fan out `gfd-coder`
-  subagents once conventions are validated. `fanout` = a `gfd-coder` per card from
-  the start (for large features that exceed one context). If unclear, default to
+  feature-dev quality). `hybrid` = first wave inline, then fan out coder
+  subagents once conventions are validated. `fanout` = a coder subagent per card from
+  the start (for large features that exceed one context). The coder is `gfd-coder`,
+  except for a board card of type `screen`, which goes to `gfd-coder-frontend`
+  (Skill §3.1). If unclear, default to
   `inline` and say so.
 
 ---

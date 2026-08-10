@@ -328,6 +328,112 @@ function projectConfigBlock(card) {
 }
 // endregion FUNC_projectConfig
 
+// region FUNC_cardType — тип карточки: единственная ручка исполнения (A5.1 · П10)
+// ## @purpose На карточке накопились четыре независимые ручки — rigor, model, buildMode,
+// ##   autonomy — и выставлял их тот, кто нарезал задачу. Ручка, которую подбирают на каждой
+// ##   карточке, подбирается один раз и потом копируется: во ВСЕХ прошедших прогонах rigor
+// ##   стоял по умолчанию, buildMode — inline (0 спавнов кодера на 45 спавнов ревьюера), а
+// ##   решение «экран делает фронтендер» не выражалось вообще ничем. Ручек больше нет: на
+// ##   карточке ОДНО поле `type`, а как её исполнять — знает доска по таблице типов.
+// ## @io (card) -> {type, rigor, buildMode, coder, budget, legacy, overridden[]}
+// ## @invariants
+// ## - Таблица — КОНСТАНТА ДОСКИ, а не файл проекта: она про то, как работает конвейер, и
+// ##   разъезжаться по проектам ей нельзя. Проект правит КЛЕТКУ через `.grace/project.md →
+// ##   overrides` и обязан назвать причину (`why`) — исключение без причины через полгода
+// ##   неотличимо от опечатки, поэтому оно игнорируется и всплывает блокером префлайта.
+// ## - Обратная совместимость по образцу LEGACY_COLUMN: карточка БЕЗ `type` читается как
+// ##   `backend`, но её собственные явные ручки (rigor/model/buildMode) УВАЖАЮТСЯ — на живой
+// ##   доске десятки таких, и менять им строгость посреди полёта нельзя. Карточка С `type`
+// ##   исполняется строго по таблице: две правды об одной строгости хуже одной неудобной.
+// ## - Множитель масштабирует БАЗУ предохранителя A1.1, а не заменяет её; порядок —
+// ##   база доски → множитель типа → override прогона (`--loops/--log-mb`), override побеждает.
+// ## @rationale Q: почему `screen` — hybrid, а не inline? A: фронтендер — это отдельная модель
+// ##   (Opus) и отдельный скилл (frontend-design), а получить их можно только у субагента:
+// ##   главный тред сессии один на карточку и его модель задаётся на весь ран.
+// ## @modulemap
+// ## FUNC 1[calc]  => cardType      — тип карточки (нет/мусор → backend)
+// ## FUNC 4[io]    => typeOverrides — клетки таблицы, переопределённые проектом (+ игнор без причины)
+// ## FUNC 4[calc]  => execFor       — ЕДИНАЯ точка: строгость, режим, кодер, множитель
+// GREP_SUMMARY: A5.1, type, тип карточки, таблица типов, backend screen integration foundation fix,
+//   overrides, execFor, кодер-фронтендер, множитель бюджета
+// STRUCTURE: ▶ cardType(card) → ⊕ typeOverrides(projectDir) → ⚡ execFor(card) → ⎋ dispatch/промпты/предохранитель
+
+const CARD_TYPES = ["backend", "screen", "integration", "foundation", "fix"];
+const CARD_TYPE_RU = { backend: "бэкенд", screen: "экран", integration: "интеграция",
+  foundation: "фундамент", fix: "починка" };
+// Клетки: строгость разметки · кодер, которому уходит код · режим сборки · множитель порога A1.1.
+const TYPE_TABLE = {
+  backend:     { rigor: "grace", coder: "gfd-coder",          buildMode: "inline", budget: 1.0 },
+  screen:      { rigor: "grace", coder: "gfd-coder-frontend", buildMode: "hybrid", budget: 0.8 },
+  integration: { rigor: "grace", coder: "gfd-coder",          buildMode: "inline", budget: 1.0 },
+  foundation:  { rigor: "grace", coder: "gfd-coder",          buildMode: "inline", budget: 0.7 },
+  fix:         { rigor: "off",   coder: "gfd-coder",          buildMode: "inline", budget: 0.5 },
+};
+const TYPE_DEFAULT = "backend";
+const cardType = (card) => (card && CARD_TYPES.includes(card.type)) ? card.type : TYPE_DEFAULT;
+const cardTyped = (card) => !!(card && CARD_TYPES.includes(card.type));   // false = старая карточка
+
+// Проектные исключения кешируются на 30 с: `execFor` зовётся на КАЖДОМ тике супервизора по
+// каждой карточке (предохранитель), а конфиг проекта меняется руками раз в недели.
+const OVERRIDE_TTL_MS = 30 * 1000;
+const overrideCache = new Map();
+const cellOk = {
+  rigor: (v) => (RIGORS.includes(v) ? v : undefined),
+  buildMode: (v) => (BUILD_MODES.includes(v) ? v : undefined),
+  coder: (v) => (typeof v === "string" && /^[\w.-]{3,64}$/.test(v.trim()) ? v.trim() : undefined),
+  budget: (v) => (Number(v) > 0 && Number(v) <= 4 ? Number(v) : undefined),
+};
+function readTypeOverrides(projectDir) {
+  const cfg = (readProjectConfig(projectDir) || {}).cfg || {};
+  const raw = cfg.overrides;
+  const ok = {}, ignored = [];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok, ignored };
+  for (const key of Object.keys(raw)) {
+    const cell = raw[key];
+    if (!cell || typeof cell !== "object" || Array.isArray(cell)) { ignored.push({ type: key, cells: [], why: "значение — не набор клеток" }); continue; }
+    const cells = Object.keys(cell).filter((k) => k in cellOk);
+    if (!cells.length) continue;
+    if (!CARD_TYPES.includes(key)) { ignored.push({ type: key, cells, why: `неизвестный тип (есть: ${CARD_TYPES.join(", ")})` }); continue; }
+    const why = String(cell.why || cell.reason || cell["причина"] || "").trim();
+    // Исключение без причины не применяется СОЗНАТЕЛЬНО: молча применённое исключение
+    // неотличимо от дрейфа, а тут — блокер префлайта, который человек видит до запуска.
+    if (!why) { ignored.push({ type: key, cells, why: "не указана причина (why)" }); continue; }
+    const out = { why };
+    for (const k of cells) { const v = cellOk[k](cell[k]); if (v !== undefined) out[k] = v; }
+    ok[key] = out;
+  }
+  return { ok, ignored };
+}
+function typeOverrides(projectDir) {
+  const hit = overrideCache.get(projectDir);
+  if (hit && Date.now() - hit.at < OVERRIDE_TTL_MS) return hit.val;
+  const val = readTypeOverrides(projectDir);
+  overrideCache.set(projectDir, { at: Date.now(), val });
+  return val;
+}
+// ЕДИНАЯ точка исполнения карточки. Всё, что раньше читало card.rigor / card.buildMode напрямую,
+// ходит сюда — иначе таблица типов стала бы пятой ручкой рядом с четырьмя старыми.
+function execFor(card) {
+  const type = cardType(card);
+  const table = TYPE_TABLE[type];
+  const legacy = !cardTyped(card);
+  const ov = (card && card.project) ? (typeOverrides(resolveProjectDir(card.project)).ok[type] || {}) : {};
+  const overridden = Object.keys(ov).filter((k) => k !== "why");
+  // Старая карточка: её собственные ручки — правда. Нет ручки — сегодняшнее умолчание доски
+  // (rigor off / GRACE_BUILD_MODE), а НЕ клетка таблицы: карточки в полёте не меняют поведения.
+  const rigor = legacy
+    ? (RIGORS.includes(card && card.rigor) ? card.rigor : "off")
+    : (ov.rigor || table.rigor);
+  const buildMode = legacy
+    ? (BUILD_MODES.includes(card && card.buildMode) ? card.buildMode : BUILD_MODE_DEFAULT)
+    : (ov.buildMode || table.buildMode);
+  return { type, legacy, rigor, buildMode,
+    coder: ov.coder || table.coder,
+    budget: ov.budget || table.budget,
+    why: ov.why || null, overridden };
+}
+// endregion FUNC_cardType
+
 // The headline the pipeline builds against = the task theme; the detail (long
 // description, links, attached files) is compiled into the requirements context.
 const featureLine = (card) => card.theme || card.description || "task";
@@ -676,7 +782,7 @@ function resumeHeld(board) {
     if (!isInsideRoot(projectDir)) { unpause(); changed = true; continue; }
     if (hasActiveForProject(board, card.project, card.id)) continue;   // WIP=1 outlives the brake
     const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);
-    const rigor = (card.rigor && card.rigor !== "auto") ? card.rigor : "off";
+    const rigor = execFor(card).rigor;                          // A5.1: строгость даёт тип карточки
     const recovery = [
       `RECOVERY-КОНТЕКСТ (этап был оборван человеком стоп-краном): ПРЕДЫДУЩИЙ прогон убит сигналом на станции`,
       `«${card.column}» — это НЕ дефект кода и НЕ причина переделывать фичу. Удержание снято, продолжай работу.`,
@@ -1157,6 +1263,10 @@ const REF_CLAUDE_DIR = path.join(__dirname, ".claude");
 const SKILL_PARTS = [
   { what: "скилл grace-feature-dev", rel: ["skills", "grace-feature-dev", "SKILL.md"] },
   { what: "агент gfd-coder", rel: ["agents", "gfd-coder.md"] },
+  // A5.2: кодер экранов и его скилл — часть конвейера ровно так же, как остальные пятеро:
+  // устаревшая копия здесь означает экран, собранный вчерашними правилами дизайна.
+  { what: "агент gfd-coder-frontend", rel: ["agents", "gfd-coder-frontend.md"] },
+  { what: "скилл frontend-design", rel: ["skills", "frontend-design", "SKILL.md"] },
   { what: "агент gfd-verifier", rel: ["agents", "gfd-verifier.md"] },
   { what: "агент gfd-reviewer", rel: ["agents", "gfd-reviewer.md"] },
   { what: "агент gfd-architect", rel: ["agents", "gfd-architect.md"] },
@@ -1226,6 +1336,20 @@ function preflightPlan(board, project, cardIds) {
     options: [
       { id: "update", title: `обновить: scripts/prepare-project.sh ${resolveProjectDir(project)}`, recommended: true },
       { id: "keep", title: "оставить как есть — копии проекта сознательно свои" },
+    ],
+  });
+  // A5.1: исключение из таблицы типов без причины НЕ применяется. Молчать об этом нельзя —
+  // человек написал override и вправе считать, что он работает; говорим ровно здесь, до запуска.
+  const ovr = typeOverrides(resolveProjectDir(project));
+  if (ovr.ignored.length) blockers.push({
+    id: "type-override", type: "blocker",
+    q: `Исключения таблицы типов в .grace/project.md не применены (${ovr.ignored.length}): `
+      + ovr.ignored.map((o) => `${o.type}${o.cells.length ? ` (${o.cells.join(", ")})` : ""} — ${o.why}`).join("; ")
+      + `. Прогон поедет по таблице доски.`,
+    ignored: ovr.ignored,
+    options: [
+      { id: "fix", title: "дописать причину (why) в клетку overrides — исключение начнёт работать", recommended: true },
+      { id: "keep", title: "оставить: исключение не нужно, таблица доски верна" },
     ],
   });
   const cards = (cardIds || []).map((id) => board.cards.find((c) => c.id === id)).filter(Boolean);
@@ -1474,14 +1598,15 @@ function launchPlanFix(board, plan, acc) {
     sources: uniqStr(stages.flatMap((c) => c.sources || [])).slice(0, MAX_SOURCES),
     files: uniqStr(stages.flatMap((c) => c.files || [])),
     contract: null, contractResult: null,
-    rigor: "off",   // решение владельца: починки без разметки
+    type: "fix",
   };
   const card = spawnTailCard(board, context, {
     theme: `Починка приёмки: ${plan.goal || plan.id}`.slice(0, 200),
     description: fixBrief(board, plan, acc, round),
     acceptance: failedChecks.map((c) => c.title),
     outOfScope: "Всё, кроме перечисленных провалившихся сценариев приёмки.",
-    rigor: "off",
+    // A5.1: тип «починка» — и `rigor: off` следует из него, а не из хардкода в двух местах.
+    type: "fix",
     draft: false,   // единственное исключение: этот круг доска ведёт без человека
   });
   card.fixFor = plan.id;
@@ -1960,9 +2085,9 @@ function nextTag(last, stand) {
 // (в отличие от карточки починки приёмки): за ним не следует автоматика, её посмотрит человек.
 function postMergeRedCard(board, plan, ci, logTail) {
   const failedNames = (ci.failed || []).map((r) => r.name).join(", ") || "пост-мерж CI";
-  const card = spawnTailCard(board, { id: null, project: plan.project, rigor: "off" }, {
+  const card = spawnTailCard(board, { id: null, project: plan.project, type: "fix" }, {
     theme: `Почини CI на main: ${plan.goal || plan.id}`.slice(0, 200),
-    rigor: "off",
+    type: "fix",   // A5.1: «почини CI» — карточка починки, строгость off следует из типа
     outOfScope: "Всё, кроме красного пост-мерж CI. Новую функциональность не добавлять.",
     acceptance: [`пост-мерж workflow на main зелёный: ${failedNames}`],
     description: [
@@ -2716,12 +2841,18 @@ function planCloseTick(board) {
 // ── dispatch: write a grace-feature-dev-compatible seed into the project ─────
 function dispatch(card) {
   const projectDir = resolveProjectDir(card.project);
-  const rigor = card.rigor === "grace" ? "grace" : "off";
+  // A5.1: строгость/режим/кодер разрешаются ТАБЛИЦЕЙ ТИПОВ в момент диспатча (с учётом
+  // проектных исключений), а не читаются с карточки. У старой карточки без `type` execFor
+  // вернёт её собственные ручки — поведение карточек в полёте не меняется.
+  const ex = execFor(card);
+  const rigor = ex.rigor;
   const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);
   // B2: with nobody waiting for answers the ask stage is a paid no-op — merge it into build.
   const merged = effAutonomy(card) === "auto";
   const event = { ts: new Date().toISOString(), event: "dispatch", cardId: card.id, project: card.project, slug: card.slug,
-    rigor, buildMode: buildModeFor(card), model: modelFor(card) || null, merged };
+    type: ex.type, typeLegacy: ex.legacy || undefined, coder: ex.coder,
+    typeOverride: ex.overridden.length ? { cells: ex.overridden, why: ex.why } : undefined,
+    rigor, buildMode: ex.buildMode, model: modelFor(card) || null, merged };
 
   try {
     fs.mkdirSync(runDir, { recursive: true });
@@ -2880,17 +3011,25 @@ const modelFor = (owner) => (owner && typeof owner.model === "string" && owner.m
 const BUILD_MODES = ["inline", "hybrid", "fanout"];
 const BUILD_MODE_DEFAULT = BUILD_MODES.includes((process.env.GRACE_BUILD_MODE || "").trim()) ? process.env.GRACE_BUILD_MODE.trim() : "inline";
 // NB: `plan.mode` is the AUTONOMY of a run (ask|auto) and predates this — hence `buildMode`.
-const buildModeFor = (card) => (card && BUILD_MODES.includes(card.buildMode)) ? card.buildMode : BUILD_MODE_DEFAULT;
+// A5.1: режим больше не покарточная ручка — его (и КОДЕРА, которому уйдёт код) даёт таблица типов.
+const buildModeFor = (card) => execFor(card).buildMode;
 function buildModeBlock(card, branch) {
-  const mode = buildModeFor(card);
+  const ex = execFor(card);
+  const mode = ex.buildMode;
   if (mode === "inline") return "";
   return [
-    `РЕЖИМ СБОРКИ «${mode}»: декомпозированные карточки отдавай субагенту gfd-coder (свежий контекст), сам`,
+    `РЕЖИМ СБОРКИ «${mode}»: декомпозированные карточки отдавай субагенту ${ex.coder} (свежий контекст), сам`,
     `не пиши их код. ЖЁСТКОЕ ОГРАНИЧЕНИЕ ПАРАЛЛЕЛИЗМА: рабочее дерево проекта ОДНО и общее — спавни`,
     `СТРОГО ОДНОГО кодера за раз и дожидайся его возврата, прежде чем брать следующую карточку. НИКОГДА не`,
     `переключай ветку рабочего каталога (никаких "git checkout main"/"switch") — работай только в "${branch}".`,
     `Кодеру передавай ТОЛЬКО файлы из его card.files[]; пересечение файлов между одновременными карточками`,
     `запрещено (инвариант §2.2 скилла).`,
+    // A5.2: кодер экрана — не тот же агент под другим именем: у него своя модель и свой скилл.
+    // Без этой строки главный тред «оптимизирует» подмену на привычного gfd-coder.
+    ...(ex.coder === "gfd-coder" ? [] : [
+      `КОДЕР ЭТОЙ КАРТОЧКИ — ИМЕННО «${ex.coder}» (тип карточки «${CARD_TYPE_RU[ex.type] || ex.type}»): у него своя`,
+      `модель и подключённый скилл frontend-design. НЕ подменяй его на gfd-coder и не пиши экран сам.`,
+    ]),
   ].join("\n");
 }
 // endregion FUNC_buildMode
@@ -3267,7 +3406,10 @@ function spawnTailCard(board, parent, opts) {
     theme,
     description: String(opts.description || "").slice(0, MAX_DESC),
     designLink: null, requirementsLink: parent.requirementsLink || null, requirements: null,
-    attachments: [], rigor: opts.rigor || parent.rigor || "off",
+    attachments: [],
+    // A5.1: тип задаёт создатель хвоста (карточки починки — `fix`), иначе он наследуется от
+    // родителя. Строгость из типа, поле `rigor` на новой карточке не заводится.
+    type: CARD_TYPES.includes(opts.type) ? opts.type : cardType(parent),
     column: "backlog", createdAt: now, dispatchedAt: null,
     history: [{ column: "backlog", ts: now }],
     spawnedFrom: parent.id || null,
@@ -3283,6 +3425,12 @@ function spawnTailCard(board, parent, opts) {
     acceptance: Array.isArray(opts.acceptance) ? opts.acceptance.slice(0, MAX_ACCEPTANCE) : [],
     planId: null, dependsOn: [], autonomy: null,
   };
+  // Родитель БЕЗ типа — карточка старого образца: её явная строгость едет с хвостом, иначе
+  // хвост «починки» уехал бы с grace-разметкой там, где родитель работал без неё (A5.1).
+  if (!CARD_TYPES.includes(opts.type) && !cardTyped(parent) && RIGORS.includes(parent.rigor)) {
+    card.type = null;
+    card.rigor = parent.rigor;
+  }
   board.cards.push(card);
   return card;
 }
@@ -3344,13 +3492,20 @@ function runLogBytes(card) {
     return Math.max(0, size - (known ? (card.runLogFrom || 0) : 0));
   } catch { return 0; }
 }
-// Порог: константа доски, которую прогон может переопределить. `plan.loopBudget` кладётся при
-// сборке прогона (POST /api/plans) — покарточного уровня нет и не будет (см. @invariants).
+// Порог: база доски → множитель типа карточки (A5.1) → override прогона. Побеждает override:
+// человек, который написал `--loops 5` на конкретный прогон, знает про него больше таблицы.
+// `plan.loopBudget` кладётся при сборке прогона (POST /api/plans) — покарточного уровня нет.
 function loopBudgetFor(board, card) {
   const plan = card.planId ? planById(board, card.planId) : null;
   const over = (plan && plan.loopBudget && typeof plan.loopBudget === "object") ? plan.loopBudget : {};
   const num = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : d);
-  return { loops: num(over.loops, LOOP_MAX_DEFAULT), logMB: num(over.logMB, LOG_MAX_MB_DEFAULT) };
+  const ex = execFor(card);
+  // Возвраты — счётный сигнал: пол в 1 обязателен, иначе множитель 0.5 превратил бы порог в 0
+  // и предохранитель бил бы по карточке, которая ещё ничего не сделала.
+  const base = { loops: Math.max(1, Math.round(LOOP_MAX_DEFAULT * ex.budget)),
+    logMB: Math.round(LOG_MAX_MB_DEFAULT * ex.budget * 100) / 100 };
+  return { loops: num(over.loops, base.loops), logMB: num(over.logMB, base.logMB),
+    type: ex.type, mult: ex.budget };
 }
 // Сводка для классификатора: сигналы + какие пороги пробиты. `minutes` и `deathsInWindow` в
 // пороги не входят — они контекст, по которому страж отличает цикл от зависшего окружения.
@@ -3708,7 +3863,7 @@ function quotaResumeTick(board, now) {
     // wait for the next tick rather than starting two runs in the same working copy.
     if (hasActiveForProject(board, card.project, card.id)) continue;
     const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);
-    const rigor = (card.rigor && card.rigor !== "auto") ? card.rigor : "off";
+    const rigor = execFor(card).rigor;                          // A5.1: строгость даёт тип карточки
     const recovery = [
       `RECOVERY-КОНТЕКСТ (пауза по лимиту подписки): ПРЕДЫДУЩИЙ прогон был убит лимитом Claude на станции`,
       `«${card.column}» — это НЕ дефект кода и НЕ причина что-то переделывать. Лимит сброшен, продолжай работу.`,
@@ -3875,7 +4030,7 @@ function syncFromPipeline() {
     // build against the same working tree. If it dies, the guard falls away and the ordinary
     // recovery below/here takes over from the furthest recorded point.
     if (pip && card.column === "asking" && !card.buildLaunched && !(card.askBuildMerged && isAlive(card.runPid))) {
-      const rigor = pip.rigor || (card.rigor && card.rigor !== "auto" ? card.rigor : "off");
+      const rigor = RIGORS.includes(pip.rigor) ? pip.rigor : execFor(card).rigor;   // посев рана → тип карточки
       const archEmpty = !Array.isArray(pip.archQuestions) || pip.archQuestions.length === 0;
       if (pip.askStage === "done" && archEmpty) {
         // architecture gate passed, no forks → launch the full build (exactly once)
@@ -3984,7 +4139,7 @@ function syncFromPipeline() {
             `дальнего ЗЕЛЁНОГО чекпоинта: "git log --oneline" в ветке "${branchFor(card)}" → коммиты`,
             `"green(<cardId>): …"; при необходимости "git restore --source=<sha> -- <файл>". Фичу заново НЕ начинай.`,
           ].join("\n");
-          const rigor = (card.rigor && card.rigor !== "auto") ? card.rigor : "off";
+          const rigor = execFor(card).rigor;                          // A5.1: строгость даёт тип карточки
           const { target, launch, kind } = resumeRun(card, projectDir, runDir, rigor, recovery);
           if (launch && launch.launched) {
             card.autoHealCount = (card.autoHealCount || 0) + 1;
@@ -4381,32 +4536,42 @@ async function handleApi(req, res, urlPath) {
     if (!isInsideRoot(resolveProjectDir(project))) {
       return sendJSON(res, 400, { error: `project must resolve inside ${PROJECTS_ROOT}` });
     }
+    // A5.1: тип — единственная ручка исполнения. Неизвестное значение — ошибка, а не тихий
+    // откат к умолчанию: «--type sreen» иначе уехал бы бэкендом и никто бы не заметил.
+    if (b.type !== undefined && b.type !== null && b.type !== "" && !CARD_TYPES.includes(b.type)) {
+      return sendJSON(res, 400, { error: `unknown type "${b.type}" — есть: ${CARD_TYPES.join(", ")}` });
+    }
     const board = readBoard();
     const id = crypto.randomUUID();
+    // A5.3: ссылки на макеты и требования — это ИСТОЧНИКИ, а не два отдельных поля. Старые
+    // карточки свои поля сохраняют (читаются как раньше), новые кладут ссылку в sources[].
+    const linkSources = [];
+    const dl = String(b.designLink || "").trim(), rl = String(b.requirementsLink || "").trim();
+    if (dl) linkSources.push(`Макеты: ${dl}`);
+    if (rl) linkSources.push(`Требования: ${rl}`);
+    const brief = normalizeBrief(b);
+    if (linkSources.length) brief.sources = toLines(uniqStr([...(brief.sources || []), ...linkSources]), MAX_SOURCES, MAX_SOURCE_LEN);
     const card = {
       id, project,
       slug: slugify(theme, "task-" + id.slice(0, 8)),
       theme,
       description: String(b.description || "").trim().slice(0, MAX_DESC) || null,
-      designLink: String(b.designLink || "").trim() || null,
-      requirementsLink: String(b.requirementsLink || "").trim() || null,
-      requirements: String(b.requirements || "").trim() || null,
+      // A5.1 · ЕДИНСТВЕННАЯ ручка исполнения. Строгость, режим сборки, кодер и порог
+      // предохранителя доска берёт из таблицы типов в момент диспатча (FUNC_cardType).
+      // Покарточных rigor/model/buildMode/autonomy новая карточка не несёт: их принимал
+      // только этот путь, и выставлял их тот, кто нарезал, — то есть никто осознанно.
+      type: CARD_TYPES.includes(b.type) ? b.type : TYPE_DEFAULT,
       attachments: [],
-      rigor: RIGORS.includes(b.rigor) ? b.rigor : "off",
       // Plan Run scaffold (additive; null/[] = single card = today's behaviour, §1).
-      // The integration branch / final-PR mechanics land with the Plan entity (S4);
-      // here the fields are just carried so a card can belong to a plan and declare its
-      // dependency edges + write-footprint. Empty → no DAG gating → immediate dispatch.
+      // A5.3: `dependsOn` заполняет ТОЛЬКО сборка прогона (`gb run --stage ID:dep`) — ребро
+      // DAG между карточками, которых ещё нет в одном плане, ничего не значит и не гейтит.
       planId: (typeof b.planId === "string" && b.planId.trim()) ? b.planId.trim() : null,
-      dependsOn: Array.isArray(b.dependsOn) ? b.dependsOn.filter((x) => typeof x === "string") : [],
+      dependsOn: [],
       files: Array.isArray(b.files) ? b.files.filter((x) => typeof x === "string") : [],
-      autonomy: AUTONOMIES.includes(b.autonomy) ? b.autonomy : null,   // S3: null = inherit the global default (§5.3)
-      // B3′/B7: per-card pins. null = inherit the run's, then the board's env default.
-      model: (typeof b.model === "string" && b.model.trim()) ? b.model.trim() : null,
-      buildMode: BUILD_MODES.includes(b.buildMode) ? b.buildMode : null,
+      autonomy: null,   // A5.3: производная — дефолт доски `auto`/`ask`, `ask` ставит только нарезка
       // S3 · statement of work (§4.1). Defaults = today's card: origin "human" → no checks.
       outOfScope: null, acceptance: [], contract: null, sources: [], origin: "human", draft: false,
-      ...normalizeBrief(b),
+      ...brief,
       column: "backlog",
       createdAt: new Date().toISOString(),
       dispatchedAt: null,
@@ -4463,7 +4628,7 @@ async function handleApi(req, res, urlPath) {
     const pf = path.join(runDir, "board.json");
     let pip = {};
     try { pip = JSON.parse(fs.readFileSync(pf, "utf8")); } catch {}
-    const rigor = pip.rigor || (card.rigor && card.rigor !== "auto" ? card.rigor : "off");
+    const rigor = RIGORS.includes(pip.rigor) ? pip.rigor : execFor(card).rigor;   // посев рана → тип карточки
     let launch;
 
     if (stage === "functional") {
@@ -4728,7 +4893,7 @@ async function handleApi(req, res, urlPath) {
     if (!isInsideRoot(projectDir)) return sendJSON(res, 400, { error: "project resolves outside the projects root" });
     const runDir = path.join(projectDir, ".grace-feature-dev", card.slug);
     try { fs.mkdirSync(runDir, { recursive: true }); } catch {}
-    const rigor = (card.rigor && card.rigor !== "auto") ? card.rigor : "off";
+    const rigor = execFor(card).rigor;                          // A5.1: строгость даёт тип карточки
     // Resume from the furthest-reached point (shared with the watchdog auto-heal).
     const { target, launch, kind } = resumeRun(card, projectDir, runDir, rigor);
     card.column = target;
@@ -4791,16 +4956,25 @@ async function handleApi(req, res, urlPath) {
     if (card.column !== "backlog" || card.dispatchedAt) {
       return sendJSON(res, 409, { error: "only a Backlog task can be edited" });
     }
+    // A5.1/A5.3: правится тип, ручки исполнения — нет. Ссылки на макеты/требования дописываются
+    // в sources[] (старое поле карточки, если оно есть, не трогаем — оно и так читается).
+    if (b.type !== undefined && b.type !== null && b.type !== "" && !CARD_TYPES.includes(b.type)) {
+      return sendJSON(res, 400, { error: `unknown type "${b.type}" — есть: ${CARD_TYPES.join(", ")}` });
+    }
     if (b.theme !== undefined) card.theme = String(b.theme).trim() || card.theme;
     if (b.description !== undefined) card.description = String(b.description).trim().slice(0, MAX_DESC) || null;
-    if (b.designLink !== undefined) card.designLink = String(b.designLink).trim() || null;
-    if (b.requirementsLink !== undefined) card.requirementsLink = String(b.requirementsLink).trim() || null;
-    if (b.rigor !== undefined && RIGORS.includes(b.rigor)) card.rigor = b.rigor;
-    if (b.model !== undefined) card.model = (typeof b.model === "string" && b.model.trim()) ? b.model.trim() : null;
-    if (b.buildMode !== undefined) card.buildMode = BUILD_MODES.includes(b.buildMode) ? b.buildMode : null;
-    if (b.autonomy !== undefined) card.autonomy = AUTONOMIES.includes(b.autonomy) ? b.autonomy : null; // null = inherit global (§5.3)
+    if (CARD_TYPES.includes(b.type)) { card.type = b.type; }
     if (Array.isArray(b.files)) card.files = b.files.filter((x) => typeof x === "string");
-    Object.assign(card, normalizeBrief(b, card));   // S3 §4.1 — incl. clearing the draft flag
+    const patchBrief = normalizeBrief(b, card);
+    const patchLinks = [];
+    const pdl = b.designLink === undefined ? "" : String(b.designLink).trim();
+    const prl = b.requirementsLink === undefined ? "" : String(b.requirementsLink).trim();
+    if (pdl) patchLinks.push(`Макеты: ${pdl}`);
+    if (prl) patchLinks.push(`Требования: ${prl}`);
+    if (patchLinks.length) patchBrief.sources = toLines(uniqStr([
+      ...(patchBrief.sources !== undefined ? patchBrief.sources : (card.sources || [])), ...patchLinks,
+    ]), MAX_SOURCES, MAX_SOURCE_LEN);
+    Object.assign(card, patchBrief);   // S3 §4.1 — incl. clearing the draft flag
     writeBoard(board);
     return sendJSON(res, 200, { card, blocked: dispatchBlock(card) });
   }

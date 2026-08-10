@@ -128,6 +128,13 @@ body{
 /* S6 · ожидание по лимиту — амбер «ждём часы», а не красный «сломалось» */
 .tag--quota{border-color:rgba(230,161,30,.5);background:rgba(230,161,30,.12);color:#8a5e08;font-weight:600}
 .tag--warden{border-color:rgba(20,155,139,.45);background:rgba(20,155,139,.10);color:#0e6f64}
+/* A5.1 · тип карточки — единственная ручка исполнения. Тон различает ЧЕТЫРЕ рода работы, а не
+   пять цветов ради пяти: экран заметен (у него другой кодер), починка приглушена (она вторична). */
+.tag--type{font-weight:600;border-color:var(--line-2);background:var(--surface-2);color:var(--ink)}
+.tag--type-screen{border-color:rgba(139,83,224,.4);background:rgba(139,83,224,.08);color:#6a3fc0}
+.tag--type-integration{border-color:rgba(20,155,139,.45);background:rgba(20,155,139,.10);color:#0e6f64}
+.tag--type-foundation{border-color:rgba(47,115,194,.4);background:rgba(47,115,194,.08);color:#255a97}
+.tag--type-fix{border-color:var(--line-2);background:var(--surface);color:var(--ink-faint)}
 /* S3 · statement of work (§4): who authored the card · unreviewed tail held as a draft */
 .tag--origin{border-style:dashed;color:var(--ink-faint)}
 .tag--draft{border-color:rgba(107,116,128,.5);background:repeating-linear-gradient(135deg,var(--surface-2),var(--surface-2) 5px,var(--well) 5px,var(--well) 10px);color:var(--s-backlog)}
@@ -194,6 +201,9 @@ body{
 .seg{display:inline-flex;background:var(--surface);border:1px solid var(--line-2);border-radius:9px;padding:3px;gap:3px}
 .seg__opt{font-family:var(--sans);font-size:13px;font-weight:600;color:var(--ink-soft);background:none;border:none;border-radius:6px;padding:7px 14px;cursor:pointer}
 .seg__opt.is-on{color:#fff;background:var(--ember)}
+/* A5.1 · пять типов не влезают в строку узкого листа — сегмент переносится, а не режется */
+.seg--type{flex-wrap:wrap;max-width:100%}
+.seg--type .seg__opt{font-size:12.5px;padding:6px 11px}
 .dropzone{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;border:1.5px dashed var(--line-2);
   border-radius:11px;padding:18px;cursor:pointer;color:var(--ink-faint);text-align:center;transition:border-color .15s ease,background .15s ease;background:var(--surface)}
 .dropzone:hover,.dropzone.is-over{border-color:var(--ember);background:rgba(216,91,34,.05);color:var(--ink-soft)}
