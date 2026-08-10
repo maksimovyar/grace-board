@@ -12,6 +12,14 @@ data/
 # The committed halves are .grace/project.md and .grace/local.example.md.
 .grace/local.md
 
+# внутренние документы и данные, которые не публикуются (репозиторий публичный):
+# отчёты и промты содержат имена клиентских проектов, стоимости прогонов и пути машины,
+# мокапы board-v4-* несут вшитый снимок БОЕВОЙ доски (реальные карточки клиента),
+# settings.json — помашинные разрешения с абсолютными путями и pid.
+docs/
+.claude/settings.json
+design/board-v4-*.html
+
 # OS / editor cruft
 .DS_Store
 
