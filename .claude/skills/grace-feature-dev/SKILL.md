@@ -1,4 +1,5 @@
 ---
+version: 2026.08.10
 name: grace-feature-dev
 description: Canonical board + phase + markup spec for the grace-feature-dev pipeline. Load when the /grace-feature-dev command (or its agents) needs the board.json schema, the kanban lifecycle (how a card moves through build phases), the run-level phase state machine, the GRACE semantic-exoskeleton markup template, the LDD log format, or the Anti-Loop signature rule. This file is the single source of truth for those formats.
 ---
@@ -347,21 +348,27 @@ journal tail to confirm the last in-flight action.
 These govern how the orchestrator spawns the Review/Verify phases — they are part
 of the contract, not left to per-run judgement.
 
-- **Verify** (gfd-verifier, once per card): runs against the **clean snapshot
-  worktree** (§2.1), never the dirty working tree. Its first gate is the run's
-  **`board.verifyGate`** — a reproduced strict build/test command (e.g.
-  `npx tsc --noEmit && <test-runner> && <build>`), resolved per project stack at
-  Decompose. A **non-zero exit = Verify failure** (card → `implementing`, not
-  `done`): "green" is a reproduced gate, never the agent's self-attestation. Only
-  after the gate passes does it consume the card's `test_guide-<cardId>.md` (§2.6),
-  run the Diagnostic Trio (Logs/Code/Data), perform Semantic Trace Verification, then
-  a Chain-of-Verification self-check before emitting the verdict.
-- **Review** (gfd-reviewer, 1–3 in parallel per card, after tests are green):
-  - When `rigor != off` AND `mode != inline`, **one reviewer is always assigned the
-    Conventions / GRACE-markup focus** — it is not optional in the focus lottery.
-    Protocol/markup adherence is the highest-priority axis because the artifacts are
-    written for other agents (swarm navigation, RAG) before humans.
-  - Semantic-exoskeleton violations (missing/!malformed MODULE_CONTRACT, FUNCTION_CONTRACT,
-    GREP_SUMMARY, STRUCTURE; abbreviations/`...`/`pass` placeholders) are **Critical**.
-  - In `inline` mode the main thread reviews; the same checklist applies but the
-    dedicated markup reviewer is not separately spawned.
+- **Verify** — two steps, and the cheap one goes first (С1). The run's
+  **`board.verifyGate`** (a reproduced strict build/test command, e.g.
+  `npx tsc --noEmit && <test-runner> && <build>`, resolved per project stack at
+  Decompose) is run **by the orchestrator itself**, in Bash, output tailed. A
+  **non-zero exit = Verify failure**: the card goes back to `implementing` with the
+  log tail, and **gfd-verifier is not spawned at all** — a verdict on "did it
+  compile" is an exit code, not a judgement, and a verifier session on a known-red
+  pass is ~50k tokens of start context bought for nothing. Only on a green gate is
+  **gfd-verifier** spawned (read-only, against the **clean snapshot worktree** of
+  §2.1, never the dirty tree): it consumes the card's `test_guide-<cardId>.md`
+  (§2.6), runs the Diagnostic Trio (Logs/Code/Data), performs Semantic Trace
+  Verification, then a Chain-of-Verification self-check before the verdict.
+  "Green" is a reproduced gate, never the agent's self-attestation.
+- **Review** (gfd-reviewer, 1–2 in parallel per card, after tests are green):
+  - Semantic-exoskeleton presence (`MODULE_CONTRACT`, `GREP_SUMMARY:`, `STRUCTURE:`,
+    function navigation, `[IMP:9]` in the log) is checked by the **linter**
+    (`scripts/grace-lint.mjs`), run before the reviewers — it is grep, not judgement.
+    Violations go straight back to the coder. **No reviewer is assigned a markup
+    focus any more** (С2): that focus was mandatory on every grace card and spent a
+    whole session per card on what a script answers for free.
+  - Reviewers keep the axes that need judgement: **simplicity/DRY** and
+    **bugs/correctness**. Placeholder code (`...`/`pass`/stub returns) stays a
+    reviewer's Critical — a linter cannot tell a placeholder from a valid ellipsis.
+  - In `inline` mode the main thread reviews; the same checklist applies.

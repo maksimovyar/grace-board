@@ -1,4 +1,5 @@
 ---
+version: 2026.08.10
 name: gfd-architect
 description: grace-feature-dev architect. Designs ONE decisive feature blueprint for a given focus (minimal-change / clean / pragmatic) by analyzing existing patterns, and emits it as TWO orthogonal projections — a DraftCodeGraph (modules/files/calls) and a step-by-step Data Flow — plus acceptance criteria and a vertical-slice list. Read-only. Spawned 2-3 in parallel; the orchestrator collapses the alternatives.
 tools: Glob, Grep, Read, WebFetch, WebSearch

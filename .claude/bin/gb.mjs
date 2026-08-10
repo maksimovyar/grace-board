@@ -8,7 +8,10 @@
 //            [--design-link URL] [--req-link URL] [--requirements "..."]
 //            [--origin human|skill|agent] [--out-of-scope "..." | --out-of-scope-file PATH]
 //            [--contract "..." | --contract-file PATH | --contract TBD]
-//            [--acceptance "пункт" ...] [--source "источник" ...] [--file path/to/x.ts ...]
+//            [--acceptance "сквозной пункт" ...] [--acceptance-card "пункт карточки" ...]
+//            [--source "источник" ...] [--file path/to/x.ts ...]
+//       --acceptance      — сквозной критерий: проверяет ПРИЁМКА всего прогона (умолчание, как было)
+//       --acceptance-card — покарточный: проверяет верификатор карточки, в приёмку не идёт (С4)
 //       desc opts (pick one): --desc "text" | --desc-file PATH | --desc-stdin
 //       origin skill/agent ⇒ the board REQUIRES out-of-scope + acceptance + sources + contract
 //       (design §4.2) and refuses to dispatch the card otherwise.
@@ -44,7 +47,7 @@ function die(msg) { console.error("gb: " + msg); process.exit(1); }
 // Minimal flag parser. Repeatable flags (--card, --stage) collect into arrays.
 function parseArgs(argv) {
   const out = { _: [] };
-  const multi = new Set(["--card", "--stage", "--acceptance", "--source", "--file", "--decision", "--answer"]);
+  const multi = new Set(["--card", "--stage", "--acceptance", "--acceptance-card", "--source", "--file", "--decision", "--answer"]);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith("--")) {
@@ -131,7 +134,12 @@ async function cmdCard(args) {
   if (oos !== undefined) payload.outOfScope = oos;
   const contract = args["--contract-file"] ? fs.readFileSync(args["--contract-file"], "utf8") : args["--contract"];
   if (contract !== undefined) payload.contract = contract;
-  if (args["--acceptance"]) payload.acceptance = args["--acceptance"];
+  // A3.3 · С4: критерий уровня `card` проверяет верификатор карточки, уровня `run` — приёмка
+  // всего прогона. `--acceptance` остаётся сквозным (уровень run) СОЗНАТЕЛЬНО: так вели себя все
+  // уже заведённые карточки, и менять их смысл задним числом нельзя. Новое — `--acceptance-card`.
+  const accRun = (args["--acceptance"] || []).map((t) => ({ text: t, level: "run" }));
+  const accCard = (args["--acceptance-card"] || []).map((t) => ({ text: t, level: "card" }));
+  if (accRun.length || accCard.length) payload.acceptance = [...accCard, ...accRun];
   if (args["--source"]) payload.sources = args["--source"];
   if (args["--file"]) payload.files = args["--file"];
   const { card } = await api("POST", "/api/tasks", payload);
@@ -151,7 +159,17 @@ async function cmdPreflight(args) {
   const project = args["--project"] || die("--project is required");
   const cardIds = args["--card"] || die("at least one --card ID is required");
   const r = await api("POST", "/api/plans/preflight", { project, cardIds });
-  console.log(JSON.stringify(r, null, 2));
+  if (args["--json"]) return void console.log(JSON.stringify(r, null, 2));
+  // A3.5: блокер stale-skill теряется в сыром JSON ровно тогда, когда он важен. Печатаем
+  // читаемо, а полный ответ оставляем под --json.
+  for (const b of r.blockers || []) {
+    console.log(`БЛОКЕР ${b.id}: ${b.q}`);
+    for (const s of b.stale || []) console.log(`   · ${s.what}: ${s.path}${s.version ? ` (${s.version} против ${s.refVersion})` : ""}`);
+    for (const o of b.options || []) console.log(`   → ${o.title}${o.recommended ? "  ←рекомендовано" : ""}`);
+  }
+  for (const f of r.floor || []) console.log(`ЖЁСТКИЙ ПОЛ [${f.class}]: ${f.detail} (этап ${f.stage})`);
+  if (!(r.blockers || []).length && !(r.floor || []).length) console.log("префлайт чист: блокеров и жёсткого пола нет");
+  if ((r.blockers || []).length) process.exitCode = 3;
 }
 
 async function cmdRun(args) {

@@ -237,6 +237,9 @@ body{
 .brief__label{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--ink-faint);margin-bottom:3px}
 .brief__body{font-size:13px;line-height:1.55;color:var(--ink-soft);white-space:pre-wrap}
 .brief__items{margin:0;padding-left:17px;font-size:13px;line-height:1.55;color:var(--ink-soft)}
+/* A3.3 · кто проверяет этот критерий: верификатор карточки или приёмка прогона */
+.brief__lvl{font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--ink-faint);border:1px solid var(--line-2);border-radius:5px;padding:1px 5px;margin-left:7px;white-space:nowrap}
 .brief__tbd{font-family:var(--mono);font-size:11.5px;color:var(--s-asking)}
 .brief__done{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--s-ready);margin-top:6px}
 

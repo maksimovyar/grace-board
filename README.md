@@ -155,6 +155,44 @@ over it. See [`.env.example`](.env.example).
 - **Ready for deploy** — terminal: all gates green.
 - **Blocked** — a side state for cards that need you (run died/stalled twice, anti-loop tripped).
 
+**Two of these stations no longer pay a model to answer a yes/no question.** Before
+Verifying, the orchestrator runs the card's `verifyGate` itself, in Bash — a red gate
+sends the card back to Implementing with the log tail and **never spawns the verifier**
+(a verifier session on a known-red pass is ~50k tokens of start context bought for
+nothing, and known-red passes are exactly the loops that cost the most). Before
+Reviewing, [`scripts/grace-lint.mjs`](scripts/grace-lint.mjs) greps the card's files for
+the GRACE skeleton (`MODULE_CONTRACT`, `GREP_SUMMARY:`, `STRUCTURE:`, function
+navigation, `[IMP:9]` in the log); violations go straight back to the coder. That
+retires the mandatory "Conventions / GRACE markup" reviewer, which used to be assigned
+to **every** grace card. Reviewers keep what needs judgement: simplicity/DRY and
+bugs/correctness.
+
+### Acceptance criteria have two levels
+
+A card's `acceptance` entry is either a plain string or `{text, level}` where level is
+`card` or `run`:
+
+- **`card`** — the card's own verifier checks it, and it stops there;
+- **`run`** — cross-cutting, only visible once the stages are integrated: the run's
+  acceptance checks it.
+
+An **unmarked** entry reads as `run`, so every card written before this behaves exactly
+as it did. Previously the run's acceptance re-ran *every* stage's criteria — an exam
+each verifier had already passed, at $2.3–5.4 and 45–87 model calls per run.
+`gb card --acceptance-card "…"` marks the card level; `--acceptance "…"` stays the
+cross-cutting one.
+
+### Stale project copies of the pipeline
+
+Lean runs read the **project's** copies of the skill, the `gfd-*` agents and the
+command — so a copy that drifted silently changes how every run in that project
+behaves. This series already had that incident: an old skill overrode the command and
+31 runs went by without a single coder. Each pipeline file now carries `version:` in
+its frontmatter, `gb preflight` compares the project's copy against this repo's and
+raises a **`stale-skill`** blocker, and `scripts/prepare-project.sh` reports drifted
+copies loudly (`GRACE_FORCE=1` replaces them with symlinks). A project that has no
+copies of its own is not stale — it simply runs non-lean.
+
 ## Creating tasks
 
 **+ New task** opens a composer with: **Project** (folder under your projects root,

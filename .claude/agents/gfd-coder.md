@@ -1,4 +1,5 @@
 ---
+version: 2026.08.10
 name: gfd-coder
 description: grace-feature-dev implementer for fanout/hybrid mode. Implements ONE board card (a feature slice) in fresh context — code + tests — applying GRACE markup per the run's rigor, LDD logs, and BUG_FIX_CONTEXT scars. Touches only the card's files[]. Returns a structured result. Used only when the orchestrator scales out; in inline mode the main thread codes instead.
 tools: Read, Grep, Glob, Edit, Write, Bash

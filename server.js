@@ -387,13 +387,48 @@ function toLines(v, maxItems, maxLen) {
   return arr.map((x) => String(x).replace(/^\s*[-•*]\s*/, "").trim()).filter(Boolean)
     .slice(0, maxItems).map((x) => x.slice(0, maxLen));
 }
+// A3.3 · С4 — два уровня критериев приёмки.
+// ## @purpose Приёмка прогона собирала acceptance[] ВСЕХ этапов и пересдавала экзамен за
+// ##   верификаторов: каждый критерий уже проверен покарточно, а приёмка платила за повтор
+// ##   ($2.3–5.4 и 45–87 обращений на прогон). Но часть критериев покарточно проверить и
+// ##   нельзя — они появляются только на интеграции. Значит, уровня два, и различать их
+// ##   должна нарезка, а не приёмка постфактум.
+// ## @invariants
+// ## - `card` — проверяет верификатор карточки. `run` — сквозной, проверяет только приёмка.
+// ## - НЕПОМЕЧЕННЫЙ критерий = `run`. Это не умолчание «по вкусу», а обратная совместимость:
+// ##   старые планы и старые карточки обязаны вести себя ровно как раньше (всё в приёмку).
+// ## - Хранится как было — массивом; элемент либо строка (старая форма), либо {text, level}.
+// ##   Отдельного поля-параллели нет сознательно: два места про один критерий разъедутся.
+// GREP_SUMMARY: A3.3, С4, acceptance level, card run, приёмка не пересдаёт, обратная совместимость
+const ACCEPT_LEVELS = ["card", "run"];
+const acceptLevel = (v) => (ACCEPT_LEVELS.includes(v) ? v : "run");
+function toAcceptance(v) {
+  const arr = Array.isArray(v) ? v : (typeof v === "string" ? v.split("\n") : []);
+  return arr.map((x) => {
+    if (x && typeof x === "object") {
+      const text = String(x.text || "").replace(/^\s*[-•*]\s*/, "").trim().slice(0, MAX_ACCEPTANCE_LEN);
+      return text ? { text, level: acceptLevel(x.level) } : null;
+    }
+    const text = String(x).replace(/^\s*[-•*]\s*/, "").trim().slice(0, MAX_ACCEPTANCE_LEN);
+    return text ? text : null;      // строку оставляем строкой — форма старых карточек не меняется
+  }).filter(Boolean).slice(0, MAX_ACCEPTANCE);
+}
+// Единственная точка чтения критериев. Всё остальное — промпты, приёмка, UI — ходит сюда,
+// чтобы форма хранения (строка или объект) никого больше не касалась.
+function acceptanceItems(card) {
+  return (Array.isArray(card && card.acceptance) ? card.acceptance : []).map((a) =>
+    (a && typeof a === "object")
+      ? { text: String(a.text || ""), level: acceptLevel(a.level) }
+      : { text: String(a), level: "run" }).filter((x) => x.text);
+}
+
 // Coerce the statement-of-work half of a create/edit body. `base` supplies the current values
 // so PATCH can send a subset. Returns only the keys present in the body (undefined = untouched).
 function normalizeBrief(b, base) {
   const out = {};
   if (b.outOfScope !== undefined) out.outOfScope = String(b.outOfScope).trim().slice(0, MAX_DESC) || null;
   if (b.contract !== undefined) out.contract = String(b.contract).trim().slice(0, MAX_DESC) || null;
-  if (b.acceptance !== undefined) out.acceptance = toLines(b.acceptance, MAX_ACCEPTANCE, MAX_ACCEPTANCE_LEN);
+  if (b.acceptance !== undefined) out.acceptance = toAcceptance(b.acceptance);
   if (b.sources !== undefined) out.sources = toLines(b.sources, MAX_SOURCES, MAX_SOURCE_LEN);
   if (b.origin !== undefined) out.origin = ORIGINS.includes(b.origin) ? b.origin : (base ? cardOrigin(base) : "human");
   if (b.draft !== undefined) out.draft = !!b.draft;
@@ -436,10 +471,22 @@ function briefBlock(card) {
   if (String(card.outOfScope || "").trim()) out.push(
     `НЕ ВХОДИТ В ОБЪЁМ — ЭТО УЖЕ РЕШЕНО НА ЭТАПЕ ПОСТАНОВКИ. НЕ спрашивай про это, НЕ делай это,`,
     `НЕ выноси это в deferred как «обнаруженное»:`, card.outOfScope, ``);
-  if (Array.isArray(card.acceptance) && card.acceptance.length) out.push(
-    `ПРИЁМКА (Definition of Done карточки — каждый пункт обязан иметь прогоняемую проверку;`,
-    `из этих же пунктов собирается приёмка всего прогона):`,
-    ...card.acceptance.map((a, i) => `${i + 1}) ${a}`), ``);
+  // A3.3: два уровня и разные хозяева. Верификатор карточки обязан закрыть `card`-критерии
+  // здесь и сейчас; `run`-критерии он проверить не может (они появляются только на интеграции),
+  // и требовать этого от него — значит получить «проверено» без проверки.
+  const acc = acceptanceItems(card);
+  const accCard = acc.filter((a) => a.level === "card");
+  const accRun = acc.filter((a) => a.level === "run");
+  if (accCard.length) out.push(
+    `ПРИЁМКА КАРТОЧКИ (Definition of Done — ЭТО проверяет верификатор этой карточки, каждый пункт`,
+    `обязан иметь прогоняемую проверку):`,
+    ...accCard.map((a, i) => `${i + 1}) ${a.text}`), ``);
+  if (accRun.length) out.push(
+    accCard.length
+      ? `СКВОЗНЫЕ КРИТЕРИИ ПРОГОНА (проверяет приёмка ВСЕГО прогона на собранной ветке, не ты):`
+      : `ПРИЁМКА (Definition of Done карточки — каждый пункт обязан иметь прогоняемую проверку;\nиз этих же пунктов собирается приёмка всего прогона):`,
+    ...accRun.map((a, i) => `${i + 1}) ${a.text}`),
+    accCard.length ? `Не ломай их и не считай их своей зоной — но и не отчитывайся за них.` : ``, ``);
   const contract = String(card.contract || "").trim();
   if (contract && /^tbd$/i.test(contract)) out.push(
     `КОНТРАКТ ДАННЫХ: TBD — его проектируешь ТЫ в этой карточке (это и есть часть задачи).`,
@@ -1091,6 +1138,62 @@ function planStatus(board, plan) {
 const planView = (board, plan) => ({ ...plan, status: planStatus(board, plan), release: planRelease(plan),
   result: { releaseManifest: planReleaseManifest(board, plan.id), ...(plan.result || {}) } });
 
+// region FUNC_staleSkill — проектная копия конвейера разъехалась с эталоном (A3.5 · Д4)
+// ## @purpose Lean-режим читает ПРОЕКТНЫЕ копии скилла, агентов и команды. По машине лежат
+// ##   копии от июня–июля, и дрейф попроектный и невидимый: инцидент этой серии уже был —
+// ##   устаревшая копия скилла перебила команду, и 31 прогон прошёл без единого кодера.
+// ##   Любая оптимизация промптов тихо не доезжает до части проектов, пока этого гейта нет.
+// ## @io (projectDir) -> [{what, path, version, refVersion, state}] · пусто = расхождений нет
+// ## @invariants
+// ## - Проект БЕЗ своих копий — не устаревший, а неподготовленный: он и так поедет нетощим
+// ##   (leanFlags), и блокировать его нечем. Сравниваем только то, что у проекта своё.
+// ## - Симлинк в эталон свежий ПО ПОСТРОЕНИЮ (так кладёт prepare-project.sh) — не сравниваем.
+// ## - Сравнение по `version:` во frontmatter, а при её отсутствии — по хешу содержимого:
+// ##   версия говорит «насколько старо», хеш — только «не то же самое», но и этого хватает.
+// ## - Это БЛОКЕР ПРЕФЛАЙТА, а не диспатча: доска не отказывается работать, она говорит
+// ##   человеку правду перед сборкой прогона. Чинится одной командой prepare-project.sh.
+// GREP_SUMMARY: A3.5, Д4, stale-skill, свежесть скиллов, дрейф копий, preflight, prepare-project
+const REF_CLAUDE_DIR = path.join(__dirname, ".claude");
+const SKILL_PARTS = [
+  { what: "скилл grace-feature-dev", rel: ["skills", "grace-feature-dev", "SKILL.md"] },
+  { what: "агент gfd-coder", rel: ["agents", "gfd-coder.md"] },
+  { what: "агент gfd-verifier", rel: ["agents", "gfd-verifier.md"] },
+  { what: "агент gfd-reviewer", rel: ["agents", "gfd-reviewer.md"] },
+  { what: "агент gfd-architect", rel: ["agents", "gfd-architect.md"] },
+  { what: "агент gfd-explorer", rel: ["agents", "gfd-explorer.md"] },
+];
+const frontVersion = (text) => {
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text || "");
+  const m = fm && /^version:\s*(.+)$/m.exec(fm[1]);
+  return m ? m[1].trim() : null;
+};
+const sha = (s) => crypto.createHash("sha1").update(s).digest("hex").slice(0, 12);
+function staleSkills(projectDir) {
+  const parts = SKILL_PARTS.concat([{ what: `команда /${GRACE_COMMAND}`, rel: ["commands", `${GRACE_COMMAND}.md`] }]);
+  const out = [];
+  for (const p of parts) {
+    const ref = path.join(REF_CLAUDE_DIR, ...p.rel);
+    const mine = path.join(projectDir, ".claude", ...p.rel);
+    let refText;
+    try { refText = fs.readFileSync(ref, "utf8"); } catch { continue; }   // эталона нет — сравнивать не с чем
+    let stat;
+    try { stat = fs.lstatSync(mine); } catch { continue; }                // своей копии нет — проект просто не подготовлен
+    if (stat.isSymbolicLink()) {
+      try { if (fs.realpathSync(mine) === fs.realpathSync(ref)) continue; } catch { /* битая ссылка — ниже */ }
+    }
+    let text;
+    try { text = fs.readFileSync(mine, "utf8"); } catch { out.push({ ...p, path: mine, state: "unreadable" }); continue; }
+    const v = frontVersion(text), rv = frontVersion(refText);
+    if (v && rv && v === rv) continue;
+    if (!v && !rv && sha(text) === sha(refText)) continue;
+    if (v === null && rv === null) { out.push({ what: p.what, path: mine, version: null, refVersion: null, state: "differs" }); continue; }
+    if (text === refText) continue;
+    out.push({ what: p.what, path: mine, version: v, refVersion: rv, state: v && rv ? "old-version" : "differs" });
+  }
+  return out;
+}
+// endregion FUNC_staleSkill
+
 // S5 · SUMMARY GATE preflight (roadmap §2 Фаза 1). Surfaces PLAN-LEVEL items the human
 // resolves ONCE before launch — deduped across stages — so individual stages don't re-ask:
 //   • blockers: objectively detectable pre-run gaps (today: the project's design source, §3.1);
@@ -1109,6 +1212,20 @@ function preflightPlan(board, project, cardIds) {
       { id: "html", title: "html · public/ (self-heal)", recommended: true },
       { id: "figma", title: "figma · указать ссылку" },
       { id: "none", title: "none · дизайн не нужен" },
+    ],
+  });
+  // A3.5 · Д4: проектные копии конвейера разъехались с эталоном. Говорим об этом ДО запуска —
+  // после запуска это выглядит как необъяснимо странное поведение прогона, а не как дрейф копий.
+  const stale = staleSkills(resolveProjectDir(project));
+  if (stale.length) blockers.push({
+    id: "stale-skill", type: "blocker",
+    q: `Проектные копии конвейера старше эталона (${stale.length}): `
+      + stale.map((s) => `${s.what}${s.version && s.refVersion ? ` — ${s.version} против ${s.refVersion}` : " — содержимое расходится"}`).join("; ")
+      + `. Lean-раны читают ИМЕННО их, так что прогон поедет на старых правилах.`,
+    stale,
+    options: [
+      { id: "update", title: `обновить: scripts/prepare-project.sh ${resolveProjectDir(project)}`, recommended: true },
+      { id: "keep", title: "оставить как есть — копии проекта сознательно свои" },
     ],
   });
   const cards = (cardIds || []).map((id) => board.cards.find((c) => c.id === id)).filter(Boolean);
@@ -1507,8 +1624,12 @@ const planTails = (board, plan) => {
 // nothing to verify and the run would close «на слово».
 function acceptanceScenarios(board, plan) {
   const out = [];
+  // A3.3 · С4: в приёмку идут ТОЛЬКО сквозные критерии. Покарточные уже закрыты верификатором
+  // на своей карточке — гнать их сюда значит платить за второй прогон того же экзамена.
+  // Непомеченный критерий читается как сквозной, поэтому старые планы собираются как раньше.
   for (const c of planCards(board, plan))
-    for (const a of (c.acceptance || [])) out.push({ from: c.theme || c.id, kind: "функционал", text: a });
+    for (const a of acceptanceItems(c)) if (a.level === "run")
+      out.push({ from: c.theme || c.id, kind: "функционал", text: a.text });
   const man = planReleaseManifest(board, plan.id).releaseManifest || {};
   for (const m of (man.manualChecks || [])) out.push({ from: "манифест релиза", kind: "ручная проверка", text: itemStr(m) });
   return out;
@@ -1522,6 +1643,7 @@ function launchPlanAcceptance(board, plan) {
   const cfg = readProjectConfig(projectDir);
   const cmds = (cfg && cfg.cfg && cfg.cfg.commands) || {};
   const scen = acceptanceScenarios(board, plan);
+  const cardLevel = planCards(board, plan).flatMap(acceptanceItems).filter((a) => a.level === "card").length;
   const cmdLine = (k, label) => cmds[k] ? `• ${label}: ${cmds[k]}` : `• ${label}: не задана в .grace/project.md → пропусти, отметь check со status:"skip"`;
   const prompt = [
     `ПРИЁМКА ПРОГОНА «${plan.goal || plan.id}» — проверь, что оно РАБОТАЕТ. Это НЕ код-ревью: код уже прошёл`,
@@ -1534,9 +1656,16 @@ function launchPlanAcceptance(board, plan) {
     `3) ФУНКЦИОНАЛЬНАЯ ЧАСТЬ. Подними приложение${cmds.dev ? ` командой: ${cmds.dev}` : " (команда dev не задана — подними как принято в проекте)"}`,
     `   и пройди сценарии ниже браузером/curl. Для КАЖДОГО собери доказательство: код ответа, кусок вывода,`,
     `   путь к скриншоту. «Похоже, работает» без доказательства = status:"fail".`,
+    // A3.3 · С4: «сквозных сценариев нет» — теперь ЗАКОННОЕ состояние (все критерии закрыты
+    // покарточно верификаторами), и красить прогон за это нельзя. А вот «критериев нет вообще»
+    // — по-прежнему провал: принять прогон «на слово» нечем.
     scen.length ? scen.map((s, i) => `   ${i + 1}) [${s.kind}] ${s.text}   ← из «${s.from}»`).join("\n")
-      : `   (сценариев нет — ни у одного этапа не заполнено acceptance. Отметь это отдельным check со status:"fail":`
-        + `\n    прогон нельзя принять «на слово».)`, ``,
+      : cardLevel
+        ? `   (сквозных сценариев нет: все ${cardLevel} критери(ев) прогона помечены уровнем card и уже\n`
+          + `    проверены верификаторами на своих карточках. Экзамен за них не пересдавай — ограничься\n`
+          + `    детерминированной частью выше и ручными проверками манифеста, это и есть интеграция.)`
+        : `   (критериев нет вовсе — ни у одного этапа не заполнено acceptance. Отметь это отдельным\n`
+          + `    check со status:"fail": прогон нельзя принять «на слово».)`, ``,
     `4) РЕЗУЛЬТАТ — строго в ${path.join(runDir, "acceptance.json")}, СТРОГО в этом формате:`,
     `   {"checks":[{"id":"c1","title":"…","kind":"deterministic|functional","status":"pass|fail|skip",`,
     `   "output":"хвост вывода/код ответа","evidence":"путь к скриншоту или пусто"}],`,
@@ -2794,6 +2923,17 @@ function buildDirectives(card, runDir, rigor) {
     `зелёный чекпоинт оставляем нетронутым, человек продолжит от него. Эти green-коммиты — атомарные точки`,
     `отката ("git restore --source=<sha> -- <файл>"); финальный push перед "ready" (см. BRANCH & HANDOFF) идёт`,
     `в ту же ветку "${branch}" и эти коммиты НЕ заменяет.`,
+    // A3.4 · §1+§2: вывод команд — самая дешёвая статья экономии и самая крупная по объёму.
+    // Полный лог сборки/тестов приезжает в контекст ЦЕЛИКОМ и платится дважды (запись кеша +
+    // чтение на каждом следующем шаге сессии), а решение принимается по последним строкам.
+    // Плюс три отдельных вызова typecheck/test/build — это три круга «команда → весь вывод →
+    // разбор», хотя нужен один и только на красном.
+    `ВЫВОД КОМАНД — ХВОСТАМИ, НЕ ЦЕЛИКОМ. Любую шумную команду (тесты, сборка, typecheck, установка`,
+    `зависимостей, миграции) запускай с обрезкой: "<команда> 2>&1 | tail -n 40". Полный вывод читай`,
+    `ТОЛЬКО когда хвоста не хватило для диагноза, и тогда — grep'ом по конкретной ошибке, а не целиком.`,
+    `ПРОВЕРКИ — ОДНИМ ВЫЗОВОМ. Гоняй гейт цепочкой: "npx tsc --noEmit && <тест> && <сборка> 2>&1 | tail -n 40"`,
+    `(команды бери из .grace/project.md, если он есть). Цепочка встаёт на первом красном — это и нужно.`,
+    `Разбивай на отдельные вызовы, только когда уже что-то упало и ты сужаешь причину.`,
     `DEFINITION OF DONE (гейт перед "ready" — НЕ помечай карточку/слайс done, пока не выполнено):`,
     `карточка НЕ уходит в done/ready, если в её файлах остались TODO/FIXME/HACK/XXX/NotImplementedError/`,
     `заглушки (placeholder-возвраты, выброшенные значения), КРОМЕ случая, когда строка покрыта проходящим`,

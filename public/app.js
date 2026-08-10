@@ -1151,7 +1151,15 @@ function briefHTML(card) {
   const rows = [];
   const list = (v) => `<ul class="brief__items">${v.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`;
   if (card.outOfScope) rows.push(`<div class="brief__sec"><div class="brief__label">Не входит в объём</div><div class="brief__body">${esc(card.outOfScope)}</div></div>`);
-  if ((card.acceptance || []).length) rows.push(`<div class="brief__sec"><div class="brief__label">Приёмка</div>${list(card.acceptance)}</div>`);
+  // A3.3 · С4: критерий может быть покарточным (его закрывает верификатор) или сквозным (его
+  // проверяет приёмка прогона). Элемент — строка (старая форма, читается как сквозной) либо
+  // {text, level}; кто проверяет — видно прямо в списке, иначе разница существует только в коде.
+  const acc = (card.acceptance || []).map((a) => (a && typeof a === "object")
+    ? { text: String(a.text || ""), level: a.level === "card" ? "card" : "run" }
+    : { text: String(a), level: "run" }).filter((a) => a.text);
+  if (acc.length) rows.push(`<div class="brief__sec"><div class="brief__label">Приёмка</div>`
+    + `<ul class="brief__items">${acc.map((a) => `<li>${esc(a.text)}`
+      + `<span class="brief__lvl" title="${a.level === "card" ? "проверяет верификатор этой карточки" : "сквозной — проверяет приёмка всего прогона"}">${a.level === "card" ? "карточка" : "прогон"}</span></li>`).join("")}</ul></div>`);
   if (card.contract) {
     const tbd = /^tbd$/i.test(card.contract.trim());
     const done = card.result && card.result.contract;

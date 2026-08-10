@@ -1,4 +1,5 @@
 ---
+version: 2026.08.10
 name: gfd-explorer
 description: grace-feature-dev codebase explorer. Read-only. Traces execution paths, maps abstraction layers, and documents patterns/dependencies to inform new development. Navigates cheaply — grep by GREP_SUMMARY/STRUCTURE markers first, semantic reading only when needed. Spawned 2-3 in parallel during Exploration, each on a different aspect. Returns 5-10 essential files to read. Never edits code.
 tools: Glob, Grep, Read, Bash

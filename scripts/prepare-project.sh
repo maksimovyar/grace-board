@@ -33,11 +33,23 @@ CMD="${GRACE_COMMAND_NAME:-grace-run}"
 DST="${1:?укажи каталог проекта}"
 DST="$(cd "$DST" && pwd)"
 
-mkdir -p "$DST/.claude/commands" "$DST/.claude/agents" "$DST/.claude/skills"
+mkdir -p "$DST/.claude/commands" "$DST/.claude/agents" "$DST/.claude/skills" "$DST/.claude/scripts"
 
+# A3.5 · Д4: своя копия — это ДРЕЙФ, а не настройка, пока владелец не сказал обратного. Раньше
+# скрипт молча её пропускал, и проект годами ехал на июньских правилах (инцидент серии: старый
+# скилл перебил команду → 31 прогон без единого кодера). Теперь пропуск ГРОМКИЙ, а `gb preflight`
+# ставит по этому же поводу блокер `stale-skill`. GRACE_FORCE=1 — заменить копию ссылкой.
+STALE=0
 link() {  # символическая ссылка на копию из репозитория: git pull в grace-board обновляет всех
   local src="$1" dst="$2"
-  if [ -e "$dst" ] && [ ! -L "$dst" ]; then echo "  пропуск (лежит своё, не ссылка): $dst"; return; fi
+  if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+    if [ "${GRACE_FORCE:-0}" = "1" ]; then
+      rm -rf "$dst"; ln -sfn "$src" "$dst"; echo "  ЗАМЕНЕНО своё на ссылку (GRACE_FORCE=1): $dst"; return
+    fi
+    if diff -rq "$src" "$dst" >/dev/null 2>&1; then echo "  своё, но совпадает с эталоном: $dst"; return; fi
+    echo "  ⚠ УСТАРЕЛО (лежит своё и отличается от эталона): $dst"
+    STALE=$((STALE+1)); return
+  fi
   ln -sfn "$src" "$dst"; echo "  связано: $dst"
 }
 
@@ -47,6 +59,9 @@ link "$SRC/commands/$CMD.md"              "$DST/.claude/commands/$CMD.md"
 link "$SRC/commands/grace-feature-dev.md" "$DST/.claude/commands/grace-feature-dev.md"
 link "$LIB/skills/grace-feature-dev"      "$DST/.claude/skills/grace-feature-dev"
 for a in "$LIB"/agents/gfd-*.md; do link "$a" "$DST/.claude/agents/$(basename "$a")"; done
+# A3.2: линтер разметки — детерминированная замена ревьюеру «Conventions / GRACE markup».
+# Команда зовёт его по пути .claude/scripts/, поэтому он обязан лежать в проекте, а не в репо доски.
+link "$REPO/scripts/grace-lint.mjs"       "$DST/.claude/scripts/grace-lint.mjs"
 
 # .claude/ проекта — служебная оснастка контура, а не код продукта: она не должна попасть
 # в коммит агента (он коммитит строго по card.files[], но исключение дешевле надежды).
@@ -57,3 +72,10 @@ if [ -f "$EX" ] && ! grep -qx "/.claude/" "$EX" 2>/dev/null; then
 fi
 
 echo "Готово. Проверь, что доска включила lean: в dispatch-log у нового запуска launch.lean === true."
+if [ "$STALE" -gt 0 ]; then
+  echo ""
+  echo "⚠ Устаревших собственных копий: $STALE. Прогон читает ИМЕННО их, а не эталон."
+  echo "  Заменить ссылками:  GRACE_FORCE=1 $0 $DST"
+  echo "  Оставить сознательно — тогда блокер stale-skill в 'gb preflight' будет виден каждый раз."
+  exit 4
+fi

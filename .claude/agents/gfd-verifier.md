@@ -1,4 +1,5 @@
 ---
+version: 2026.08.10
 name: gfd-verifier
 description: grace-feature-dev independent verifier. Read-only. Runs the card's tests against the real code and performs Semantic Trace Verification — does the actual execution path in the logs match the DevelopmentPlan Data Flow? — then returns a structured Bug Report. When rigor=off it verifies behavior/acceptance-criteria instead of LDD markers. Spawned once per card in the Verify phase. Does NOT fix code.
 tools: Read, Grep, Glob, Bash

@@ -77,12 +77,26 @@ argument-hint: <тема карточки> --rigor grace|off --mode inline|hybri
         конкурентное переключение уже роняло чужой прогон.
       - При `rigor != off` пиши `test_guide-<cardId>.md` — это контракт
         кодер→верификатор, он идёт в `card.artifacts[]`.
-   3. **verifying.** **`gfd-verifier`** (read-only): тесты + Diagnostic Trio +
-      Semantic Trace Verification (при `rigor != off`) либо проверка поведения и
-      acceptance-критериев (при `rigor: off`). Возвращает Bug Report.
-   4. **reviewing.** **`gfd-reviewer`** ×(1-3 по весу карточки) параллельно
-      (простота/DRY · баги/корректность · конвенции и разметка). Считаются
-      только находки с confidence ≥ 80.
+   3. **verifying.** Сначала **сам** гоняешь гейт (Bash, без субагента):
+      `board.verifyGate` цепочкой и с обрезкой — `<gate> 2>&1 | tail -n 40`.
+      **Красный гейт → верификатора НЕ спавнишь**: карточка сразу назад в
+      `implementing`, в контекст кодеру — хвост вывода. Верификатор нужен для
+      суждения (Diagnostic Trio, Semantic Trace Verification), а «упало ли» —
+      это код возврата, и платить за него сессией модели незачем: заведомо
+      красный проход стоил ~50 тыс. токенов старта плюс разведку, и происходило
+      это ровно на тех кругах, которые и так дороже всех.
+      Гейт зелёный → **`gfd-verifier`** (read-only): Diagnostic Trio + Semantic
+      Trace Verification (при `rigor != off`) либо проверка поведения и
+      acceptance-критериев уровня `card` (при `rigor: off`). Возвращает Bug Report.
+   4. **reviewing.** Сначала — **линтер разметки** (при `rigor != off`, Bash):
+      `node .claude/scripts/grace-lint.mjs --files-from <runDir>/board.json --card <cardId> --log app.log`
+      Код возврата 1 → нарушения разметки идут **кодеру**, ревьюеров не спавнишь:
+      наличие `MODULE_CONTRACT` / `GREP_SUMMARY:` / `STRUCTURE:` / `[IMP:9]` — это
+      grep, а не предмет обсуждения. Линтера нет в проекте (файл отсутствует) —
+      просто идёшь дальше, это не повод останавливать карточку.
+      Линтер чистый → **`gfd-reviewer`** ×(1-2 по весу карточки) параллельно:
+      **простота/DRY** · **баги/корректность**. Разметку им НЕ поручай — её уже
+      проверил линтер. Считаются только находки с confidence ≥ 80.
    5. **Резолв.** Зелено → карточка `done`, `verdict`, **green-checkpoint**:
       `git add` строго по `files[]` этой карточки (никогда `git add .`/`-A`),
       затем `git commit -m "green(<cardId>): <кратко>"`. Красно → назад в

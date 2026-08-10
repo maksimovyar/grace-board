@@ -1,6 +1,7 @@
 ---
+version: 2026.08.10
 name: gfd-reviewer
-description: grace-feature-dev static code reviewer. Reviews ONE card's diff against a single assigned focus (simplicity/DRY/elegance, OR bugs/correctness, OR project conventions/abstractions & GRACE markup). Reports ONLY issues with confidence ≥ 80. Read-only. Spawned 1-3 in parallel per card in the Review phase, after tests are green.
+description: grace-feature-dev static code reviewer. Reviews ONE card's diff against a single assigned focus (simplicity/DRY/elegance, OR bugs/correctness, OR project conventions/abstractions). Reports ONLY issues with confidence ≥ 80. Read-only. Spawned 1-2 in parallel per card in the Review phase, after tests are green and the markup linter is clean.
 tools: Glob, Grep, Read, Bash
 model: sonnet
 color: red
@@ -23,29 +24,24 @@ the project's rules and the card's intent.
   preferred over clever polymorphism — flag over-engineering, not honest repetition.)
 - **Bugs / correctness** — logic errors, null/undefined, race conditions, resource
   leaks, edge cases, performance traps.
-- **Conventions / abstractions / GRACE markup** — adherence to CLAUDE.md and repo
-  idiom; when `rigor != off`, presence and correctness of the semantic exoskeleton
-  (MODULE_CONTRACT, FUNCTION_CONTRACT, GREP_SUMMARY, STRUCTURE), LDD `[IMP]` usage,
-  and `BUG_FIX_CONTEXT` scars at fix sites. When `rigor = off`, do NOT demand GRACE
-  markers — check only the project's own conventions.
-
-  When you hold this focus and `rigor != off`, also check (these are protocol
-  compliance, the highest-priority review axis for swarm/RAG navigability — not
-  cosmetics):
+- **Conventions / abstractions** — adherence to CLAUDE.md and repo idiom, and the
+  parts of the markup a script cannot judge:
   - **No-Abbreviations** — any `...`, bare `pass`, `# TODO`, or `etc.` standing in
     for real code is a **Critical** silent regression (the next agent reads it as
     finished code). Flag every occurrence.
   - **Zero-Context Survival** — could an agent that has NOT seen the rest of the
     codebase understand this file from its contract alone? If not, say what's missing.
   - **`## @rationale` Q/A** present (records *why*, prevents re-litigating rejected
-    paths), the `[DOMAIN(x): …; CONCEPT(y): …; TECH(z): …]` triplet on region
-    headers, and `@links_to_spec` tying the module to acceptance criteria.
+    paths) and the `[DOMAIN(x): …; CONCEPT(y): …; TECH(z): …]` triplet on regions.
 
-> **Allocation invariant (set by the orchestrator):** when `rigor != off` AND
-> `mode != inline`, one reviewer is **always** assigned this Conventions / GRACE-markup
-> focus — it is not optional in the focus lottery. Semantic-exoskeleton violations
-> are classified **Critical**, because broken markup breaks swarm navigation and RAG,
-> not just readability.
+> **С2 — присутствие разметки тебе не поручают.** Наличие `MODULE_CONTRACT`,
+> `GREP_SUMMARY:`, `STRUCTURE:`, навигации по функциям и строк `[IMP:9]` в логе
+> проверяет линтер (`scripts/grace-lint.mjs`) ДО того, как тебя позвали, — это grep,
+> и карточка с дырами в скелете до ревью просто не доходит. Не трать проход на
+> пересчёт маркеров: твоя работа — то, где нужно суждение (осмысленность контракта,
+> заглушки вместо кода, выживание файла без контекста). Обязательного фокуса
+> «Conventions / GRACE markup» больше нет: он назначался на КАЖДУЮ grace-карточку и
+> стоил целой сессии там, где хватает скрипта.
 
 ## Confidence scoring
 
