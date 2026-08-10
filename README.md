@@ -134,6 +134,9 @@ over it. See [`.env.example`](.env.example).
 | `GRACE_LOOP_MAX` | `2` | returns `verifying/reviewing → implementing` before the fuse calls the warden |
 | `GRACE_LOG_MAX_MB` | `6` | size of one run's output before the fuse calls the warden |
 | `GRACE_RELEASE_STALE_MIN` | `60` | how long a run may sit in a human-owed release stage before it is flagged |
+| `GRACE_POSTMERGE_WAIT_MIN` | `30` | how long to wait for the post-merge workflow on `main` before giving up on tagging |
+| `GRACE_POSTMERGE_GRACE_SEC` | `120` | grace window before "no runs yet" is read as "this repo has no post-merge CI" |
+| `GRACE_FIX_ROUNDS` | `2` | automatic repair rounds for a red acceptance before it goes to a human |
 | `GRACE_PLAN_HOOK_URL` | — | zero-config run-event webhook (same as registering `{kind:"http"}`) |
 | `GRACE_QUOTA_FALLBACK_MIN` | `30` | how long to wait when a run hits the limit but logs no reset time |
 | `GRACE_QUOTA_MAX_WAIT_MIN` | `360` | sanity cap on a parsed reset time (a stale log line can't sleep a day) |
@@ -293,7 +296,7 @@ against a fixed table and acts through HTTP only — it never writes `board.json
 | `POST /api/tasks/:id/note` | the diagnosis, shown on the card, so a human reads "why we stand" instead of a log |
 | `POST /api/tasks/:id/split` | `{remainder}` — stop the run, carry the unfinished remainder into a draft tail card (inherits sources/contract/files), close the original. The green commits stay in its branch |
 | `POST /api/hooks/warden` | register the handler: `{kind:"command",cmd}` locally, `{kind:"http",url}` on a VPS, `{kind:"off"}` to disable |
-| `POST /api/hooks/plan` | same shape, for **run** events: `close-step`, `awaiting`, `acceptance-broken`, `ci-red`, `plan-quota-hold`, `plan-closed`, `fix-started`, `fix-done`, `fix-exhausted`. Best-effort: one shot, 5 s, no retries — the truth is `GET /api/board`, where every run now carries `release` (stage + its age) |
+| `POST /api/hooks/plan` | same shape, for **run** events: `close-step`, `awaiting`, `acceptance-broken`, `ci-red`, `plan-quota-hold`, `plan-closed`, `fix-started`, `fix-done`, `fix-exhausted`, `postmerge-red`, `tagged`, `tag-failed`. Best-effort: one shot, 5 s, no retries — the truth is `GET /api/board`, where every run now carries `release` (stage + its age) |
 
 A fourth event joins the three above: **`loop-budget`** — the card is alive and working, but
 has crossed the fuse (`GRACE_LOOP_MAX` returns to `implementing`, or `GRACE_LOG_MAX_MB` of run
@@ -360,6 +363,32 @@ never reach `main` until a human shows up. So the board now does what a human wo
 Two rounds (`GRACE_FIX_ROUNDS`), then it stops and says so: notice on the run, `fix-exhausted`
 on the webhook, PR left as a draft. Card-level defects never enter this loop — those are fixed
 inside the card's own build session by `verify → implementing`.
+
+### After the merge — the board reads main and tags it
+
+"Merged" is not "in production", and until now the board stopped at the merge: nobody
+watched the post-merge workflow, nobody set the tag, and 4 of 5 apps were rolled out from
+main by hand. Now, once a merge lands:
+
+1. the board asks GitHub about the workflow runs **on the merge commit**, counting only
+   runs whose branch is `main` (a run triggered by a *tag* push is the deploy itself —
+   waiting on it would be waiting on our own consequence);
+2. **green** → if the project declares `stand.release: tag` in `.grace/project.md`, the
+   board creates the next `v*` tag on the merge commit via `gh api …/git/refs` (never a
+   local `git tag && push` — the project's working tree is shared and closing must not
+   touch it). The tag is what starts the app's own `deploy.yml`: snapshot → smoke over the
+   **public URL** → automatic rollback. Patch bump by default; `stand.tag_prefix` and
+   `stand.tag_bump: minor` override;
+3. **red** → **no tag** (a tag would deploy an unverified main), the run closes as
+   `postmerge-red`, and the board files a **draft card "почини CI"** carrying the failing
+   job's log tail, plus a `postmerge-red` webhook event. Production stays on the previous
+   version — that is the whole point of not tagging;
+4. **still running past `GRACE_POSTMERGE_WAIT_MIN`** → no tag either: the run ends in
+   `awaiting-deploy` and says so.
+
+Tagging is **opt-in per project** (`stand.release: tag`). Without that key the closing
+phase behaves exactly as before — the board does not start pushing tags into nine
+repositories because its own code was updated.
 
 `stand.is_production: true` demotes any deploy policy to "waits for a human",
 **regardless of autonomy** — the mechanical floor sits before the policy, not after it.

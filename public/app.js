@@ -91,6 +91,7 @@ const ORIGIN_BADGE = { skill: ["◇ скилл", "заведена скилло�
 // но человеку она не хвост, а объяснение, почему прогон ещё не закрыт. Называем как есть.
 function originBadge(card) {
   if (card.fixFor) return ["✚ починка", "заведена доской по красной приёмке прогона — правит только провалившиеся сценарии"];
+  if (card.postMergeFor) return ["⛔ починка CI", "заведена доской по красному пост-мерж CI на main — тег не поставлен, выкатки не было"];
   return ORIGIN_BADGE[card.origin];
 }
 function cardTags(card) {
@@ -512,6 +513,11 @@ function runHTML(plan) {
 const CLOSE_STEP_RU = { acceptance: "идёт приёмка прогона", pr: "собираю PR", "pr-wait": "создаю PR",
   // A2.1 · контур починки: доска сама правит красную приёмку, человек в этом круге не участвует
   "fix-wait": "приёмка красная — чиню сама, потом переиграю", "pr-refresh": "обновляю PR",
+  // A4.2/A4.3 · жизнь после мержа: main проверяет сам себя, и только зелёный main получает тег
+  "post-merge": "смержено · жду CI на main", "post-merge-wait": "смержено · жду CI на main",
+  "post-merge-log": "CI на main красный — читаю лог",
+  tag: "ставлю тег релиза", "tag-wait": "ставлю тег релиза", "tag-push-wait": "ставлю тег релиза",
+  "postmerge-red": "смержено, но CI на main красный — тега нет",
   "post-pr": "разбираю результат", "merge-wait": "мержу", deploy: "деплой", "deploy-wait": "деплой идёт",
   "pr-ready": "закрыт · PR собран, мерж за тобой", "merge-failed": "автомерж не прошёл — мерж за человеком",
   "awaiting-deploy": "деплой ждёт человека", closed: "закрыт",
@@ -528,6 +534,7 @@ function closeState(plan) {
   if (!plan.closeStatus) return "running";
   if (plan.closeStatus === "failed") return "failed";
   if (plan.closeStep === "acceptance-broken") return "acceptance-broken";
+  if (plan.closeStep === "postmerge-red") return "postmerge-red";
   if (plan.closeStep === "awaiting-merge") return (plan.policy || {}).merge === "manual" ? "pr-ready" : "merge-failed";
   if (plan.closeStep === "pr-ready") return "pr-ready";
   if (plan.closeStep === "merge-failed") return "merge-failed";
@@ -550,7 +557,9 @@ function releaseAgeHTML(plan) {
   return `<span class="close__age${cls}" title="${esc(title)}">${r.approx ? "≈ " : ""}${esc(ago(r.since))} на этой стадии</span>`;
 }
 // Прогон закрыт — доска по нему больше ничего не сделает сама. Полка (Ш5), не колонки.
-const CLOSED_STATES = new Set(["pr-ready", "closed", "failed"]);
+// A4.3: красный main — тоже финал доски (работа смержена, дальше её ход невозможен), поэтому
+// прогон уезжает на полку. Но молча он не уходит: строка в «Требует меня» остаётся, пока main красный.
+const CLOSED_STATES = new Set(["pr-ready", "closed", "failed", "postmerge-red"]);
 function closeHTML(plan) {
   if (!plan.closeStatus) return "";
   const r = plan.result || {}, a = r.acceptance, pr = r.pr, note = r.notice;
@@ -758,6 +767,12 @@ function attention() {
         s: `приёмка не прогналась (${ab.attempts || "?"} попыт.) · этапов в ready ${ab.ready ?? "?"}/${ab.stages ?? "?"}`
           + ` · CI: ${ab.ci || "не спрошен"} — код НЕ проверен, PR черновик${held}`, go: "Разобрать" });
     }
+    // A4.3: код в main, но main красный. Тега нет → выкатки не было → прод на прошлой версии.
+    if (st === "postmerge-red") {
+      const pm = (p.result || {}).postMergeCi || {};
+      rows.push({ k: "merge", ic: "⛔", t: p.goal || "Прогон " + p.id, plan: p.id,
+        s: `смержено, но CI на main КРАСНЫЙ (${(pm.failed || []).join(", ") || "пост-мерж"}) · тега нет, прод на прошлой версии${held}`, go: "Разобрать" });
+    }
     if (st === "deploy-hold")
       rows.push({ k: "floor", ic: "⚠", t: p.goal || "Прогон " + p.id, plan: p.id,
         s: `смержено · деплой за человеком (жёсткий пол: боевой стенд)${held}`, go: "Раскатать" });
@@ -816,6 +831,7 @@ const CLOSE_WORD = {
   "pr-ready": ["✓", "закрыт · PR за тобой", "мерж руками — политика прогона"],
   closed: ["✓", "закрыт", "смержено и раскатано по политике"],
   failed: ["✕", "провален", "приёмка красная — PR оставлен черновиком, деплоя не было"],
+  "postmerge-red": ["⛔", "смержено · CI на main красный", "тег не поставлен, выкатки не было — заведена карточка «почини CI»"],
 };
 // Строка полки — ОДНА строка: закрытых прогонов копится десяток, и каждый, занимающий три
 // строки, отодвигает работающие вниз. Детали («почему» + состав) раскрываются по клику.
@@ -826,7 +842,8 @@ function shelfRowHTML(plan) {
   const onBoard = cards.filter((c) => !c.archived).length;
   const a = (plan.result || {}).acceptance, pr = (plan.result || {}).pr;
   const closedAt = (plan.result || {}).closingStartedAt || plan.closedAt || null;
-  const chips = [`<span class="tag tag--${st === "failed" ? "bad" : "ok"}">${ic} ${esc(word)}</span>`];
+  const bad = st === "failed" || st === "postmerge-red";   // A4.3: красный main — не «ок» и по цвету тоже
+  const chips = [`<span class="tag tag--${bad ? "bad" : "ok"}">${ic} ${esc(word)}</span>`];
   if (a) chips.push(`<span class="tag tag--${a.passed ? "ok" : "bad"}" title="${esc((a.checks || []).map((c) => `${c.status}: ${c.title}`).join("\n"))}">приёмка ${(a.checks || []).filter((c) => c.status === "pass").length}/${(a.checks || []).length}</span>`);
   // Черновик называется черновиком: PR по красной приёмке не смержить, и это видно сразу.
   if (pr && pr.url) chips.push(`<a class="tag${pr.draft ? " tag--bad" : ""}" href="${esc(safeUrl(pr.url) || "#")}" target="_blank" rel="noopener">PR${(pr.url.match(/\/(\d+)$/) || [])[1] ? " " + pr.url.match(/\/(\d+)$/)[1] : ""}${pr.draft ? " · черновик" : ""} →</a>`);

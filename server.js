@@ -1259,7 +1259,7 @@ function preflightPlan(board, project, cardIds) {
 
 // Шаги, где доска сделала всё, что могла, и дальше ход человека. Возраст ИМЕННО этих стадий —
 // то, что превращает «прогон висит» из догадки в число.
-const RELEASE_WAITING = new Set(["pr-ready", "merge-failed", "awaiting-merge", "awaiting-deploy", "acceptance-broken"]);
+const RELEASE_WAITING = new Set(["pr-ready", "merge-failed", "awaiting-merge", "awaiting-deploy", "acceptance-broken", "postmerge-red"]);
 const RELEASE_STALE_MIN = Number(process.env.GRACE_RELEASE_STALE_MIN || 60);
 function releaseState(plan) {
   if (!plan.closeStatus) return "running";
@@ -1269,6 +1269,7 @@ function releaseState(plan) {
   // v4 Ш1: `awaiting-merge` у старых прогонов значил три разные вещи — разводится политикой,
   // ровно тем же правилом чтения, что и в UI (closeState).
   if (step === "awaiting-merge") return (plan.policy || {}).merge === "manual" ? "pr-ready" : "merge-failed";
+  if (step === "postmerge-red") return "postmerge-red";
   if (step === "pr-ready" || step === "merge-failed" || step === "closed") return step;
   if (step === "awaiting-deploy") return "deploy-hold";
   return "running";
@@ -1289,7 +1290,10 @@ function releaseEventName(plan) {
   const step = plan.closeStep || "";
   if (step === "acceptance-broken") return "acceptance-broken";
   if (step === "awaiting-merge" || step === "awaiting-deploy") return "awaiting";
-  if (step === "closed" || step === "pr-ready" || step === "merge-failed") return "plan-closed";
+  // `postmerge-red` — терминальное состояние прогона, и как ЗАКРЫТИЕ оно и уезжает наружу.
+  // Своё содержательное событие (упавшие проверки, карточка починки) уже отправил postMergeRed;
+  // дублировать его именем шага значит послать приёмнику одно и то же дважды, второй раз пустым.
+  if (step === "closed" || step === "pr-ready" || step === "merge-failed" || step === "postmerge-red") return "plan-closed";
   return "close-step";
 }
 // Единственная точка, где фиксируется время смены шага и откуда уходит событие наружу.
@@ -1341,7 +1345,7 @@ const PLAN_HOOK_LOG_DIR = path.join(DATA_DIR, "plan-hook");
 // Полный список того, что может прийти приёмнику. Отдаётся в GET /api/hooks/plan, чтобы
 // сторона Гермеса не выясняла состав событий чтением исходника доски.
 const PLAN_EVENT_NAMES = ["close-step", "awaiting", "acceptance-broken", "ci-red", "plan-quota-hold", "plan-closed",
-  "fix-started", "fix-done", "fix-exhausted"];
+  "fix-started", "fix-done", "fix-exhausted", "postmerge-red", "tagged", "tag-failed"];
 function planHook(board) {
   const h = board && board.planHook;
   if (h && h.kind === "command" && h.cmd) return h;
@@ -1600,7 +1604,8 @@ const ACCEPT_GRACE_MS = Number(process.env.GRACE_ACCEPT_GRACE_SEC || 60) * 1000;
 // owed by the human (`awaiting-*`), two say HOW the run ended (`pr-ready` = closed, the merge is
 // yours by policy · `merge-failed` = the board promised to merge and could not), и `acceptance-broken`
 // говорит, что проверок НЕ БЫЛО вовсе. Collapsing any of them loses the only difference the human acts on.
-const CLOSE_KEEP_STEPS = new Set(["awaiting-merge", "awaiting-deploy", "pr-ready", "merge-failed", "acceptance-broken"]);
+const CLOSE_KEEP_STEPS = new Set(["awaiting-merge", "awaiting-deploy", "pr-ready", "merge-failed", "acceptance-broken",
+  "postmerge-red"]);   // A4.3: смержено, но main красный — это отдельный исход, не «закрыт»
 
 // Release policy of a run: what was passed at assembly wins, then the project's
 // `deploy_policy`, then the built-in default (§5.1).
@@ -1887,6 +1892,115 @@ const ciRunIdOf = (urls) => {
   return null;
 };
 // endregion FUNC_ciGate
+
+// region FUNC_postMerge — доска дочитывает CI ПОСЛЕ мержа и ставит тег (A4.2/A4.3 · О3)
+// ## @purpose Доска читала CI только на PR — до мержа (`ciClassify`). Что происходит на `main`
+// ##   ПОСЛЕ мержа, она не знала вовсе: пост-мерж workflow никто не отслеживал, тег никто не
+// ##   ставил, и «сделано на доске» переставало значить «в проде» (4 из 5 приложений выкачены
+// ##   с main руками). Тег — последнее недостающее звено: по `v*` у приложений уже висит
+// ##   deploy.yml со snapshot → smoke по публичному URL → автооткатом (промпт 07, июль).
+// ## @io (board, plan) -> шаги post-merge → tag → deploy · draft-карточка «почини CI» на красном
+// ## @invariants
+// ## - Тег ставится ТОЛЬКО на зелёный пост-мерж CI. Красный или незавершившийся — тега нет:
+// ##   тег запускает выкатку в прод, и ставить его на непроверенный main значит выкатывать вслепую.
+// ## - Тегирование ВКЛЮЧАЕТСЯ ЯВНО: `.grace/project.md → stand.release: tag`. Без этого ключа
+// ##   поведение прогона байт в байт прежнее (deploy_cmd либо ничего) — доска не начинает
+// ##   пушить теги в девять репозиториев потому, что кто-то обновил её код.
+// ## - Тег создаётся ЧЕРЕЗ API на sha мерж-коммита (`gh api git/refs`), а не локальным
+// ##   `git tag && git push`: рабочее дерево проекта общее, и трогать его на закрытии нельзя.
+// ## - Красный пост-мерж — НЕ провал прогона: код уже в main, работа сделана. Это отдельная
+// ##   работа, поэтому она и заводится карточкой-черновиком, а прогон закрывается своим итогом.
+// ## - Ожидание пост-мерж CI очередь НЕ держит: ветка уже в main, гейт порядка (planOrderHold)
+// ##   пропустил следующий прогон в ту же секунду, когда мерж состоялся.
+// ## @rationale Q: почему не `gh run watch`? A: он блокирующий; тик доски не ждёт никого и
+// ##   ничего — каждый шаг либо спавнит потомка, либо читает его файл.
+// ## @modulemap
+// ## FUNC 3[calc] => classifyPostMerge — прогоны workflow на мерж-коммите → green|red|pending|none
+// ## FUNC 3[calc] => releaseMode       — режим релиза проекта: tag | command | none
+// ## FUNC 3[calc] => nextTag           — следующий semver-тег от самого свежего существующего
+// ## FUNC 5[persist] => postMergeRedCard — draft «почини CI» с хвостом лога (A4.3)
+// GREP_SUMMARY: A4.2, A4.3, О3, пост-мерж CI, тег, v*, автотег, почини CI, gh api, git/refs
+// STRUCTURE: ▶ merged → ⊕ post-merge(gh) → ⚡ green? → ⎋ tag → deploy.yml · red? → ⎋ draft «почини CI»
+
+const POSTMERGE_GRACE_MS = Number(process.env.GRACE_POSTMERGE_GRACE_SEC || 120) * 1000;  // прогонов ещё нет — они регистрируются не мгновенно
+const POSTMERGE_BUDGET_MS = Number(process.env.GRACE_POSTMERGE_WAIT_MIN || 30) * 60 * 1000;
+const TAG_PREFIX_DEFAULT = "v";
+// Режим релиза объявляется проектом. Ничего не объявлено — старое поведение, без тегов.
+function releaseMode(projectDir) {
+  const cfg = readProjectConfig(projectDir);
+  const stand = (cfg && cfg.cfg && cfg.cfg.stand) || {};
+  const mode = String(stand.release || "").trim().toLowerCase();
+  if (mode === "tag" || mode === "command" || mode === "none") return { mode, stand };
+  return { mode: stand.deploy_cmd ? "command" : "none", stand };
+}
+// Прогоны workflow на мерж-коммите. Берём только ветку main: раны, запущенные пушем ТЕГА,
+// приезжают с head_branch = имя тега, и считать их пост-мерж проверкой нельзя — они идут ПОСЛЕ.
+function classifyPostMerge(text) {
+  const runs = String(text || "").split("\n").filter((l) => l.startsWith("RUN\t"))
+    .map((l) => { const p = l.split("\t"); return { id: p[1], name: p[2], branch: p[3], status: p[4], conclusion: p[5] }; })
+    .filter((r) => r.branch === "main");
+  if (!runs.length) return { status: "none", runs: [], failed: [] };
+  if (runs.some((r) => r.status !== "completed")) return { status: "pending", runs, failed: [] };
+  const failed = runs.filter((r) => CI_FAIL.has(String(r.conclusion || "").toUpperCase()));
+  return { status: failed.length ? "red" : "green", runs, failed };
+}
+// Следующий тег от самого свежего. Патч по умолчанию: релиз прогона — это инкремент, а не
+// решение о версии; смена minor/major — сознательный шаг человека, доска её не выдумывает.
+function nextTag(last, stand) {
+  const prefix = String(stand.tag_prefix || TAG_PREFIX_DEFAULT);
+  const bump = ["patch", "minor"].includes(String(stand.tag_bump || "").trim()) ? stand.tag_bump : "patch";
+  const m = /^\D*(\d+)\.(\d+)\.(\d+)/.exec(String(last || "").trim());
+  if (!m) return `${prefix}0.1.0`;
+  let [, a, b, c] = m.map(Number);
+  if (bump === "minor") { b += 1; c = 0; } else { c += 1; }
+  return `${prefix}${a}.${b}.${c}`;
+}
+// A4.3 · красный пост-мерж → карточка-черновик «почини CI». Механизация §3.1 протокола ночной
+// вахты: раньше это был человек, который утром замечал красный main. Черновик здесь ПРАВИЛЬНЫЙ
+// (в отличие от карточки починки приёмки): за ним не следует автоматика, её посмотрит человек.
+function postMergeRedCard(board, plan, ci, logTail) {
+  const failedNames = (ci.failed || []).map((r) => r.name).join(", ") || "пост-мерж CI";
+  const card = spawnTailCard(board, { id: null, project: plan.project, rigor: "off" }, {
+    theme: `Почини CI на main: ${plan.goal || plan.id}`.slice(0, 200),
+    rigor: "off",
+    outOfScope: "Всё, кроме красного пост-мерж CI. Новую функциональность не добавлять.",
+    acceptance: [`пост-мерж workflow на main зелёный: ${failedNames}`],
+    description: [
+      `КРАСНЫЙ ПОСТ-МЕРЖ CI после прогона «${plan.goal || plan.id}».`,
+      `Код прогона УЖЕ в main (ветка ${plan.integrationBranch}) — откатывать его не нужно и не надо.`,
+      `Упало на main: ${failedNames}.`,
+      `Тег НЕ поставлен, значит выкатки не было: прод живёт на предыдущей версии, время есть.`,
+      ``,
+      `Хвост лога упавшего job:`,
+      `----- ci log -----`,
+      logTail || "(лог получить не удалось)",
+      `----- /ci log -----`,
+      ``,
+      `Почини причину на main минимальными изменениями. Когда CI на main позеленеет, тег`,
+      `поставит человек или следующий прогон — доска на красном main тегов не ставит.`,
+    ].join("\n"),
+  });
+  card.postMergeFor = plan.id;
+  logPlan(plan, "plan-postmerge-red-card", { cardId: card.id, failed: (ci.failed || []).map((r) => r.name) });
+  return card;
+}
+// Итог прогона, чей main оказался красным. Прогон закрывается СВОИМ итогом (работа сделана и
+// смержена), но закрывается ГРОМКО: отдельный шаг, карточка починки и событие наружу — иначе
+// красный main обнаруживается утром, а это ровно то, что ночная вахта делала руками.
+function postMergeRed(board, plan, ci, logTail) {
+  const card = postMergeRedCard(board, plan, ci, logTail);
+  const failed = (ci.failed || []).map((r) => r.name).join(", ") || "пост-мерж CI";
+  plan.result.deploy = { status: "blocked-by-ci", reason: `пост-мерж CI на main красный (${failed}) — тег не ставился, выкатки не было` };
+  plan.result.postMergeCi = { ...(plan.result.postMergeCi || {}), status: "red", logTail: logTail || null, fixCardId: card.id };
+  plan.closeStatus = "done";
+  plan.closeStep = "postmerge-red";
+  planNotice(plan, `Смержено, но CI на main КРАСНЫЙ: ${failed}. Тег не поставлен — прод остался на предыдущей версии, `
+    + `выкатки вслепую не было. Заведена карточка-черновик «${card.theme}» с хвостом лога.`, "error");
+  logPlan(plan, "plan-postmerge-red", { failed: (ci.failed || []).map((r) => r.name), cardId: card.id });
+  firePlanEvent(board, plan, "postmerge-red", { key: "main", failed: (ci.failed || []).map((r) => r.name),
+    fixCardId: card.id, logTail: (logTail || "").slice(-1000) });
+}
+// endregion FUNC_postMerge
 
 // region FUNC_planMetrics — во что обошёлся прогон, машинно и без ручного разбора (A5)
 // ## @purpose Стоимость и время прогона восстанавливались только ручным разбором 77 МБ
@@ -2421,9 +2535,123 @@ function planCloseTick(board) {
         logPlan(plan, "plan-merge-failed", { reason: "gh" });
         changed = true; continue;
       }
-      plan.closeStep = "deploy"; changed = true;
+      // A4.2: смержено — но «в main» ещё не «в проде». Дочитываем CI на main прежде, чем
+      // решать про тег и выкатку. Очередь партии это не держит: ветка уже предок main.
+      plan.closeStep = "post-merge";
+      plan.postMergeSince = new Date().toISOString();
+      plan.postMergeNextAt = null; plan.postMergeRun = null;
+      changed = true;
       logPlan(plan, "plan-merged", {});
       continue;
+    }
+
+    // ── A4.2 · пост-мерж CI: что говорит main о самом себе ─────────────────────────────
+    if (plan.closeStep === "post-merge") {
+      if (plan.postMergeNextAt && Date.parse(plan.postMergeNextAt) > Date.now()) continue;
+      try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+      // Один вызов даёт и sha мерж-коммита, и прогоны workflow на нём. Формат строк RUN —
+      // ради дешёвого разбора: полный JSON списка ранов это десятки килобайт на тик.
+      const url = shq((plan.result.pr || {}).url || "");
+      const cmd = `SHA=$(${GH_BIN} pr view ${url} --json mergeCommit --jq '.mergeCommit.oid' 2>/dev/null); echo "SHA:$SHA"; `
+        + `[ -n "$SHA" ] && ${GH_BIN} api "repos/{owner}/{repo}/actions/runs?head_sha=$SHA&per_page=20" `
+        + `--jq '.workflow_runs[] | "RUN\\t\\(.id)\\t\\(.name)\\t\\(.head_branch)\\t\\(.status)\\t\\(.conclusion)"'`;
+      const st = spawnStep(projectDir, cmd, path.join(dir, "postmerge.out"));
+      plan.postMergeRun = { ...st, startedAt: new Date().toISOString() };
+      plan.closeStep = "post-merge-wait"; changed = true;
+      continue;
+    }
+    if (plan.closeStep === "post-merge-wait") {
+      const r = readStep(path.join(dir, "postmerge.out"));
+      const started = Date.parse((plan.postMergeRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.postMergeRun || {}).started) continue;
+      const sinceMs = Date.now() - (Date.parse(plan.postMergeSince || "") || Date.now());
+      const sha = r ? ((r.text.match(/^SHA:(\w+)$/m) || [])[1] || null) : null;
+      if (sha) plan.result.mergeSha = sha;
+      const ci = classifyPostMerge(r ? r.text : "");
+      plan.result.postMergeCi = { status: ci.status, runs: ci.runs.map((x) => x.name),
+        failed: ci.failed.map((x) => x.name), checkedAt: new Date().toISOString(), waitedSec: Math.round(sinceMs / 1000) };
+      // «Прогонов нет» сразу после мержа — это ещё не «CI отсутствует»: они регистрируются
+      // не мгновенно. Ждём окно и только потом верим тишине.
+      if ((ci.status === "pending" || (ci.status === "none" && sinceMs < POSTMERGE_GRACE_MS)) && sinceMs < POSTMERGE_BUDGET_MS) {
+        plan.postMergeNextAt = new Date(Date.now() + CI_POLL_MS).toISOString();
+        plan.closeStep = "post-merge"; changed = true;
+        continue;
+      }
+      if (ci.status === "red") {
+        const runId = (ci.failed[0] || {}).id || null;
+        if (runId && !plan.pmLogRun) {   // хвост упавшего job — иначе карточка починки бессодержательна
+          const st = spawnStep(projectDir, `${GH_BIN} run view ${runId} --log-failed 2>&1 | tail -n 40`, path.join(dir, "pm-log.out"));
+          plan.pmLogRun = { ...st, runId, startedAt: new Date().toISOString() };
+          plan.closeStep = "post-merge-log"; changed = true; continue;
+        }
+        postMergeRed(board, plan, ci, null);
+        changed = true; continue;
+      }
+      if (ci.status === "pending") {     // бюджет вышел, вердикта нет — тег на непроверенное не ставим
+        plan.closeStatus = "done"; plan.closeStep = "awaiting-deploy";
+        plan.result.deploy = { status: "awaiting-human", reason: `пост-мерж CI не завершился за ${Math.round(POSTMERGE_BUDGET_MS / 60000)} мин — тег на непроверенный main доска не ставит` };
+        planNotice(plan, `Смержено. ${plan.result.deploy.reason}. Выкатка за человеком.`, "warn");
+        logPlan(plan, "plan-postmerge-timeout", { waitedSec: plan.result.postMergeCi.waitedSec });
+        firePlanEvent(board, plan, "awaiting", { key: "postmerge-timeout", step: "awaiting-deploy" });
+        changed = true; continue;
+      }
+      logPlan(plan, "plan-postmerge-green", { status: ci.status, runs: plan.result.postMergeCi.runs, waitedSec: plan.result.postMergeCi.waitedSec });
+      plan.closeStep = "deploy"; changed = true;
+      continue;
+    }
+    if (plan.closeStep === "post-merge-log") {
+      const r = readStep(path.join(dir, "pm-log.out"));
+      const started = Date.parse((plan.pmLogRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.pmLogRun || {}).started) continue;
+      const failedNames = (plan.result.postMergeCi || {}).failed || [];
+      postMergeRed(board, plan, { failed: failedNames.map((n) => ({ name: n })) }, r ? r.text.slice(-2000) : null);
+      changed = true; continue;
+    }
+
+    // ── A4.2 · тег: последний шаг «на доске = в проде». Ставится ТОЛЬКО на зелёном main ──
+    if (plan.closeStep === "tag") {
+      const st = spawnStep(projectDir, `git fetch --tags -q origin 2>/dev/null; git tag -l 'v*' --sort=-v:refname | head -1`, path.join(dir, "tag-last.out"));
+      plan.tagRun = { ...st, startedAt: new Date().toISOString() };
+      plan.closeStep = "tag-wait"; changed = true;
+      continue;
+    }
+    if (plan.closeStep === "tag-wait") {
+      const r = readStep(path.join(dir, "tag-last.out"));
+      const started = Date.parse((plan.tagRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.tagRun || {}).started) continue;
+      const last = r ? (r.text.split("\n").map((l) => l.trim()).filter((l) => /^\D*\d+\.\d+\.\d+/.test(l))[0] || null) : null;
+      const { stand } = releaseMode(projectDir);
+      const tag = nextTag(last, stand);
+      const sha = plan.result.mergeSha;
+      if (!sha) {   // без sha тег ставить некуда — а тег на «последний main» может увезти чужой коммит
+        plan.result.deploy = { status: "failed", reason: "sha мерж-коммита не прочитан — тег не поставлен" };
+        plan.closeStatus = "done"; plan.closeStep = "awaiting-deploy";
+        planNotice(plan, `Смержено, CI на main зелёный, но sha мерж-коммита получить не удалось — тег ставит человек.`, "warn");
+        changed = true; continue;
+      }
+      const st = spawnStep(projectDir, `${GH_BIN} api repos/{owner}/{repo}/git/refs -f ref=${shq("refs/tags/" + tag)} -f sha=${shq(sha)}`, path.join(dir, "tag-push.out"));
+      plan.tagPushRun = { ...st, tag, from: last, startedAt: new Date().toISOString() };
+      plan.closeStep = "tag-push-wait"; changed = true;
+      logPlan(plan, "plan-tag", { tag, from: last, sha });
+      continue;
+    }
+    if (plan.closeStep === "tag-push-wait") {
+      const r = readStep(path.join(dir, "tag-push.out"));
+      const started = Date.parse((plan.tagPushRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.tagPushRun || {}).started) continue;
+      const tag = (plan.tagPushRun || {}).tag || null;
+      const ok = !!(r && r.code === 0);
+      plan.result.deploy = ok
+        ? { status: "tagged", tag, sha: plan.result.mergeSha, note: "выкатку ведёт deploy.yml приложения: snapshot → smoke по публичному URL → автооткат" }
+        : { status: "failed", tag, reason: `тег не создан (${r ? "gh код " + r.code : "gh не ответил"}): ${r ? r.text.slice(-300) : ""}` };
+      plan.closeStatus = "done"; plan.closeStep = "closed";
+      plan.archived = ok;
+      planNotice(plan, ok
+        ? `Прогон закрыт: смержено, пост-мерж CI зелёный, поставлен тег ${tag} — дальше выкатывает deploy.yml приложения (smoke + автооткат внутри него).`
+        : `Смержено и CI зелёный, но тег не поставлен: ${plan.result.deploy.reason}. Выкатка за человеком.`, ok ? "ok" : "error");
+      logPlan(plan, "plan-tagged", { ok, tag });
+      firePlanEvent(board, plan, ok ? "tagged" : "tag-failed", { key: tag || "tag", tag, sha: plan.result.mergeSha || null });
+      changed = true; continue;
     }
 
     // ── deploy: the mechanical floor sits BEFORE the policy, not after it ──────────────
@@ -2442,6 +2670,13 @@ function planCloseTick(board) {
         planNotice(plan, `Смержено. Деплой ждёт человека: ${plan.result.deploy.reason}`, "warn");
         logPlan(plan, "plan-deploy-hold", { reason: plan.result.deploy.reason });
         changed = true; continue;
+      }
+      // A4.2: у приложения релиз может ехать ТЕГОМ, а не командой выкатки — тогда доска ставит
+      // `v*`, а всё остальное (snapshot → smoke по публичному URL → автооткат) делает deploy.yml
+      // самого приложения. Включается явно, `stand.release: tag`: без ключа — как было.
+      if (releaseMode(projectDir).mode === "tag") {
+        plan.closeStep = "tag"; changed = true;
+        continue;
       }
       if (!deployCmd) {
         plan.result.deploy = { status: "no-command", reason: "stand.deploy_cmd не задан в .grace/local.md" };
