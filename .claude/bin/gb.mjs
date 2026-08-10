@@ -15,9 +15,21 @@
 //   gb preflight --project X --card ID [--card ID ...]
 //   gb run   --project X [--goal "G"] [--mode ask|auto] --stage ID [--stage ID:dep1,dep2 ...]
 //            [--pr always|never] [--merge manual|auto] [--deploy off|after-merge|ask]
+//            [--decision "вопрос=ответ" ...] [--loops N] [--log-mb N]
 //       release policy of the run (design §5.1). Omitted → .grace/project.md → deploy_policy,
 //       then always/manual/off. Red acceptance never deploys; a production stand always
 //       requires a human for the deploy, whatever the policy says.
+//       --decision — решения сводного гейта (Ш7): доска штампует их на КАЖДЫЙ этап блоком
+//       «СОБЛЮДАЙ, НЕ переспрашивай», и этап не выносит их снова в вопросы. Повторяемый флаг.
+//       --loops / --log-mb — порог предохранителя (A1.1) на этот прогон; без них — константы доски.
+//
+//   ── сопровождение запущенного (A1.5 · О4.1) ────────────────────────────────
+//   gb plans   [--project X] [--json]        прогоны: статус · стадия релиза · возраст · PR
+//   gb answers --card ID                     показать вопросы карточки
+//   gb answers --card ID --answer "..." ...  ответить на функциональный гейт (по порядку вопросов)
+//   gb answers --card ID --decision d1=o2 ...  ответить на архитектурный гейт (id вопроса = id опции)
+//   gb note    --card ID --text "..." [--class env-broken]
+//   gb relaunch --card ID                    перезапуск с самой дальней достигнутой точки
 //
 // Env: GRACE_BOARD_PORT (default 4317). Host is always 127.0.0.1 (board is local-only).
 
@@ -32,7 +44,7 @@ function die(msg) { console.error("gb: " + msg); process.exit(1); }
 // Minimal flag parser. Repeatable flags (--card, --stage) collect into arrays.
 function parseArgs(argv) {
   const out = { _: [] };
-  const multi = new Set(["--card", "--stage", "--acceptance", "--source", "--file"]);
+  const multi = new Set(["--card", "--stage", "--acceptance", "--source", "--file", "--decision", "--answer"]);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith("--")) {
@@ -157,15 +169,110 @@ async function cmdRun(args) {
   if (args["--merge"]) policy.merge = args["--merge"];
   if (args["--deploy"]) policy.deploy = args["--deploy"];
   if (Object.keys(policy).length) payload.policy = policy;
+  // О4.1 · решения сводного гейта. Серверная механика была живой целиком (санитайз → штамп на
+  // карточки → блок «СОБЛЮДАЙ, НЕ переспрашивай» в четырёх промптах), но отправлять их было
+  // нечем: во ВСЕХ прошедших планах стояло decisions: 0. Симуляция вопросов на Ш4 делалась и
+  // выбрасывалась, а потом те же вопросы задавались заново в рантайме — часами простоя.
+  const decisions = parseDecisions(args["--decision"], "--decision");
+  if (decisions.length) payload.decisions = decisions;
+  // A1.1 · порог предохранителя на прогон (покарточного уровня нет)
+  const loopBudget = {};
+  if (args["--loops"]) loopBudget.loops = Number(args["--loops"]);
+  if (args["--log-mb"]) loopBudget.logMB = Number(args["--log-mb"]);
+  if (Object.keys(loopBudget).length) payload.loopBudget = loopBudget;
   const { plan } = await api("POST", "/api/plans", payload);
   console.log(`created plan ${plan.id}  mode=${plan.mode}  branch=${plan.integrationBranch}`);
   const p = plan.policy || {};
   console.log(`policy: pr=${p.pr} merge=${p.merge} deploy=${p.deploy}`);
+  console.log(`decisions: ${(plan.decisions || []).length}${(plan.decisions || []).length ? "" : "  (гейт Ш7 ничего не передал — этапы спросят это заново)"}`);
+  if (plan.loopBudget) console.log(`loop budget: loops=${plan.loopBudget.loops ?? "по умолчанию"} logMB=${plan.loopBudget.logMB ?? "по умолчанию"}`);
   console.log(`stages: ${(plan.cardIds || []).join(", ")}`);
+}
+
+// "вопрос=ответ" → форма, которую доска штампует на этапы. Разделитель — ПЕРВЫЙ `=`: в ответе
+// он встречается постоянно («deploy=after-merge»), в вопросе — почти никогда.
+function parseDecisions(list, flag) {
+  return (list || []).map((s, i) => {
+    const at = String(s).indexOf("=");
+    if (at <= 0) die(`${flag} ожидает "вопрос=ответ", получено: ${s}`);
+    const q = String(s).slice(0, at).trim(), a = String(s).slice(at + 1).trim();
+    if (!q || !a) die(`${flag} ожидает "вопрос=ответ", получено: ${s}`);
+    return { id: `d${i + 1}`, q, choice: "human", chosenTitle: a };
+  });
+}
+
+// ── сопровождение запущенного (A1.5) ─────────────────────────────────────────
+// Раньше всё это жило только curl-рецептами в скилле Гермеса, и Mac-сторона была слепа:
+// увидеть, на чём стоит партия, или ответить на вопрос карточки без ручного curl было нечем.
+const relWord = (p) => {
+  const r = p.release;
+  if (!r) return p.status || "—";
+  const age = r.since ? ` · ${r.approx ? "≈" : ""}${Math.round((Date.now() - Date.parse(r.since)) / 60000)} мин` : "";
+  return `${r.state}${r.waitingHuman ? " ⟵ ход человека" : ""}${age}${r.stale ? " ⚠ висит" : ""}`;
+};
+async function cmdPlans(args) {
+  const { plans } = await api("GET", "/api/plans");
+  let list = plans || [];
+  if (args["--project"]) list = list.filter((p) => sameProject(p.project, args["--project"]));
+  if (args["--json"]) return void console.log(JSON.stringify(list, null, 2));
+  if (!list.length) return void console.log("(no plans)");
+  for (const p of list) {
+    const pr = ((p.result || {}).pr || {}).url;
+    console.log(`${p.id}  [${p.status}]  ${relWord(p)}`);
+    console.log(`      ${p.goal || "(без цели)"}  ⎇ ${p.integrationBranch || "—"}${pr ? "  " + pr : ""}`);
+  }
+  console.log(`\n${list.length} plan(s).`);
+}
+
+async function cmdAnswers(args) {
+  const id = args["--card"] ? args["--card"][0] : die("--card ID is required");
+  const board = await api("GET", "/api/board");
+  const card = (board.cards || []).find((c) => c.id === id) || die(`card ${id} not found`);
+  const answers = args["--answer"] || [];
+  const decisions = args["--decision"] || [];
+  if (!answers.length && !decisions.length) {
+    console.log(`${card.id}  [${card.column}]  ${card.theme}`);
+    console.log(`askStage: ${card.askStage || "—"}`);
+    (card.questions || []).forEach((q, i) => console.log(`  Q${i + 1}. ${typeof q === "string" ? q : q.q}`));
+    (card.archQuestions || []).forEach((d) => {
+      console.log(`  ${d.id}. ${d.q}${d.floor ? "  [жёсткий пол — решает только человек]" : ""}`);
+      (d.options || []).forEach((o) => console.log(`       ${o.id}: ${o.title}${o.recommended ? "  ←рекомендовано" : ""}`));
+    });
+    if (!(card.questions || []).length && !(card.archQuestions || []).length) console.log("  (вопросов нет)");
+    return;
+  }
+  const body = decisions.length
+    ? { stage: "architecture", answers: decisions.map((s) => {
+        const at = String(s).indexOf("=");
+        if (at <= 0) die(`--decision ожидает "idВопроса=idОпции", получено: ${s}`);
+        return { decisionId: String(s).slice(0, at).trim(), choice: String(s).slice(at + 1).trim() };
+      }) }
+    : { stage: "functional", answers };
+  const r = await api("POST", `/api/tasks/${id}/answers`, body);
+  console.log(`ответы приняты (${body.stage}) · карточка теперь [${r.card.column}]` +
+    (r.launch && r.launch.launched ? `, запущен ${r.launch.pid ? "pid " + r.launch.pid : "прогон"}` : ", прогон не стартовал"));
+}
+
+async function cmdNote(args) {
+  const id = args["--card"] ? args["--card"][0] : die("--card ID is required");
+  const text = args["--text"] || die("--text is required");
+  const body = { text };
+  if (args["--class"]) body.class = args["--class"];
+  await api("POST", `/api/tasks/${id}/note`, body);
+  console.log(`заметка записана на карточку ${id}`);
+}
+
+async function cmdRelaunch(args) {
+  const id = args["--card"] ? args["--card"][0] : die("--card ID is required");
+  const r = await api("POST", `/api/tasks/${id}/relaunch`, {});
+  const l = r.launch || {};
+  console.log(`перезапуск ${id}: станция [${r.card.column}]` + (l.launched ? `, pid ${l.pid}` : `, НЕ стартовал${l.error ? ": " + l.error : ""}`));
+  if (!l.launched) process.exitCode = 2;
 }
 
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
-const table = { board: cmdBoard, card: cmdCard, preflight: cmdPreflight, run: cmdRun };
-if (!table[cmd]) die(`unknown command "${cmd || ""}". Use: board | card | preflight | run`);
+const table = { board: cmdBoard, card: cmdCard, preflight: cmdPreflight, run: cmdRun,
+  plans: cmdPlans, answers: cmdAnswers, note: cmdNote, relaunch: cmdRelaunch };
+if (!table[cmd]) die(`unknown command "${cmd || ""}". Use: board | card | preflight | run | plans | answers | note | relaunch`);
 table[cmd](args).catch((e) => die(e.stack || String(e)));

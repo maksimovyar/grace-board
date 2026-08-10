@@ -577,6 +577,11 @@ button.tag--auto:hover{border-color:var(--ink-soft)}
 .close__state--failed{color:#a8362e;background:rgba(211,63,53,.10)}
 .close__state--broken{color:#8a5e08;background:rgba(214,158,20,.14)}
 .close__step{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+/* A1.3 · возраст стадии релиза: спокойный по умолчанию, заметный когда ход человека,
+   и красный, когда ход человека затянулся (порог сервера, GRACE_RELEASE_STALE_MIN). */
+.close__age{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+.close__age--wait{color:#8a5e08}
+.close__age--stale{color:#a8362e;font-weight:600}
 .close__chip{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);background:var(--surface);
   border:1px solid var(--line);border-radius:6px;padding:3px 9px;text-decoration:none}
 .close__chip--ok{color:#1f7a42;border-color:rgba(46,158,80,.4);background:rgba(46,158,80,.07)}

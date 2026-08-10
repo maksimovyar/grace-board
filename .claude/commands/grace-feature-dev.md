@@ -129,7 +129,7 @@ Loop until no card is `todo`/`backlog`-ready or a card is `blocked`:
    - Any failure → `git worktree remove <wt> --force` + `git reset -- <files[]>`
      (unstage, keep the edits), move card back to `implementing` and fix. **Nothing is
      committed on a red card.** Update the **Anti-Loop** counter by failure
-     **signature** (Skill §4). At `attempts ≥ antiLoop.max`, set card `blocked`, stop
+     **signature** (Skill §4). At `attempts ≥ antiLoop.max` (no field → 3), set card `blocked`, stop
      the loop, and escalate to the human (the only return to chat during build).
 6. Re-evaluate `backlog` cards: any whose deps just became `done` → `todo`.
 7. Persist `board.json` after **every** transition; the board is the only state.

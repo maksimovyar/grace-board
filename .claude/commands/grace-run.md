@@ -87,7 +87,7 @@ argument-hint: <тема карточки> --rigor grace|off --mode inline|hybri
       `git add` строго по `files[]` этой карточки (никогда `git add .`/`-A`),
       затем `git commit -m "green(<cardId>): <кратко>"`. Красно → назад в
       `implementing`, счётчик Anti-Loop по СИГНАТУРЕ отказа; на
-      `attempts ≥ antiLoop.max` — карточка `blocked` и остановка цикла.
+      `attempts ≥ antiLoop.max` (поля нет — потолок 3) — карточка `blocked` и остановка цикла.
    6. Пересчитать `backlog`: чьи `deps` стали `done` → `todo`.
    7. **Синхронизация доски — в НАЧАЛЕ каждой фазы, не в конце.** Верхнеуровневое
       поле `column` в `board.json` — это то, что доска зеркалит на карточку канбана.

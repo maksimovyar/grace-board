@@ -70,7 +70,8 @@ TodoWrite — it is read from / written to this file. Anything else describing
   "mode": "inline",                       // inline | hybrid | fanout  (§ command)
   "verifyGate": "npx tsc --noEmit && npm test && npm run build",  // reproduced strict gate run in the clean snapshot (§2.1, §6); resolved per stack at Decompose
   "gates": { "clarify": "approved", "architecture": "approved" },
-  "antiLoop": { "max": 3 },               // §4
+  "antiLoop": { "max": 3 },               // §4 — ПИШЕТ ЭТОТ ПАЙПЛАЙН, не доска (A1.2: доска поле
+                                          //   больше не сеет и никогда его не читала). Нет поля → 3.
 
   "milestones": [
     { "id": "m1", "title": "vertical shippable slice", "status": "todo" }  // todo|in-progress|done

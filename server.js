@@ -1082,7 +1082,9 @@ function planStatus(board, plan) {
 // Read projection for the rail: derived status + accumulated release manifest (§6.1).
 // The stored result (frozen at close: acceptance, PR, merge, deploy) rides on top of the live
 // manifest — before closing there is no stored half, so this is the S4 projection unchanged.
-const planView = (board, plan) => ({ ...plan, status: planStatus(board, plan),
+// A1.3: `release` едет вместе с проекцией — это единственный способ узнать, на какой стадии
+// релиза прогон стоит и сколько он там стоит, не читая закрытых полей closeStep/closeStepAt.
+const planView = (board, plan) => ({ ...plan, status: planStatus(board, plan), release: planRelease(plan),
   result: { releaseManifest: planReleaseManifest(board, plan.id), ...(plan.result || {}) } });
 
 // S5 · SUMMARY GATE preflight (roadmap §2 Фаза 1). Surfaces PLAN-LEVEL items the human
@@ -1110,6 +1112,156 @@ function preflightPlan(board, project, cardIds) {
   return { blockers, floor, forks: [] };
 }
 // endregion FUNC_plans
+
+// region FUNC_planRelease — «ready ≠ в проде»: стадия релиза прогона и её возраст (A1.3 · Д3)
+// ## @purpose После того как все этапы доехали до ready, прогон продолжает жить: приёмка → PR →
+// ##   CI → мерж → деплой, и заканчивается это одним из состояний, где ждут ЧЕЛОВЕКА
+// ##   (`pr-ready`, `merge-failed`, `awaiting-merge`, `awaiting-deploy`, `acceptance-broken`).
+// ##   Всё это лежало в `plan.closeStep` и наружу не показывалось: в kanban карточки уже ready,
+// ##   и доска выглядит пустой. Отсюда обе поломки 08.08 — «Гермес путается в состоянии партии»
+// ##   и разрыв «сделано на доске ≠ в проде».
+// ## @io (plan) -> {step, state, since, ageMinutes, waitingHuman, stale} · в planView и GET /api/board
+// ## @invariants
+// ## - Возраст стадии — ФАКТ, а не оценка: `closeStepAt` штампуется ровно в момент смены шага,
+// ##   единственной точкой (stampCloseStep в голове тика закрытия), а не в 30 местах присваивания.
+// ## - Прогон, собранный ДО этой версии, момента смены шага не имеет. Ему ставится `createdAt`
+// ##   и флаг `closeStepApprox` — «≈ столько-то», потому что «0 мин» на трёхдневном прогоне
+// ##   было бы ровно тем враньём, против которого вся эта правка.
+// ## - `state` — та же свёртка, что показывает UI (`awaiting-merge` читается по политике мержа),
+// ##   но сделанная на сервере: Гермесу нужен тот же ответ, что видит человек, а не сырой шаг.
+// ## @modulemap
+// ## FUNC 3[calc]    => releaseState    — свёртка closeStep+политика в исход, понятный человеку
+// ## FUNC 3[calc]    => planRelease     — проекция стадии релиза наружу (UI + API)
+// ## FUNC 3[persist] => stampCloseStep  — единственная точка штампа времени + выстрел вебхука
+// GREP_SUMMARY: A1.3, Д3, стадия релиза, closeStep, closeStepAt, возраст, ready не в проде, release
+// STRUCTURE: ▶ stampCloseStep(tick) → ⊕ closeStepAt → ⚡ planRelease → ⎋ UI + GET /api/board + вебхук
+
+// Шаги, где доска сделала всё, что могла, и дальше ход человека. Возраст ИМЕННО этих стадий —
+// то, что превращает «прогон висит» из догадки в число.
+const RELEASE_WAITING = new Set(["pr-ready", "merge-failed", "awaiting-merge", "awaiting-deploy", "acceptance-broken"]);
+const RELEASE_STALE_MIN = Number(process.env.GRACE_RELEASE_STALE_MIN || 60);
+function releaseState(plan) {
+  if (!plan.closeStatus) return "running";
+  if (plan.closeStatus === "failed") return "failed";
+  const step = plan.closeStep;
+  if (step === "acceptance-broken") return "acceptance-broken";
+  // v4 Ш1: `awaiting-merge` у старых прогонов значил три разные вещи — разводится политикой,
+  // ровно тем же правилом чтения, что и в UI (closeState).
+  if (step === "awaiting-merge") return (plan.policy || {}).merge === "manual" ? "pr-ready" : "merge-failed";
+  if (step === "pr-ready" || step === "merge-failed" || step === "closed") return step;
+  if (step === "awaiting-deploy") return "deploy-hold";
+  return "running";
+}
+function planRelease(plan) {
+  if (!plan || !plan.closeStatus) return null;
+  const step = plan.closeStep || null;
+  const since = plan.closeStepAt || plan.createdAt || null;
+  const ageMinutes = since ? Math.max(0, Math.round((Date.now() - (Date.parse(since) || Date.now())) / 60000)) : null;
+  const waitingHuman = RELEASE_WAITING.has(step);
+  return { step, state: releaseState(plan), status: plan.closeStatus || null,
+    since, ageMinutes, approx: !!plan.closeStepApprox, waitingHuman,
+    stale: !!(waitingHuman && ageMinutes !== null && ageMinutes >= RELEASE_STALE_MIN) };
+}
+// Какое событие вебхука соответствует новому шагу (A1.4). Один шаг — одно имя, чтобы приёмник
+// не разбирал строковые шаги доски и не переезжал вместе с их переименованиями.
+function releaseEventName(plan) {
+  const step = plan.closeStep || "";
+  if (step === "acceptance-broken") return "acceptance-broken";
+  if (step === "awaiting-merge" || step === "awaiting-deploy") return "awaiting";
+  if (step === "closed" || step === "pr-ready" || step === "merge-failed") return "plan-closed";
+  return "close-step";
+}
+// Единственная точка, где фиксируется время смены шага и откуда уходит событие наружу.
+// Вызывается в голове цикла planCloseTick для КАЖДОГО прогона, включая закрытые: иначе
+// последний переход («закрыт») остался бы без штампа, а он самый нужный.
+function stampCloseStep(board, plan) {
+  const step = plan.closeStep || null;
+  if (plan.closeStepSeen === step) return false;
+  const known = plan.closeStepSeen !== undefined;
+  plan.closeStepSeen = step;
+  if (!known) {
+    // Первая встреча с прогоном после апгрейда: настоящего момента у него нет, и события по
+    // нему слать нельзя — приёмник получил бы шквал «новостей» о том, что случилось на прошлой неделе.
+    if (!plan.closeStepAt) { plan.closeStepAt = plan.createdAt || new Date().toISOString(); plan.closeStepApprox = true; }
+    return true;
+  }
+  plan.closeStepAt = new Date().toISOString();
+  plan.closeStepApprox = false;
+  if (plan.closeStatus) firePlanEvent(board, plan, releaseEventName(plan), { step });
+  return true;
+}
+// endregion FUNC_planRelease
+
+// region FUNC_planEvents — доска → Гермес: событие прогона, best-effort (A1.4 · О2)
+// ## @purpose Гермес вёл runs.json реконструкцией по опросу и врал: конфликт PR приписан не тому
+// ##   плану, состояние партии расходилось с доской (runs-state.md). Канал «дёрнуть URL» у доски
+// ##   уже был — им пользуется страж (kind `http`); здесь тот же механизм включается на события
+// ##   ПРОГОНА, чтобы приёмник узнавал о смене состояния сразу, а не на следующем опросе.
+// ## @io (board, plan, event, details) -> одна доставка (spawn|POST), очередь флашится после writeBoard
+// ## @invariants
+// ## - События — ДЛЯ СКОРОСТИ, истина — сверка по `GET /api/board` (там же лежит `release`).
+// ##   Гарантии доставки нет и не строится: один выстрел, таймаут 5 с, без ретраев. Потерянное
+// ##   событие — норма, приёмник обязан переживать это сверкой, а не ждать чуда от сети.
+// ## - Тик НИКОГДА не ждёт приёмника: очередь флашится ПОСЛЕ записи board.json, как у стража,
+// ##   иначе ответ приёмника по HTTP затёрся бы хвостовой записью тика.
+// ## - Payload идемпотентен: `id = planId:event:step` не зависит от времени, поэтому повторная
+// ##   доставка одного и того же перехода узнаётся приёмником по совпадению `id`.
+// ## - Хук не настроен → функция возвращает false и не делает НИЧЕГО. Вебхук — добавка, а не
+// ##   зависимость: доска обязана работать одинаково с ним и без него.
+// ## @modulemap
+// ## FUNC 2[calc] => planHook       — зарегистрированный обработчик (board.json → env)
+// ## FUNC 4[io]   => firePlanEvent  — собрать payload и положить в очередь
+// ## FUNC 3[io]   => flushPlanQueue — доставить всё, что накопилось за тик
+// GREP_SUMMARY: A1.4, О2, вебхук, planHook, события прогона, Гермес, runs.json, best-effort
+// STRUCTURE: ▶ переход шага/CI/квота → ⊕ firePlanEvent → ⚡ PLAN_QUEUE → ⎋ flushPlanQueue(после записи)
+
+const PLAN_HOOK_URL = (process.env.GRACE_PLAN_HOOK_URL || "").trim();
+const PLAN_HOOK_LOG_DIR = path.join(DATA_DIR, "plan-hook");
+// Полный список того, что может прийти приёмнику. Отдаётся в GET /api/hooks/plan, чтобы
+// сторона Гермеса не выясняла состав событий чтением исходника доски.
+const PLAN_EVENT_NAMES = ["close-step", "awaiting", "acceptance-broken", "ci-red", "plan-quota-hold", "plan-closed"];
+function planHook(board) {
+  const h = board && board.planHook;
+  if (h && h.kind === "command" && h.cmd) return h;
+  if (h && h.kind === "http" && h.url) return h;
+  if (h && h.kind === "off") return null;
+  return PLAN_HOOK_URL ? { kind: "http", url: PLAN_HOOK_URL, registeredAt: null } : null;
+}
+const PLAN_QUEUE = [];
+function firePlanEvent(board, plan, event, details) {
+  const hook = planHook(board);
+  if (!hook) return false;
+  const d = details || {};
+  const payload = {
+    id: `${plan.id}:${event}:${d.key || plan.closeStep || ""}`,
+    planId: plan.id, event, ts: new Date().toISOString(),
+    boardUrl: `http://${HOST}:${PORT}`,
+    plan: {
+      project: plan.project, goal: plan.goal || null, branch: plan.integrationBranch || null,
+      status: plan.closeStatus || null, step: plan.closeStep || null,
+      policy: plan.policy || null, stages: (plan.cardIds || []).length,
+      prUrl: ((plan.result || {}).pr || {}).url || null,
+    },
+    release: planRelease(plan),
+    ...d,
+  };
+  PLAN_QUEUE.push({ hook, payload, projectDir: resolveProjectDir(plan.project) });
+  return true;
+}
+function flushPlanQueue() {
+  while (PLAN_QUEUE.length) {
+    const { hook, payload, projectDir } = PLAN_QUEUE.shift();
+    const json = JSON.stringify(payload);
+    try {
+      deliverHook(hook, json, { projectDir, logFile: path.join(PLAN_HOOK_LOG_DIR, `${payload.planId}.log`),
+        env: { GRACE_PLAN_EVENT: json, GRACE_BOARD_URL: payload.boardUrl, GRACE_PLAN_ID: payload.planId } });
+      fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: payload.ts, event: "plan-hook-call", planId: payload.planId, name: payload.event, via: hook.kind }) + "\n");
+    } catch (e) {
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "plan-hook-failed", planId: payload.planId, name: payload.event, error: String(e.message || e) }) + "\n"); } catch {}
+    }
+  }
+}
+// endregion FUNC_planEvents
 
 // region FUNC_planClose — closing a run: manifest → acceptance → PR → policy (design §5)
 // ## @purpose 6 plans out of 6 ended with `status: "running"`, `result: null`, four archived by
@@ -1245,6 +1397,9 @@ function planQuotaHold(board, plan, stop, where, retryStep) {
   planNotice(plan, `Лимит подписки Claude на шаге «${where}» — это не провал прогона. Сделанное сохранено, `
     + `шаг переиграется сам после сброса в ${hhmm(stop.until)}. Из лога: ${stop.raw}`, "warn");
   logPlan(plan, "plan-quota-hold", { step: where, until: stop.until, exact: stop.exact });
+  // A1.4: очередь партии встала не по вине кода — приёмник должен знать это сразу, иначе
+  // «прогон не движется» читается как поломка и человека будят зря.
+  firePlanEvent(board, plan, "plan-quota-hold", { key: where, step: where, until: stop.until, exact: stop.exact, raw: stop.raw });
   try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts, event: "plan-quota-hold", planId: plan.id, step: where, until: stop.until }) + "\n"); } catch {}
 }
 
@@ -1560,6 +1715,10 @@ function planCloseTick(board) {
   // on spawn and paint the run red for a reason that has nothing to do with the code. Hold.
   if (quotaOpen(board)) return false;
   for (const plan of (board.plans || [])) {
+    // A1.3/A1.4 · до всякой логики: зафиксировать смену шага и отдать её наружу. Здесь, а не в
+    // 30 местах присваивания closeStep — иначе один забытый переход и возраст стадии врёт.
+    // Закрытые прогоны тоже проходят через штамп, поэтому `continue` ниже, а не в условии цикла.
+    if (stampCloseStep(board, plan)) changed = true;
     if (plan.closeStep === "closed") continue;
     const cards = planCards(board, plan);
     if (!cards.length) continue;
@@ -1793,6 +1952,9 @@ function planCloseTick(board) {
         plan.result.merge = { ok: false, error: reason, ci: plan.result.ci };
         planNotice(plan, text, "error");
         logPlan(plan, "plan-merge-failed", { reason, ci: ci.status, failed: ci.failed });
+        // A1.4: `ci-red` — отдельное событие, а не просто смена шага: приёмнику нужен список
+        // упавших проверок, чтобы не ходить за ним в GitHub самому.
+        if (reason === "ci-red") firePlanEvent(board, plan, "ci-red", { key: "pr", failed: ci.failed, checks: ci.checks.length, prUrl: (plan.result.pr || {}).url || null });
       };
       if (ci.status === "green" || ci.status === "none") {
         logPlan(plan, "plan-ci-green", { checks: ci.checks.length, waitedSec: plan.result.ci.waitedSec });
@@ -1842,6 +2004,8 @@ function planCloseTick(board) {
       plan.result.merge = { ok: false, error: "ci-red", ci: plan.result.ci };
       planNotice(plan, `CI красный — доска НЕ мержит. Упало: ${(plan.result.ci.failed || []).join(", ")}. Хвост лога job'а — в результате прогона.`, "error");
       logPlan(plan, "plan-merge-failed", { reason: "ci-red", runId: plan.result.ci.runId, failed: plan.result.ci.failed });
+      firePlanEvent(board, plan, "ci-red", { key: "pr", failed: plan.result.ci.failed || [], runId: plan.result.ci.runId || null,
+        logTail: tail.slice(-1000), prUrl: (plan.result.pr || {}).url || null });
       changed = true; continue;
     }
     if (plan.closeStep === "merge") {
@@ -1943,7 +2107,9 @@ function dispatch(card) {
       askStage: "functional",          // functional → architecture → done
       rigor,
       gates: { functional: "pending", architecture: "pending" },
-      antiLoop: { max: 3 },
+      // A1.2: посев `antiLoop` убран. Доска его никогда не читала (мёртвый лимит), а с A1.1
+      // живой порог считает она сама по card.history — двух правд об одном лимите быть не должно.
+      // Старые runDir/board.json с полем читаются как раньше: его просто никто не смотрит.
       source: { tool: "grace-board", cardId: card.id, designLink: card.designLink || null, requirementsLink: card.requirementsLink || null },
       requirements: compiledRequirements(card),
       milestones: [],
@@ -2437,6 +2603,128 @@ function blockCard(card, reason) {
   try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "blocked", cardId: card.id, reason }) + "\n"); } catch {}
 }
 
+// region FUNC_tailCard — «хвост» карточки: draft с унаследованным контекстом (B9 + A1.2)
+// ## @purpose Механизм заводился под structured `deferred[]` (B9): работа, которую ран решил не
+// ##   делать сейчас, становится карточкой в Backlog — но НЕ работой: `draft: true`, и лever
+// ##   откажет в диспатче, пока человек не посмотрел. 30 хвостов за прогон, автоматически
+// ##   ставших задачами, — это то, чего здесь удалось избежать.
+// ##   A1.2 делает ту же операцию вторым потребителем: `split` отрезает недоделанный остаток
+// ##   сценария в такой же хвост. Наследование одно на оба случая — иначе одна из копий
+// ##   неизбежно разъедется (у хвоста пропадёт contract или sources, и он переспросит их у модели).
+// ## @io (board, parent, opts) -> новая карточка в board.cards (backlog, draft), возвращается она же
+// ## @invariants
+// ## - Хвост наследует КОНТЕКСТ (sources / contract / files / requirementsLink), а не постановку:
+// ##   он продолжение родителя, а не новое ТЗ. Родитель с `contract: TBD` уже опубликовал
+// ##   настоящий контракт — хвосту достаётся РЕЗУЛЬТАТ, иначе он спроектирует его заново.
+// ## - `planId: null` всегда: draft-карточка не диспатчится, а этап прогона, который не может
+// ##   быть задиспатчен, вешает весь прогон намертво (deps никогда не выполнятся).
+// GREP_SUMMARY: B9, A1.2, хвост, deferred, draft, split, наследование контекста, spawnedFrom
+function spawnTailCard(board, parent, opts) {
+  const nid = crypto.randomUUID();
+  const theme = String(opts.theme || "").slice(0, 200);
+  const now = new Date().toISOString();
+  const card = {
+    id: nid, project: parent.project,
+    slug: slugify(theme, "task-" + nid.slice(0, 8)),
+    theme,
+    description: String(opts.description || "").slice(0, MAX_DESC),
+    designLink: null, requirementsLink: parent.requirementsLink || null, requirements: null,
+    attachments: [], rigor: opts.rigor || parent.rigor || "off",
+    column: "backlog", createdAt: now, dispatchedAt: null,
+    history: [{ column: "backlog", ts: now }],
+    spawnedFrom: parent.id,
+    origin: "deferred", draft: true,
+    sources: Array.isArray(parent.sources) ? parent.sources.slice() : [],
+    contract: parent.contractResult || parent.contract || null,
+    files: Array.isArray(parent.files) ? parent.files.slice() : [],
+    outOfScope: opts.outOfScope || null,
+    acceptance: Array.isArray(opts.acceptance) ? opts.acceptance.slice(0, MAX_ACCEPTANCE) : [],
+    planId: null, dependsOn: [], autonomy: null,
+  };
+  board.cards.push(card);
+  return card;
+}
+// endregion FUNC_tailCard
+
+// region FUNC_loopBudget — живой предохранитель от runaway-карточки (A1.1 · Д1)
+// ## @purpose Anti-Loop правило живёт только в скилле: `attempts`/`failSig` доска не читает
+// ##   ни разу, а посеянный `antiLoop` никто не исполняет. Единственная защита от карточки,
+// ##   которая крутится в цикле verify → implementing, была несуществующей: прогон G2 сжёг
+// ##   1181 обращение и $48.79, прежде чем это заметил человек. Считать возвраты постфактум
+// ##   (lib/plan-metrics.js) поздно — деньги уже потрачены.
+// ##   Здесь тот же счёт делается ВЖИВУЮ, на данных, которые доска и так пишет: каждый переход
+// ##   колонки уже зеркалится в `card.history` (via: "pipeline"), а размер `build.log` — это
+// ##   один statSync. Ни парсинга транскриптов, ни вызова модели.
+// ## @io (board, card) -> {loops, logMB, minutes, over[]}; превышение → событие `loop-budget` стражу
+// ## @invariants
+// ## - Порог один: константа доски (env) + override НА УРОВНЕ ПРОГОНА (`plan.loopBudget`).
+// ##   Покарточных ручек нет сознательно — никто не будет осмысленно подбирать порог на каждую
+// ##   карточку, а две конкурирующие правды о лимите хуже отсутствия лимита.
+// ## - Предохранитель НИЧЕГО не останавливает сам: он только зовёт стража и пишет заметку
+// ##   человеку. Решение (pause / split / note / эскалация) принимает классификатор.
+// ## - Срабатывает не чаще, чем растут сигналы: повторное событие только когда возвратов стало
+// ##   БОЛЬШЕ, чем при прошлом выстреле, или лог вырос вдвое. Иначе тик спамил бы стража каждые 2 с.
+// ## - Размер лога меряется в БАЙТАХ с начала текущего рана (`runLogFrom`): подсчёт строк — это
+// ##   полное чтение файла на каждом тике, а байты дают тот же порядок величины бесплатно.
+// ## @rationale Q: почему возвраты, а не число обращений к модели? A: обращения лежат только в
+// ##   транскриптах (~50 МБ JSONL на прогон), а возврат verify→implementing — это ровно тот
+// ##   цикл, который их и порождает. G2 была бы поймана на втором возврате, то есть ~$20 вместо $49.
+// ## @modulemap
+// ## FUNC 2[calc] => countLoops     — возвраты verifying/reviewing → implementing по history
+// ## FUNC 2[calc] => runLogBytes    — размер вывода ТЕКУЩЕГО рана, байты
+// ## FUNC 3[calc] => loopBudgetFor  — порог: константа доски → override прогона
+// ## FUNC 4[calc] => loopSignals    — сводка сигналов + список пробитых порогов
+// GREP_SUMMARY: A1.1, Д1, предохранитель, runaway, loop-budget, возвраты, card.history, размер лога
+// STRUCTURE: ▶ countLoops(history) → ⊕ runLogBytes → ⚡ loopSignals(over[]) → ⎋ событие стражу (тик)
+
+const LOOP_MAX_DEFAULT = Number(process.env.GRACE_LOOP_MAX || 2);        // возвратов на доработку
+const LOG_MAX_MB_DEFAULT = Number(process.env.GRACE_LOG_MAX_MB || 6);    // размер вывода одного рана
+
+// Возврат = переход в `implementing` ПОСЛЕ того, как карточка уже была на гейте (verify/review).
+// Счёт совпадает с `metrics.loops` (lib/plan-metrics.js) — там он делается по той же history,
+// только когда прогон уже закрыт. Одна и та же правда, разное время чтения.
+function countLoops(card) {
+  let loops = 0, sawGate = false;
+  for (const h of (card.history || [])) {
+    if (!h || !h.column) continue;
+    if (h.column === "verifying" || h.column === "reviewing") sawGate = true;
+    else if (h.column === "implementing" && sawGate) { loops += 1; sawGate = false; }
+  }
+  return loops;
+}
+// Сколько байт вывалил ТЕКУЩИЙ ран. `runLogFrom` — смещение его старта: логи дописываются между
+// перезапусками, и без смещения предохранитель считал бы чужой хвост своим.
+function runLogBytes(card) {
+  const known = card.runLog && typeof card.runLog === "string" ? card.runLog : null;
+  const file = known || path.join(resolveProjectDir(card.project), ".grace-feature-dev", card.slug || "", "build.log");
+  try {
+    const size = fs.statSync(file).size;
+    return Math.max(0, size - (known ? (card.runLogFrom || 0) : 0));
+  } catch { return 0; }
+}
+// Порог: константа доски, которую прогон может переопределить. `plan.loopBudget` кладётся при
+// сборке прогона (POST /api/plans) — покарточного уровня нет и не будет (см. @invariants).
+function loopBudgetFor(board, card) {
+  const plan = card.planId ? planById(board, card.planId) : null;
+  const over = (plan && plan.loopBudget && typeof plan.loopBudget === "object") ? plan.loopBudget : {};
+  const num = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : d);
+  return { loops: num(over.loops, LOOP_MAX_DEFAULT), logMB: num(over.logMB, LOG_MAX_MB_DEFAULT) };
+}
+// Сводка для классификатора: сигналы + какие пороги пробиты. `minutes` и `deathsInWindow` в
+// пороги не входят — они контекст, по которому страж отличает цикл от зависшего окружения.
+function loopSignals(board, card) {
+  const limit = loopBudgetFor(board, card);
+  const loops = countLoops(card);
+  const logBytes = runLogBytes(card);
+  const logMB = Math.round(logBytes / (1024 * 1024) * 100) / 100;
+  const startedMs = Date.parse(card.dispatchedAt || card.createdAt || "") || Date.now();
+  const over = [];
+  if (loops >= limit.loops) over.push("loops");
+  if (logMB >= limit.logMB) over.push("log");
+  return { loops, logBytes, logMB, minutes: Math.round((Date.now() - startedMs) / 60000), limit, over };
+}
+// endregion FUNC_loopBudget
+
 // region FUNC_warden — the board CALLS the agent; the agent never polls the board (design §2)
 // ## @purpose 3.6 h of a single run were lost to token-limit deaths: autoheal fires its one
 // ##   retry, the global limit kills that too, the card lands in `blocked` and waits for a
@@ -2445,7 +2733,10 @@ function blockCard(card, reason) {
 // ##   but a model called every 30 s is pure waste. So: the supervisor stays a free timer, and
 // ##   the model is invoked ONLY on an event — «about to block», «asking too long», «stalled».
 // ## @io (board,card,meta) -> spawn/POST one warden run + card.wardenPending
-// ##     HTTP: GET /api/health · POST /api/tasks/:id/pause|resume|note · POST /api/hooks/warden
+// ##     HTTP: GET /api/health · POST /api/tasks/:id/pause|resume|note|split · POST /api/hooks/warden
+// ## A1.2: событий стало четыре (+ `loop-budget` из FUNC_loopBudget), действий — пять
+// ##   (+ `split`: зафиксировать сделанное, остаток вынести хвостом, карточку закрыть). `split`
+// ##   считается бюджетом наравне с pause/resume/relaunch — это действие, а не диагноз.
 // ## @invariants
 // ## - NO hook registered → escalate() === blockCard(), i.e. today's behaviour byte for byte.
 // ##   The warden is an addition, never a dependency: a broken/absent agent must not strand a card.
@@ -2473,7 +2764,7 @@ function blockCard(card, reason) {
 const ASK_STALL_MS = Number(process.env.GRACE_ASK_STALL_MIN || 30) * 60 * 1000;
 const WARDEN_TIMEOUT_MS = Number(process.env.GRACE_WARDEN_TIMEOUT_MIN || 10) * 60 * 1000;
 const WARDEN_BUDGET = Number(process.env.GRACE_WARDEN_BUDGET || 5);   // state-changing actions / card / 24 h
-const WARDEN_ACTIONS = new Set(["pause", "resume", "relaunch"]);      // what the budget counts
+const WARDEN_ACTIONS = new Set(["pause", "resume", "relaunch", "split"]);   // what the budget counts
 const DEATH_WINDOW_MS = 60 * 1000;                                    // §2.3 «несколько ранов умерли в окне < 60 с»
 const WARDEN_LOG_DIR = path.join(DATA_DIR, "warden");
 
@@ -2503,6 +2794,9 @@ function cardSignals(board, card) {
   const now = Date.now();
   const deaths = (board.recentDeaths || []).filter((d) => now - (Date.parse(d.ts || "") || 0) < DEATH_WINDOW_MS);
   const logFile = card.runLog || path.join(runDir, "build.log");
+  // A1.1: предохранитель едет в КАЖДОМ событии, не только в `loop-budget`. Классификатору
+  // дешевле видеть «карточка вернулась на доработку трижды» сразу, чем догадываться по хвосту.
+  const lb = loopSignals(board, card);
   return {
     pidAlive: isAlive(card.runPid),
     runPid: card.runPid || null,
@@ -2511,8 +2805,13 @@ function cardSignals(board, card) {
     questions: (card.questions || []).length,
     archQuestions: (card.archQuestions || []).length,
     minutesInColumn: Math.round((now - (Date.parse(card.lastColumnChangeAt || card.createdAt || "") || now)) / 60000),
+    minutesSinceDispatch: lb.minutes,
     autoHealCount: card.autoHealCount || 0,
     deathsInWindow: deaths.length,
+    loops: lb.loops,
+    logMB: lb.logMB,
+    loopLimit: lb.limit,
+    loopOver: lb.over,
     runDir, logFile,
     logTail: tailLog(logFile, 60),
     budget: wardenBudget(card),
@@ -2531,7 +2830,7 @@ function fireWardenEvent(board, card, meta) {
   if (!hook) return false;
   const event = {
     ts: new Date().toISOString(),
-    kind: meta.kind,                       // about-to-block | asking-stalled | crash-before-write
+    kind: meta.kind,                       // about-to-block | asking-stalled | crash-before-write | loop-budget
     hint: meta.hint || null,               // the board's non-binding guess; the agent decides
     reason: meta.reason || null,
     boardUrl: `http://${HOST}:${PORT}`,
@@ -2544,28 +2843,38 @@ function fireWardenEvent(board, card, meta) {
   WARDEN_QUEUE.push({ hook, event, projectDir: resolveProjectDir(card.project) });
   return true;
 }
-// Deliver every queued event: spawn the command (local) or POST the webhook (VPS). Same JSON body
-// either way — that is what makes «один контракт, различаются BOARD_URL и канал» true (§2.5).
+// Доставить событие обработчику: спавн команды (локально) или POST (VPS/Гермес). Тело JSON одно
+// и то же — это и делает правдой «один контракт, различаются BOARD_URL и канал» (§2.5).
+// A1.4: общая для стража и для событий прогона — второй канал не должен заводить вторую доставку
+// со своими таймаутами и своим поведением при обрыве.
+function deliverHook(hook, json, opts) {
+  if (hook.kind === "command") {
+    let out = "ignore";
+    if (opts.logFile) {
+      try { fs.mkdirSync(path.dirname(opts.logFile), { recursive: true }); out = fs.openSync(opts.logFile, "a"); } catch { out = "ignore"; }
+    }
+    const env = { ...process.env, PATH: `${BIN_PATH_HINT}:${process.env.PATH || ""}`, ...(opts.env || {}) };
+    const child = spawn("/bin/sh", ["-lc", hook.cmd], { cwd: opts.projectDir || __dirname, env, detached: true, stdio: ["ignore", out, out] });
+    child.unref();
+    return;
+  }
+  // Best-effort по определению: один выстрел, 5 с на всё, ошибка проглатывается. Ретраев нет
+  // сознательно — потерянное событие лечится сверкой по GET /api/board, а не повтором.
+  const u = new URL(hook.url);
+  const req = http.request({ hostname: u.hostname, port: u.port || 80, path: u.pathname + u.search, method: "POST",
+    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(json) } }, (r) => r.resume());
+  req.on("error", () => {});
+  req.setTimeout(5000, () => req.destroy());
+  req.end(json);
+}
+// Deliver every queued event: spawn the command (local) or POST the webhook (VPS).
 function flushWardenQueue() {
   while (WARDEN_QUEUE.length) {
     const { hook, event, projectDir } = WARDEN_QUEUE.shift();
     const json = JSON.stringify(event);
     try {
-      if (hook.kind === "command") {
-        fs.mkdirSync(WARDEN_LOG_DIR, { recursive: true });
-        const out = fs.openSync(path.join(WARDEN_LOG_DIR, `${event.card.id}.log`), "a");
-        const env = { ...process.env, PATH: `${BIN_PATH_HINT}:${process.env.PATH || ""}`,
-          GRACE_WARDEN_EVENT: json, GRACE_BOARD_URL: event.boardUrl, GRACE_CARD_ID: event.card.id };
-        const child = spawn("/bin/sh", ["-lc", hook.cmd], { cwd: projectDir, env, detached: true, stdio: ["ignore", out, out] });
-        child.unref();
-      } else {
-        const u = new URL(hook.url);
-        const req = http.request({ hostname: u.hostname, port: u.port || 80, path: u.pathname + u.search, method: "POST",
-          headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(json) } }, (r) => r.resume());
-        req.on("error", () => {});
-        req.setTimeout(5000, () => req.destroy());
-        req.end(json);
-      }
+      deliverHook(hook, json, { projectDir, logFile: path.join(WARDEN_LOG_DIR, `${event.card.id}.log`),
+        env: { GRACE_WARDEN_EVENT: json, GRACE_BOARD_URL: event.boardUrl, GRACE_CARD_ID: event.card.id } });
       fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: event.ts, event: "warden-call", cardId: event.card.id, kind: event.kind, hint: event.hint, via: hook.kind }) + "\n");
     } catch (e) {
       try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "warden-call-failed", cardId: event.card.id, error: String(e.message || e) }) + "\n"); } catch {}
@@ -2894,31 +3203,15 @@ function syncFromPipeline() {
             const title = String((item && (item.title || item)) || "").trim();
             if (!title || card.deferredSpawned.includes(title)) continue;
             const reason = String((item && item.reason) || "").trim();
-            const nid = crypto.randomUUID();
-            const theme = title.slice(0, 200);
-            board.cards.push({
-              id: nid, project: card.project,
-              slug: slugify(theme, "task-" + nid.slice(0, 8)),
-              theme,
-              description: (`Отложено из карточки «${card.theme}».` + (reason ? `\nПричина/куда: ${reason}` : "")).slice(0, MAX_DESC),
-              designLink: null, requirementsLink: card.requirementsLink || null, requirements: null,
-              attachments: [], rigor: card.rigor || "off",
-              column: "backlog", createdAt: new Date().toISOString(), dispatchedAt: null,
-              history: [{ column: "backlog", ts: new Date().toISOString() }],
-              spawnedFrom: card.id,
-              // S3 §4.2: a tail is NOT a fresh statement of work — it inherits the parent's
-              // context (sources / contract / req link / write footprint) and starts as a
-              // DRAFT: visible on the board, but dispatchBlock() refuses to run it until a
-              // human has looked it over. That is what stopped 30 tails/run being auto-work.
-              origin: "deferred", draft: true,
-              sources: Array.isArray(card.sources) ? card.sources.slice() : [],
-              // a parent whose contract was TBD has already published the real one — hand the
-              // tail the RESULT, not the placeholder, or the tail would re-design it.
-              contract: card.contractResult || card.contract || null,
-              files: Array.isArray(card.files) ? card.files.slice() : [],
-              outOfScope: null, acceptance: [],
-              planId: null, dependsOn: [], autonomy: null,
-            });
+            // S3 §4.2: a tail is NOT a fresh statement of work — it inherits the parent's
+            // context (sources / contract / req link / write footprint) and starts as a DRAFT:
+            // visible on the board, but dispatchBlock() refuses to run it until a human has
+            // looked it over. That is what stopped 30 tails/run being auto-work. A1.2: the
+            // inheritance itself lives in spawnTailCard — `split` reuses the same one.
+            const nid = spawnTailCard(board, card, {
+              theme: title.slice(0, 200),
+              description: `Отложено из карточки «${card.theme}».` + (reason ? `\nПричина/куда: ${reason}` : ""),
+            }).id;
             card.deferredSpawned.push(title);
             changed = true;
             try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "deferred-spawn", cardId: card.id, newCardId: nid, title }) + "\n"); } catch {}
@@ -3075,6 +3368,32 @@ function syncFromPipeline() {
       }
     }
 
+    // 2.5) A1.1 · предохранитель. Ран ЖИВ и работает — watchdog выше о нём молчит, потому что
+    //    формально всё в порядке: процесс дышит, колонка меняется. Именно так выглядит runaway:
+    //    verify → implementing → verify по кругу, лог пухнет, счётчик денег крутится. Пороги
+    //    (возвраты + размер лога) считаются по данным, которые доска и так пишет.
+    //    Доска сама НИЧЕГО не останавливает: заметка человеку + событие стражу, решает он.
+    if (card.runPid && ACTIVE_COLUMNS.has(card.column) && !card.wardenPending) {
+      const sig = loopSignals(board, card);
+      const last = card.loopBudget || null;
+      // Повтор только на РОСТЕ сигнала: иначе пробитый порог звал бы стража каждые 2 с.
+      const fresh = sig.over.length && (!last || sig.loops > (last.loops || 0) || sig.logMB >= (last.logMB || 0) * 2);
+      if (fresh) {
+        const why = [];
+        if (sig.over.includes("loops")) why.push(`возвратов на доработку: ${sig.loops} (порог ${sig.limit.loops})`);
+        if (sig.over.includes("log")) why.push(`лог рана ${sig.logMB} МБ (порог ${sig.limit.logMB} МБ)`);
+        const reason = `Предохранитель: карточка в работе ${sig.minutes} мин, ${why.join(", ")}. Похоже на цикл, а не на прогресс.`;
+        card.loopBudget = { ts: new Date().toISOString(), loops: sig.loops, logMB: sig.logMB, over: sig.over };
+        // Заметка ставится ВСЕГДА, даже если стража нет: без неё человек узнаёт о сгоревшей
+        // квоте из счёта, а не с доски. Ровно этого не хватило на G2.
+        card.notes = (card.notes || []).slice(-19);
+        card.notes.push({ ts: card.loopBudget.ts, by: "board", class: "loop-budget", text: reason });
+        fireWardenEvent(board, card, { kind: "loop-budget", hint: "loop-budget", reason, blockOnTimeout: false });
+        try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.loopBudget.ts, event: "loop-budget", cardId: card.id, planId: card.planId || null, loops: sig.loops, logMB: sig.logMB, over: sig.over, limit: sig.limit }) + "\n"); } catch {}
+        changed = true;
+      }
+    }
+
     // 3) S4 · the `asking` watchdog. ACTIVE_COLUMNS deliberately excludes `asking` — there the
     //    run has exited and we wait on the HUMAN, so a dead pid is expected. But two states are
     //    not a human wait at all: (a) crash-before-write — the run died before writing its
@@ -3139,6 +3458,7 @@ function syncFromPipeline() {
   if (planMetricsTick(board)) changed = true;
   if (changed) writeBoard(board);
   flushWardenQueue();   // strictly after the write — see the note on WARDEN_QUEUE
+  flushPlanQueue();     // A1.4: по той же причине — приёмник отвечает быстрее, чем длится тик
 }
 
 // ── http helpers ─────────────────────────────────────────────────────────────
@@ -3184,9 +3504,12 @@ function sameOrigin(req) {
 async function handleApi(req, res, urlPath) {
   if (req.method !== "GET" && !sameOrigin(req)) return sendJSON(res, 403, { error: "forbidden origin" });
 
-  // GET /api/board
+  // GET /api/board — A1.3: прогоны отдаются с `release` (стадия релиза + её возраст). Это
+  // «истина» из решения 4: события вебхука могут теряться, а один этот запрос всегда показывает
+  // реальное состояние партии — именно им приёмник сверяет свой runs.json.
   if (req.method === "GET" && urlPath === "/api/board") {
-    return sendJSON(res, 200, readBoard());
+    const board = readBoard();
+    return sendJSON(res, 200, { ...board, plans: (board.plans || []).map((p) => ({ ...p, release: planRelease(p) })) });
   }
 
   // PATCH /api/settings -> board-wide defaults: the global autonomy (§5.3 header toggle) and
@@ -3365,10 +3688,17 @@ async function handleApi(req, res, urlPath) {
     // карточки на Opus, экраны на Sonnet» a per-run switch instead of a code change.
     const planModel = typeof b.model === "string" && b.model.trim() ? b.model.trim() : null;
     const planBuildMode = BUILD_MODES.includes(b.buildMode) ? b.buildMode : null;
+    // A1.1: единственный уровень, на котором порог предохранителя можно переопределить.
+    // Покарточных ручек нет: осмысленно подобрать порог на каждую карточку никто не будет,
+    // а два владельца у одного лимита — это гарантированное расхождение.
+    const lbIn = (b.loopBudget && typeof b.loopBudget === "object") ? b.loopBudget : {};
+    const lbNum = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : undefined);
+    const planLoopBudget = (lbNum(lbIn.loops) || lbNum(lbIn.logMB))
+      ? { loops: lbNum(lbIn.loops), logMB: lbNum(lbIn.logMB) } : null;
     const plan = {
       id, project, goal: String(b.goal || "").trim().slice(0, MAX_DESC) || null,
       integrationBranch, mode, cardIds: ids, status: "running", policy,
-      model: planModel, buildMode: planBuildMode,
+      model: planModel, buildMode: planBuildMode, loopBudget: planLoopBudget,
       decisions, createdAt: new Date().toISOString(), result: null,
     };
     board.plans.push(plan);
@@ -3555,6 +3885,26 @@ async function handleApi(req, res, urlPath) {
       return sendJSON(res, 200, { hook: wardenHook(board) });
     }
   }
+  // GET|POST /api/hooks/plan -> A1.4 · приёмник событий ПРОГОНА (рядом с хуком стража, тот же
+  // контракт: command локально, http на VPS/Гермес). `{"kind":"off"}` — выключить.
+  if (urlPath === "/api/hooks/plan") {
+    const board = readBoard();
+    if (req.method === "GET") return sendJSON(res, 200, { hook: planHook(board), stored: board.planHook || null, events: PLAN_EVENT_NAMES });
+    if (req.method === "POST") {
+      const b = await readBody(req);
+      const kind = ["command", "http", "off"].includes(b.kind) ? b.kind : null;
+      if (!kind) return sendJSON(res, 400, { error: "kind must be command | http | off" });
+      if (kind === "command" && !String(b.cmd || "").trim()) return sendJSON(res, 400, { error: "cmd is required for kind=command" });
+      if (kind === "http" && !String(b.url || "").trim()) return sendJSON(res, 400, { error: "url is required for kind=http" });
+      board.planHook = kind === "off" ? { kind: "off" }
+        : { kind, cmd: b.cmd ? String(b.cmd) : undefined, url: b.url ? String(b.url) : undefined,
+            registeredAt: new Date().toISOString() };
+      writeBoard(board);
+      try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "plan-hook", kind }) + "\n"); } catch {}
+      return sendJSON(res, 200, { hook: planHook(board) });
+    }
+  }
+
   // POST /api/tasks/:id/pause  { reason, minutes?, note?, by? } -> paused, place in queue kept
   // POST /api/tasks/:id/resume { by? }
   // POST /api/tasks/:id/note   { text, class?, by? } -> the diagnosis a human reads on the card
@@ -3594,6 +3944,74 @@ async function handleApi(req, res, urlPath) {
     writeBoard(board);
     try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts, event: "warden-" + action, cardId: card.id, by, reason: card.pausedReason || null }) + "\n"); } catch {}
     return sendJSON(res, 200, { card, budget: wardenBudget(card) });
+  }
+
+  // POST /api/tasks/:id/split { by, reason, remainder, theme?, acceptance? } -> A1.2 · Д2
+  // «Отрезать»: зафиксировать то, что уже сделано (зелёные коммиты лежат в ветке карточки),
+  // остаток сценария вынести отдельным хвостом-черновиком и закрыть исходную карточку.
+  //
+  // Зачем действие, которого не было: единственным выходом из runaway был `pause` + эскалация
+  // «продолжать?», а это часы ожидания человека при работающем счётчике. `split` сохраняет
+  // сделанное и превращает правило нарезки «карточка = один сценарий» в самокоррекцию: карточка,
+  // которая на практике оказалась двумя, честно становится двумя.
+  const msplit = urlPath.match(/^\/api\/tasks\/([^/]+)\/split$/);
+  if (msplit && req.method === "POST") {
+    const b = await readBody(req);
+    const by = b.by === "warden" ? "warden" : "human";
+    const board = readBoard();
+    const card = board.cards.find((c) => c.id === msplit[1]);
+    if (!card) return sendJSON(res, 404, { error: "card not found" });
+    if (!card.dispatchedAt) return sendJSON(res, 409, { error: "карточка ещё не запускалась — резать нечего, правь её в Backlog" });
+    if (card.column === TERMINAL) return sendJSON(res, 409, { error: "карточка уже закрыта" });
+    if (by === "warden") {
+      const budget = wardenBudget(card);
+      if (budget.left <= 0) return sendJSON(res, 429, { error: `бюджет стража исчерпан: ${WARDEN_BUDGET} вмешательств за 24 ч (§2.4) — эскалируй человеку`, budget });
+      recordWardenAction(card, "split");
+    }
+    const remainder = String(b.remainder || "").trim();
+    if (!remainder) return sendJSON(res, 400, { error: "remainder is required — опиши остаток сценария, который уезжает в хвост" });
+    const reason = String(b.reason || "работа отрезана предохранителем").slice(0, 500);
+    // 1) остановить ран. Живой процесс, дописывающий в ту же ветку после того, как карточка
+    //    закрыта, — это гонка: хвост увидит незафиксированное дерево и начнёт с середины.
+    const killed = isAlive(card.runPid);
+    if (killed) { try { process.kill(card.runPid, "SIGTERM"); } catch {} }
+    const branch = branchFor(card);
+    // 2) хвост. Ветка называется явно: доска не коммитит за агента, зелёные коммиты уже лежат
+    //    в ней («green(<cardId>): …»), и хвосту нужно ровно одно — знать, откуда продолжать.
+    const tail = spawnTailCard(board, card, {
+      theme: String(b.theme || `Остаток: ${card.theme || card.id}`).slice(0, 200),
+      description: [
+        `ОСТАТОК КАРТОЧКИ «${card.theme || card.id}» (отрезан предохранителем ${by === "warden" ? "стражем" : "человеком"}).`,
+        `Причина реза: ${reason}`,
+        ``,
+        `Что осталось сделать:`,
+        remainder,
+        ``,
+        `Сделанное НЕ переделывать: зелёные коммиты исходной карточки лежат в ветке «${branch}»`,
+        `("git log --oneline ${branch}" → коммиты "green(${card.id}): …"). Продолжай с самого дальнего`,
+        `зелёного коммита, фичу заново не начинай.`,
+      ].join("\n"),
+      outOfScope: card.outOfScope || null,
+      acceptance: Array.isArray(b.acceptance) ? b.acceptance.map((x) => String(x).slice(0, MAX_ACCEPTANCE_LEN)) : [],
+    });
+    // 3) закрыть исходную. `ready` — это «доска по ней больше ничего не сделает», а не «сценарий
+    //    выполнен целиком»: чем именно она закончилась, написано в finishNote и в заметке.
+    const ts = new Date().toISOString();
+    card.split = { at: ts, into: tail.id, reason, by, branch };
+    card.finishNote = `Карточка отрезана предохранителем: сделанное осталось в ветке «${branch}», остаток вынесен в черновик «${tail.theme}» (${tail.id}).`;
+    card.column = TERMINAL;
+    card.queued = false;
+    card.blockReason = null;
+    card.wardenPending = null;
+    card.runPid = null;
+    card.lastColumnChangeAt = ts;
+    card.history.push({ column: TERMINAL, ts, via: "split", reason });
+    card.notes = (card.notes || []).slice(-19);
+    card.notes.push({ ts, by, class: "split", text: `${reason} → остаток в карточке ${tail.id}.` });
+    card.result = buildResult(card);
+    writeBoard(board);
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts, event: "split", cardId: card.id, by, tailId: tail.id, killed, planId: card.planId || null, reason }) + "\n"); } catch {}
+    return sendJSON(res, 200, { card, tail, killed, budget: wardenBudget(card) });
   }
 
   // GET /api/tasks/:id/log  -> tail of the run's log (issue #8)

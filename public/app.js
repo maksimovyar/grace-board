@@ -527,6 +527,20 @@ function closeState(plan) {
   if (plan.closeStep === "closed") return "closed";
   return "running";
 }
+// A1.3 · Д3 · «ready ≠ в проде»: сколько прогон стоит НА ЭТОЙ стадии релиза. Сервер отдаёт
+// `plan.release` (шаг, момент входа в него, признак «ждут человека» и `stale`), UI показывает
+// возраст словами. Без этого числа «PR за тобой» неотличим от «PR за тобой третьи сутки» —
+// именно так партия и застревала незаметно. `approx` — прогон собран до этой версии, точного
+// момента входа в стадию у него нет, поэтому «≈».
+function releaseAgeHTML(plan) {
+  const r = plan.release;
+  if (!r || r.ageMinutes === null || r.ageMinutes === undefined || !r.since) return "";
+  const cls = r.stale ? " close__age--stale" : r.waitingHuman ? " close__age--wait" : "";
+  const title = r.waitingHuman
+    ? "доска по этому прогону больше ничего не сделает сама — ход человека"
+    : "сколько прогон идёт по текущему шагу закрытия";
+  return `<span class="close__age${cls}" title="${esc(title)}">${r.approx ? "≈ " : ""}${esc(ago(r.since))} на этой стадии</span>`;
+}
 // Прогон закрыт — доска по нему больше ничего не сделает сама. Полка (Ш5), не колонки.
 const CLOSED_STATES = new Set(["pr-ready", "closed", "failed"]);
 function closeHTML(plan) {
@@ -538,6 +552,7 @@ function closeHTML(plan) {
   const broken = plan.closeStep === "acceptance-broken";
   bits.push(`<span class="close__state close__state--${broken ? "broken" : esc(plan.closeStatus)}">${broken ? "⚠ приёмки не было" : plan.closeStatus === "verifying" ? "⏳ закрытие" : plan.closeStatus === "done" ? "✓ закрыт" : "✕ провален"}</span>`);
   bits.push(`<span class="close__step">${esc(CLOSE_STEP_RU[plan.closeStep] || plan.closeStep || "")}</span>`);
+  bits.push(releaseAgeHTML(plan));
   // Ш1.2 · «не прогналась» ≠ «красная»: в первом случае проверок НЕ БЫЛО, и это единственное,
   // что человеку нужно знать, прежде чем идти чинить якобы сломанный код.
   if (a && a.inconclusive) bits.push(`<span class="close__chip close__chip--bad" title="${esc((a.deaths || []).map((d) => `${d.ts}: ${d.why}`).join("\n"))}">приёмка: не прогналась · попыток ${a.attempts || 1}</span>`);
@@ -720,20 +735,24 @@ function attention() {
   for (const p of (state.plans || [])) {
     if (p.archived) continue;
     const st = closeState(p);
+    // A1.3 · Д3: сколько прогон УЖЕ ждёт человека. «Автомерж не прошёл» и «автомерж не прошёл,
+    // и это третьи сутки» — разные новости, а до сих пор здесь стояла только первая.
+    const held = (p.release && p.release.waitingHuman && p.release.since)
+      ? ` · ${p.release.approx ? "≈" : ""}${ago(p.release.since)} без движения` : "";
     if (st === "merge-failed")
       rows.push({ k: "merge", ic: "⛔", t: p.goal || "Прогон " + p.id, plan: p.id,
-        s: `автомерж не прошёл · ${p.result && p.result.pr && p.result.pr.url ? "PR собран" : "PR не создан"} — доска дальше не пойдёт`, go: "Разобрать" });
+        s: `автомерж не прошёл · ${p.result && p.result.pr && p.result.pr.url ? "PR собран" : "PR не создан"} — доска дальше не пойдёт${held}`, go: "Разобрать" });
     // Ш1.2 · работа сделана, а проверить её доска не смогла. Это ровно та ночь 08→09.08, когда
     // прогон с зелёным CI и тремя этапами в ready простоял до утра под ярлыком «провален».
     if (st === "acceptance-broken") {
       const ab = (p.result || {}).acceptanceBroken || {};
       rows.push({ k: "merge", ic: "⚠", t: p.goal || "Прогон " + p.id, plan: p.id,
         s: `приёмка не прогналась (${ab.attempts || "?"} попыт.) · этапов в ready ${ab.ready ?? "?"}/${ab.stages ?? "?"}`
-          + ` · CI: ${ab.ci || "не спрошен"} — код НЕ проверен, PR черновик`, go: "Разобрать" });
+          + ` · CI: ${ab.ci || "не спрошен"} — код НЕ проверен, PR черновик${held}`, go: "Разобрать" });
     }
     if (st === "deploy-hold")
       rows.push({ k: "floor", ic: "⚠", t: p.goal || "Прогон " + p.id, plan: p.id,
-        s: "смержено · деплой за человеком (жёсткий пол: боевой стенд)", go: "Раскатать" });
+        s: `смержено · деплой за человеком (жёсткий пол: боевой стенд)${held}`, go: "Раскатать" });
   }
   return rows;
 }
@@ -805,7 +824,12 @@ function shelfRowHTML(plan) {
   if (pr && pr.url) chips.push(`<a class="tag${pr.draft ? " tag--bad" : ""}" href="${esc(safeUrl(pr.url) || "#")}" target="_blank" rel="noopener">PR${(pr.url.match(/\/(\d+)$/) || [])[1] ? " " + pr.url.match(/\/(\d+)$/)[1] : ""}${pr.draft ? " · черновик" : ""} →</a>`);
   else if (pr && pr.error) chips.push(`<span class="tag tag--bad" title="${esc(pr.error)}">PR не создан</span>`);
   chips.push(`<span class="tag">${onBoard ? `${onBoard} на доске` : "карточек нет"}</span>`);
-  if (closedAt) chips.push(`<span class="tag">${esc(ago(closedAt))} назад</span>`);
+  // A1.3: на полке возраст стадии важнее возраста закрытия — «PR за тобой» и «PR за тобой
+  // вторые сутки» это разные новости, и вторая обязана колоть глаз.
+  const rel = plan.release;
+  if (rel && rel.waitingHuman && rel.since)
+    chips.push(`<span class="tag${rel.stale ? " tag--bad" : ""}" title="ход человека — доска дальше сама не пойдёт">ждёт тебя ${rel.approx ? "≈ " : ""}${esc(ago(rel.since))}</span>`);
+  else if (closedAt) chips.push(`<span class="tag">${esc(ago(closedAt))} назад</span>`);
   return `<div class="done${st === "failed" ? " done--failed" : ""}" data-planrow="${esc(plan.id)}">
     <div class="done__head">
       <span class="done__ic">${ic}</span>

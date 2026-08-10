@@ -131,6 +131,10 @@ over it. See [`.env.example`](.env.example).
 | `GRACE_WARDEN_TIMEOUT_MIN` | `10` | how long a deferred block waits for the warden's answer |
 | `GRACE_WARDEN_BUDGET` | `5` | warden interventions per card per 24 h |
 | `GRACE_WARDEN_CMD` | — | zero-config warden hook (same as registering `{kind:"command"}`) |
+| `GRACE_LOOP_MAX` | `2` | returns `verifying/reviewing → implementing` before the fuse calls the warden |
+| `GRACE_LOG_MAX_MB` | `6` | size of one run's output before the fuse calls the warden |
+| `GRACE_RELEASE_STALE_MIN` | `60` | how long a run may sit in a human-owed release stage before it is flagged |
+| `GRACE_PLAN_HOOK_URL` | — | zero-config run-event webhook (same as registering `{kind:"http"}`) |
 | `GRACE_QUOTA_FALLBACK_MIN` | `30` | how long to wait when a run hits the limit but logs no reset time |
 | `GRACE_QUOTA_MAX_WAIT_MIN` | `360` | sanity cap on a parsed reset time (a stale log line can't sleep a day) |
 | `GRACE_GH_BIN` | `gh` | GitHub CLI used to open/merge the final PR of a run |
@@ -249,7 +253,15 @@ against a fixed table and acts through HTTP only — it never writes `board.json
 | `GET /api/health[?minutes=N]` | every card standing longer than N, with the evidence: station, pid alive, questions, log tail, **how many runs died in the last 60 s**, budget left |
 | `POST /api/tasks/:id/pause` \| `resume` | `paused` — not broken, waiting out an external limit; **keeps its station and its place in the queue** |
 | `POST /api/tasks/:id/note` | the diagnosis, shown on the card, so a human reads "why we stand" instead of a log |
+| `POST /api/tasks/:id/split` | `{remainder}` — stop the run, carry the unfinished remainder into a draft tail card (inherits sources/contract/files), close the original. The green commits stay in its branch |
 | `POST /api/hooks/warden` | register the handler: `{kind:"command",cmd}` locally, `{kind:"http",url}` on a VPS, `{kind:"off"}` to disable |
+| `POST /api/hooks/plan` | same shape, for **run** events: `close-step`, `awaiting`, `acceptance-broken`, `ci-red`, `plan-quota-hold`, `plan-closed`. Best-effort: one shot, 5 s, no retries — the truth is `GET /api/board`, where every run now carries `release` (stage + its age) |
+
+A fourth event joins the three above: **`loop-budget`** — the card is alive and working, but
+has crossed the fuse (`GRACE_LOOP_MAX` returns to `implementing`, or `GRACE_LOG_MAX_MB` of run
+output). That is what a runaway looks like from outside: nothing is broken, the meter just keeps
+running. The board stops nothing by itself — it writes a note on the card and hands the case to
+the warden, whose one new action is `split`.
 
 While the warden holds a card the block is **deferred**; if the agent stays silent for
 `GRACE_WARDEN_TIMEOUT_MIN` the board keeps its original decision. Its actions are
