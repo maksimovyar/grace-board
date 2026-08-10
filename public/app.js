@@ -87,6 +87,12 @@ function renderPulse(attN) {
 const ORIGIN_BADGE = { skill: ["◇ скилл", "заведена скиллом graceboard-plan — доска требует полную постановку"],
   agent: ["◆ агент", "заведена агентом — доска требует полную постановку"],
   deferred: ["↳ хвост", "отложено из другой карточки — поля унаследованы"] };
+// A2.1: карточка починки технически тот же «хвост» (origin: deferred, контекст унаследован),
+// но человеку она не хвост, а объяснение, почему прогон ещё не закрыт. Называем как есть.
+function originBadge(card) {
+  if (card.fixFor) return ["✚ починка", "заведена доской по красной приёмке прогона — правит только провалившиеся сценарии"];
+  return ORIGIN_BADGE[card.origin];
+}
 function cardTags(card) {
   const t = [];
   // S4 §2.2: paused ≠ broken. The card keeps its station and its place in the queue, and the
@@ -102,7 +108,7 @@ function cardTags(card) {
   if (card.wardenPending) t.push(`<span class="tag tag--warden" title="${esc(card.wardenPending.reason || "")}">🛡 страж · ${esc(card.wardenPending.kind || "")}</span>`);
   // S3: draft (an unreviewed tail) never dispatches — say so where the card is, not in a 409.
   if (card.draft) t.push(`<span class="tag tag--draft" title="черновик: не уедет в работу, пока человек не снимет пометку">✎ черновик</span>`);
-  const ob = ORIGIN_BADGE[card.origin];
+  const ob = originBadge(card);
   if (ob) t.push(`<span class="tag tag--origin" title="${esc(ob[1])}">${esc(ob[0])}</span>`);
   // S4: plan stage badge «этап N/M» — most salient for a plan card, shown first.
   const plan = planOfCard(card);
@@ -504,6 +510,8 @@ function runHTML(plan) {
 // S5 §5.2–5.5: the closing phase, in the human's words. Before it starts this is empty and the
 // rail looks exactly as it did in S4.
 const CLOSE_STEP_RU = { acceptance: "идёт приёмка прогона", pr: "собираю PR", "pr-wait": "создаю PR",
+  // A2.1 · контур починки: доска сама правит красную приёмку, человек в этом круге не участвует
+  "fix-wait": "приёмка красная — чиню сама, потом переиграю", "pr-refresh": "обновляю PR",
   "post-pr": "разбираю результат", "merge-wait": "мержу", deploy: "деплой", "deploy-wait": "деплой идёт",
   "pr-ready": "закрыт · PR собран, мерж за тобой", "merge-failed": "автомерж не прошёл — мерж за человеком",
   "awaiting-deploy": "деплой ждёт человека", closed: "закрыт",
@@ -1177,7 +1185,7 @@ function openDetail(id) {
     ? `<div class="dt__draft">✎ <b>Черновик.</b> Заведена автоматически как отложенное из другой карточки: поля унаследованы, объём не проверен.
          В работу не уедет, пока ты не снимешь пометку.<button class="btn btn--ghost" type="button" data-undraft>Снять черновик</button></div>`
     : "";
-  const ob = ORIGIN_BADGE[card.origin];
+  const ob = originBadge(card);
   document.getElementById("detailPanel").innerHTML = `
     <div class="sheet__head">
       <div class="dt__badges">${badge(card.column)}<span class="badge">${esc(card.project)}</span>${ob ? `<span class="badge" title="${esc(ob[1])}">${esc(ob[0])}</span>` : ""}</div>

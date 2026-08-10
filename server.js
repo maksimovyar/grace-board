@@ -851,6 +851,10 @@ function planOrderHold(board, card) {
   if (!card || !card.planId) return null;                       // одиночная карточка не ждёт никого
   const mine = planById(board, card.planId);
   if (!mine) return null;
+  // A2.1: прогон починки не ждёт НИКОГО — по той же причине, по которой очередь пропускает
+  // одиночную fix-карточку. Ветка родителя не в main именно из-за красной приёмки, которую
+  // эта починка и правит: заставить её ждать родителя значит заставить ждать саму себя.
+  if (mine.fixFor) return null;
   const projectDir = resolveProjectDir(card.project);
   if (!isInsideRoot(projectDir)) return null;
   const mineAt = Date.parse(mine.createdAt || "") || 0;
@@ -1219,7 +1223,8 @@ const PLAN_HOOK_URL = (process.env.GRACE_PLAN_HOOK_URL || "").trim();
 const PLAN_HOOK_LOG_DIR = path.join(DATA_DIR, "plan-hook");
 // Полный список того, что может прийти приёмнику. Отдаётся в GET /api/hooks/plan, чтобы
 // сторона Гермеса не выясняла состав событий чтением исходника доски.
-const PLAN_EVENT_NAMES = ["close-step", "awaiting", "acceptance-broken", "ci-red", "plan-quota-hold", "plan-closed"];
+const PLAN_EVENT_NAMES = ["close-step", "awaiting", "acceptance-broken", "ci-red", "plan-quota-hold", "plan-closed",
+  "fix-started", "fix-done", "fix-exhausted"];
 function planHook(board) {
   const h = board && board.planHook;
   if (h && h.kind === "command" && h.cmd) return h;
@@ -1262,6 +1267,186 @@ function flushPlanQueue() {
   }
 }
 // endregion FUNC_planEvents
+
+// region FUNC_planFix — красная приёмка чинится сама, не ждёт человека (A2.1 · Д5)
+// ## @purpose Красная приёмка была терминалом: PR остаётся черновиком, прогон `failed`,
+// ##   и дальше — «решение за человеком». Авто-починки не существовало вовсе, поэтому один
+// ##   провалившийся сценарий останавливал ВСЮ очередь партии до утра: следующий прогон держит
+// ##   гейт порядка (ветка не в main), а сдвинуть её некому.
+// ##   Здесь доска делает то же, что сделал бы человек: заводит карточку починки ровно на
+// ##   провалившиеся сценарии, собирает из неё мини-прогон В ТУ ЖЕ ветку и, когда починка
+// ##   доехала, переигрывает приёмку исходного прогона.
+// ## @io (board, plan, acceptance) -> карточка починки + план `fixFor` + событие вебхука
+// ## @invariants
+// ## - Кругов починки максимум `FIX_MAX_ROUNDS` (2). Дальше — человек, и это НЕ тихий провал:
+// ##   notice на прогоне + событие `fix-exhausted`. Бесконечная самопочинка дороже человека.
+// ## - Починка живёт в ВЕТКЕ РОДИТЕЛЯ. Не в своей: PR по ветке уже открыт черновиком, и
+// ##   коммиты починки должны доехать именно в него — иначе появится второй PR на ту же работу.
+// ## - Мини-прогон НЕ закрывается по общей схеме: своей приёмки у него нет (её роль исполняет
+// ##   переигранная приёмка родителя), своего PR тоже. Иначе один провал стоил бы двух приёмок.
+// ## - Дефекты уровня КАРТОЧКИ сюда не попадают: они чинятся внутри build-сессии карточки
+// ##   циклом verify → implementing. Контур существует только для сквозной приёмки прогона.
+// ## - Карточка починки — единственная не-черновая из заводимых доской (см. spawnTailCard):
+// ##   человек в этом круге не участвует, иначе авто-починки нет.
+// ## - Красная приёмка БЕЗ единого failed-чека (нечего чинить) в контур не идёт — сразу человеку.
+// ## @rationale Q: почему починка не ждёт своей очереди? A: гейт порядка держит прогоны, чья
+// ##   ветка не в main — а ветка родителя не в main ИМЕННО из-за красной приёмки. Починка,
+// ##   ждущая родителя, ждала бы саму себя. Это тот же случай, что и одиночная fix-карточка,
+// ##   которой гейт разрешает обгонять очередь.
+// ## @modulemap
+// ## FUNC 4[calc]    => fixBrief       — постановка починки: что именно не работает
+// ## FUNC 7[persist] => launchPlanFix  — карточка + мини-прогон + диспатч + событие
+// ## FUNC 5[persist] => finishPlanFix  — починка доехала → переигрыш приёмки родителя
+// ## FUNC 4[persist] => fixExhausted   — круги кончились → человек, громко
+// GREP_SUMMARY: A2.1, Д5, починка, красная приёмка, fixFor, мини-прогон, переигрыш приёмки, круги
+// STRUCTURE: ▶ красная приёмка → ⊕ launchPlanFix(карточка+план) → ⚡ ready → ⎋ приёмка родителя заново
+
+const FIX_MAX_ROUNDS = Math.max(0, Number(process.env.GRACE_FIX_ROUNDS ?? 2));
+const uniqStr = (arr) => [...new Set(arr.filter((x) => typeof x === "string" && x.trim()))];
+
+// Постановка починки. Пишется для кодера и для человека одновременно: что не работает, что
+// приёмка при этом видела, где чинить и чего НЕ трогать. Границы здесь важнее объёма — карточка
+// починки без границ превращается в «доделай прогон», то есть во второй прогон.
+function fixBrief(board, plan, acc, round) {
+  const failedChecks = (acc.checks || []).filter((c) => c.status === "fail");
+  const L = [
+    `ПОЧИНКА ПРИЁМКИ ПРОГОНА «${plan.goal || plan.id}» — круг ${round} из ${FIX_MAX_ROUNDS}.`,
+    ``,
+    `Все этапы прогона доехали до ready и прошли покарточную верификацию, но СКВОЗНАЯ приёмка`,
+    `нашла неработающее. Чинить нужно ровно это:`,
+    ``,
+  ];
+  failedChecks.forEach((c, i) => {
+    L.push(`${i + 1}) ${c.title}${c.kind === "deterministic" ? "  [детерминированная проверка]" : ""}`);
+    if (c.output) L.push(`   что увидела приёмка: ${String(c.output).slice(0, 1200).replace(/\n/g, "\n   ")}`);
+    if (c.evidence) L.push(`   доказательство: ${c.evidence}`);
+  });
+  if (acc.notes) L.push(``, `Заметки приёмки: ${acc.notes}`);
+  L.push(
+    ``,
+    `ВЕТКА. Работай в «${plan.integrationBranch}» — это ветка того же прогона, PR по ней уже`,
+    `открыт черновиком. Каждое исправление — обычный green-коммит строго по своим files[].`,
+    `Новой ветки НЕ создавай: черновик PR должен стать зелёным, а не появиться второй раз.`,
+    ``,
+    `ГРАНИЦЫ. Чини ТОЛЬКО перечисленные сценарии. Не добавляй функциональность, не рефактори`,
+    `соседнее, не трогай сценарии, которые приёмка прошла. Если причина оказалась в чужом коде —`,
+    `почини минимально и напиши об этом в finishNote, а не переписывай.`,
+  );
+  const contracts = uniqStr(planCards(board, plan).map((c) => c.contractResult || c.contract));
+  if (contracts.length) L.push(``, `КОНТРАКТЫ ЭТАПОВ ПРОГОНА (соблюдать):`, ...contracts.map((c) => `• ${c}`));
+  return L.join("\n");
+}
+
+// Завести круг починки: карточка → мини-прогон в ветку родителя → в очередь проекта.
+// Возвращает созданный план (или null, если чинить нечего).
+function launchPlanFix(board, plan, acc) {
+  const failedChecks = (acc.checks || []).filter((c) => c.status === "fail");
+  if (!failedChecks.length) return null;                 // красная «на слово» — чинить нечего
+  const stages = planCards(board, plan);
+  const round = (plan.fixRounds || 0) + 1;
+  // Контекст наследуется от ПРОГОНА, а не от одной карточки: приёмка сквозная, и починка
+  // вправе трогать всё, что прогон писал. `id: null` — карточка починки не «хвост» этапа и не
+  // должна попасть в список хвостов прогона (planTails), у неё своя природа.
+  const context = {
+    id: null, project: plan.project,
+    requirementsLink: (stages.find((c) => c.requirementsLink) || {}).requirementsLink || null,
+    sources: uniqStr(stages.flatMap((c) => c.sources || [])).slice(0, MAX_SOURCES),
+    files: uniqStr(stages.flatMap((c) => c.files || [])),
+    contract: null, contractResult: null,
+    rigor: "off",   // решение владельца: починки без разметки
+  };
+  const card = spawnTailCard(board, context, {
+    theme: `Починка приёмки: ${plan.goal || plan.id}`.slice(0, 200),
+    description: fixBrief(board, plan, acc, round),
+    acceptance: failedChecks.map((c) => c.title),
+    outOfScope: "Всё, кроме перечисленных провалившихся сценариев приёмки.",
+    rigor: "off",
+    draft: false,   // единственное исключение: этот круг доска ведёт без человека
+  });
+  card.fixFor = plan.id;
+  card.fixRound = round;
+
+  const id = crypto.randomUUID().slice(0, 8);
+  const fixPlan = {
+    id, project: plan.project,
+    goal: `Починка приёмки прогона «${plan.goal || plan.id}» · круг ${round}`,
+    // Та же ветка — единственный способ довести уже открытый черновик PR до зелёного.
+    integrationBranch: plan.integrationBranch,
+    mode: "auto",                       // вопросов человеку в починке нет по определению
+    cardIds: [card.id], status: "running",
+    // Своего PR и своего мержа у починки нет: и то и другое принадлежит родителю.
+    policy: { pr: "never", merge: "manual", deploy: "off" },
+    model: plan.model || null, buildMode: plan.buildMode || null,
+    loopBudget: plan.loopBudget || null,
+    decisions: Array.isArray(plan.decisions) ? plan.decisions : [],
+    createdAt: new Date().toISOString(), result: null,
+    fixFor: plan.id, fixRound: round,
+  };
+  board.plans = board.plans || [];
+  board.plans.push(fixPlan);
+  card.planId = id;
+  card.integrationBranch = fixPlan.integrationBranch;
+  card.autonomy = "auto";
+  card.planDecisions = fixPlan.decisions;
+  card.column = "todo";
+  if (canDispatchNow(board, card)) dispatchNow(board, card, "plan-fix");
+  else {
+    card.queued = true;
+    card.queuedAt = new Date().toISOString();
+    card.lastColumnChangeAt = card.queuedAt;
+    card.history.push({ column: "todo", ts: card.queuedAt, via: "plan-fix-queued" });
+  }
+
+  plan.fixRounds = round;
+  plan.fixPlanId = id;
+  plan.fixHistory = [...(plan.fixHistory || []), { round, planId: id, cardId: card.id,
+    at: fixPlan.createdAt, failed: failedChecks.map((c) => c.id) }];
+  planNotice(plan, `Приёмка красная — доска чинит сама (круг ${round} из ${FIX_MAX_ROUNDS}). `
+    + `Провалено: ${failedChecks.map((c) => c.title).join(", ")}. Карточка починки уже в работе, `
+    + `после неё приёмка переиграется автоматически. Твоего участия пока не нужно.`, "warn");
+  logPlan(plan, "plan-fix-start", { round, fixPlanId: id, cardId: card.id, failed: acc.failed });
+  firePlanEvent(board, plan, "fix-started", { key: `round${round}`, round, maxRounds: FIX_MAX_ROUNDS,
+    fixPlanId: id, fixCardId: card.id, failed: failedChecks.map((c) => c.title) });
+  return fixPlan;
+}
+
+// Починка доехала — переиграть приёмку РОДИТЕЛЯ. Тот же сброс, что делает ручка «↻ переиграть
+// приёмку»: приёмка запускается заново на той же ветке, где теперь лежат коммиты починки.
+function finishPlanFix(board, fixPlan, parent) {
+  fixPlan.closeStatus = "done";
+  fixPlan.closeStep = "closed";
+  fixPlan.archived = true;                 // мини-прогон отработал, доске он больше не нужен
+  planNotice(fixPlan, `Починка доехала до ready — приёмка прогона «${parent.goal || parent.id}» переигрывается.`, "ok");
+  parent.closeStatus = "verifying";
+  parent.closeStep = "acceptance";
+  parent.acceptanceRun = null;
+  parent.acceptanceDeaths = [];             // круг починки — новая попытка, счётчик смертей с нуля
+  parent.acceptanceRetryAt = null;
+  parent.fixPlanId = null;
+  if (parent.result) { parent.result.acceptance = null; parent.result.acceptanceBroken = null; }
+  planNotice(parent, `Починка (круг ${fixPlan.fixRound}) закончена — приёмка запускается заново.`, "info");
+  logPlan(parent, "plan-fix-done", { round: fixPlan.fixRound, fixPlanId: fixPlan.id });
+  firePlanEvent(board, parent, "fix-done", { key: `round${fixPlan.fixRound}`, round: fixPlan.fixRound, fixPlanId: fixPlan.id });
+}
+
+// Круги кончились (или починка сама застряла) — дальше человек. Громко: прогон красный,
+// PR остаётся черновиком, событие уходит наружу. Молчаливый провал здесь хуже всего:
+// очередь партии стоит на этой ветке, и никто об этом не узнает.
+function fixExhausted(board, plan, acc, why) {
+  plan.closeStatus = "failed";
+  plan.closeStep = "closed";
+  // Человеку нужны НАЗВАНИЯ сценариев, а не id чеков: «c2» не говорит ничего, «письмо уходит
+  // на email» говорит всё. Падаем на id только если вердикт пришёл без чеков.
+  const byId = new Map(((acc && acc.checks) || []).map((c) => [c.id, c.title]));
+  const failed = ((acc && acc.failed) || []).map((id) => byId.get(id) || id).join("; ");
+  planNotice(plan, `Приёмка красная, авто-починка не помогла. ${why}. `
+    + `PR оставлен черновиком, деплоя не было. Провалено: ${failed || "см. PR"}. Дальше нужен человек — `
+    + `очередь прогонов проекта стоит на этой ветке.`, "error");
+  logPlan(plan, "plan-fix-exhausted", { rounds: plan.fixRounds || 0, why, failed: (acc && acc.failed) || [] });
+  firePlanEvent(board, plan, "fix-exhausted", { key: "final", rounds: plan.fixRounds || 0,
+    maxRounds: FIX_MAX_ROUNDS, why, failed: (acc && acc.failed) || [] });
+}
+// endregion FUNC_planFix
 
 // region FUNC_planClose — closing a run: manifest → acceptance → PR → policy (design §5)
 // ## @purpose 6 plans out of 6 ended with `status: "running"`, `result: null`, four archived by
@@ -1726,6 +1911,31 @@ function planCloseTick(board) {
     const dir = planDir(plan), projectDir = resolveProjectDir(plan.project);
     const acc = () => (plan.result && plan.result.acceptance) || null;
 
+    // ── A2.1 · мини-прогон починки закрывается НЕ по общей схеме ────────────────────────
+    //    Своей приёмки и своего PR у него нет: и то и другое принадлежит родителю. Его
+    //    единственный выход — довести карточку до ready и вернуть родителя на приёмку.
+    if (plan.fixFor) {
+      if (plan.closeStatus) continue;                        // уже отработал
+      const parent = planById(board, plan.fixFor);
+      if (!parent) {                                         // родителя снесли руками
+        plan.closeStatus = "failed"; plan.closeStep = "closed"; plan.archived = true;
+        planNotice(plan, "Родительский прогон исчез с доски — чинить нечего.", "warn");
+        changed = true; continue;
+      }
+      const stuck = cards.find((c) => c.column === "blocked");
+      if (stuck) {
+        plan.closeStatus = "failed"; plan.closeStep = "closed";
+        planNotice(plan, `Карточка починки встала: ${stuck.blockReason || "заблокирована"}.`, "error");
+        parent.fixPlanId = null;
+        fixExhausted(board, parent, (parent.result || {}).acceptance || null,
+          `Карточка починки (круг ${plan.fixRound}) заблокирована: ${stuck.blockReason || "причина не записана"}`);
+        changed = true; continue;
+      }
+      if (!cards.every((c) => c.column === TERMINAL)) continue;   // ещё чинит
+      finishPlanFix(board, plan, parent);
+      changed = true; continue;
+    }
+
     // ── start: every stage reached `ready` → the closing phase begins by itself (§5.2) ──
     if (!plan.closeStatus) {
       if (plan.archived) continue;                       // a run dismissed by hand is not closed
@@ -1832,6 +2042,18 @@ function planCloseTick(board) {
       continue;
     }
 
+    // ── A2.1 · родитель ждёт круг починки. Сам он ничего не делает: мини-прогон вернёт его
+    //    на приёмку, когда доедет. Здесь только страховка от исчезнувшего прогона починки —
+    //    иначе родитель завис бы в `fix-wait` навсегда, а очередь партии стоит на его ветке.
+    if (plan.closeStep === "fix-wait") {
+      const fix = plan.fixPlanId ? planById(board, plan.fixPlanId) : null;
+      if (!fix) {
+        fixExhausted(board, plan, acc(), "Прогон починки пропал с доски");
+        changed = true;
+      }
+      continue;
+    }
+
     // ── PR — ВСЕГДА (§5.4). Red acceptance opens it as a draft: a run that did not pass must
     //    still leave its trace, just not look mergeable.
     if (plan.closeStep === "pr") {
@@ -1843,6 +2065,22 @@ function planCloseTick(board) {
         plan.result.pr = { url: null, draft: false, ok: false, skipped: true, error: `pr=never — PR не создавался; тело собрано в ${bodyFile}` };
         plan.closeStep = "post-pr"; changed = true; continue;
       }
+      // A2.1: приёмка может прийти сюда ВТОРОЙ раз — после круга починки или после ручки
+      // «↻ переиграть приёмку». PR по этой ветке уже открыт, и `gh pr create` на неё падает с
+      // «already exists»: результат читался бы как «PR не создан» на ровном месте. Вместо
+      // создания — обновить тело и, если приёмка стала зелёной, снять с PR черновик. Это ровно
+      // то, ради чего починка и затевалась: черновик должен позеленеть, а не удвоиться.
+      const open = plan.result.pr;
+      if (open && open.ok && open.url) {
+        const undraft = open.draft && acc() && acc().passed;
+        const cmd = `${GH_BIN} pr edit ${shq(open.url)} --body-file ${shq(bodyFile)}`
+          + (undraft ? `; ${GH_BIN} pr ready ${shq(open.url)}` : "");
+        const st = spawnStep(projectDir, cmd, path.join(dir, "pr-refresh.out"));
+        plan.prRefreshRun = { ...st, undraft: !!undraft, startedAt: new Date().toISOString() };
+        plan.closeStep = "pr-refresh"; changed = true;
+        logPlan(plan, "plan-pr-refresh", { undraft: !!undraft, url: open.url, started: st.started });
+        continue;
+      }
       const draft = !(acc() && acc().passed);
       const title = (plan.goal || `Прогон ${plan.id}`).slice(0, 160);
       const cmd = `${GH_BIN} pr create --base main --head ${shq(plan.integrationBranch)} --title ${shq(title)} --body-file ${shq(bodyFile)}${draft ? " --draft" : ""}`;
@@ -1850,6 +2088,21 @@ function planCloseTick(board) {
       plan.prRun = { ...st, draft, startedAt: new Date().toISOString() };
       plan.closeStep = "pr-wait"; changed = true;
       logPlan(plan, "plan-pr", { draft, started: st.started });
+      continue;
+    }
+    // A2.1 · обновление уже открытого PR. Провал здесь НЕ красит прогон: тело PR — это удобство,
+    // а вердикт о работе уже вынесен приёмкой. Единственное, что записывается как факт, — снят
+    // ли черновик, потому что от этого зависит, можно ли PR мержить.
+    if (plan.closeStep === "pr-refresh") {
+      const r = readStep(path.join(dir, "pr-refresh.out"));
+      const started = Date.parse((plan.prRefreshRun || {}).startedAt || "") || 0;
+      if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.prRefreshRun || {}).started) continue;
+      const ok = !!(r && r.code === 0);
+      if ((plan.prRefreshRun || {}).undraft && ok) plan.result.pr.draft = false;
+      plan.result.pr.refreshedAt = new Date().toISOString();
+      plan.result.pr.refreshError = ok ? null : `обновить PR не удалось (${r ? "gh код " + r.code : "gh не ответил"}): ${r ? r.text.slice(-300) : ""}`;
+      plan.closeStep = "post-pr"; changed = true;
+      logPlan(plan, "plan-pr-refreshed", { ok, undraft: !!(plan.prRefreshRun || {}).undraft, draft: plan.result.pr.draft });
       continue;
     }
     if (plan.closeStep === "pr-wait") {
@@ -1880,10 +2133,20 @@ function planCloseTick(board) {
         }
         planAcceptanceBroken(board, plan, null); changed = true; continue;
       }
-      if (!a || !a.passed) {                       // красная приёмка · любой merge · любой deploy
-        plan.closeStatus = "failed"; plan.closeStep = "closed";
-        planNotice(plan, `Приёмка красная — PR оставлен черновиком, деплоя не было. Провалено: ${(a && a.failed || []).join(", ") || "см. PR"}`, "error");
-        logPlan(plan, "plan-failed", { failed: (a && a.failed) || [] });
+      if (!a || !a.passed) {
+        // A2.1 · Д5: красная приёмка больше не терминал. Пока есть круги — доска чинит сама:
+        // карточка ровно на провалившиеся сценарии, мини-прогон в ЭТУ ЖЕ ветку, потом приёмка
+        // заново. Человека зовём, только когда круги кончились или чинить нечего.
+        const canFix = a && (a.checks || []).some((c) => c.status === "fail") && (plan.fixRounds || 0) < FIX_MAX_ROUNDS;
+        if (canFix && launchPlanFix(board, plan, a)) {
+          plan.closeStatus = "verifying";
+          plan.closeStep = "fix-wait";
+          changed = true; continue;
+        }
+        fixExhausted(board, plan, a, !a ? "Вердикта приёмки нет"
+          : !(a.checks || []).some((c) => c.status === "fail")
+            ? "Ни один сценарий не помечен провалившимся — чинить нечего, вопрос к самой приёмке"
+            : `Кругов починки сделано: ${plan.fixRounds || 0} из ${FIX_MAX_ROUNDS}`);
         changed = true; continue;
       }
       // v4 Ш1 · зелёная · manual → ФИНАЛ, а не ожидание. Доска сделала всё, что обещала: собрала
@@ -2632,8 +2895,12 @@ function spawnTailCard(board, parent, opts) {
     attachments: [], rigor: opts.rigor || parent.rigor || "off",
     column: "backlog", createdAt: now, dispatchedAt: null,
     history: [{ column: "backlog", ts: now }],
-    spawnedFrom: parent.id,
-    origin: "deferred", draft: true,
+    spawnedFrom: parent.id || null,
+    // Черновик — умолчание и правило: хвост, найденный раном, работой не становится, пока на
+    // него не посмотрел человек. Единственное исключение — карточка починки (A2.1): её
+    // заводит САМА доска по факту красной приёмки, и человек в этом круге не участвует
+    // по определению, иначе авто-починки не существует.
+    origin: "deferred", draft: opts.draft !== false,
     sources: Array.isArray(parent.sources) ? parent.sources.slice() : [],
     contract: parent.contractResult || parent.contract || null,
     files: Array.isArray(parent.files) ? parent.files.slice() : [],

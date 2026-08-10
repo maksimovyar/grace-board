@@ -255,7 +255,7 @@ against a fixed table and acts through HTTP only — it never writes `board.json
 | `POST /api/tasks/:id/note` | the diagnosis, shown on the card, so a human reads "why we stand" instead of a log |
 | `POST /api/tasks/:id/split` | `{remainder}` — stop the run, carry the unfinished remainder into a draft tail card (inherits sources/contract/files), close the original. The green commits stay in its branch |
 | `POST /api/hooks/warden` | register the handler: `{kind:"command",cmd}` locally, `{kind:"http",url}` on a VPS, `{kind:"off"}` to disable |
-| `POST /api/hooks/plan` | same shape, for **run** events: `close-step`, `awaiting`, `acceptance-broken`, `ci-red`, `plan-quota-hold`, `plan-closed`. Best-effort: one shot, 5 s, no retries — the truth is `GET /api/board`, where every run now carries `release` (stage + its age) |
+| `POST /api/hooks/plan` | same shape, for **run** events: `close-step`, `awaiting`, `acceptance-broken`, `ci-red`, `plan-quota-hold`, `plan-closed`, `fix-started`, `fix-done`, `fix-exhausted`. Best-effort: one shot, 5 s, no retries — the truth is `GET /api/board`, where every run now carries `release` (stage + its age) |
 
 A fourth event joins the three above: **`loop-budget`** — the card is alive and working, but
 has crossed the fuse (`GRACE_LOOP_MAX` returns to `implementing`, or `GRACE_LOG_MAX_MB` of run
@@ -299,11 +299,29 @@ starts by itself when every stage reaches `ready`:
 
 | acceptance | `merge` | `deploy` | what happens |
 |---|---|---|---|
-| red | any | any | PR → draft, `failed`, one notice. **No deploy, ever** |
+| red | any | any | **the board repairs it itself** (below); out of rounds → PR stays draft, `failed`, one notice. **No deploy, ever** |
 | green | `manual` | — | "ready to merge" + the PR link. **Your one button** |
 | green | `auto` | `off` | merged, no deploy |
 | green | `auto` | `after-merge` | merged → deploy (`stand.deploy_cmd` from `.grace/local.md`) |
 | green | `auto` | `ask` | merged, the deploy waits for you |
+
+### A red acceptance repairs itself
+
+A red acceptance used to be a terminus: draft PR, `failed`, "your call". One failed scenario
+then held the **whole batch** — the next run waits on the order gate for a branch that will
+never reach `main` until a human shows up. So the board now does what a human would:
+
+1. it opens a card scoped to exactly the failed scenarios (their titles become its acceptance
+   criteria, the run's `files`/`sources` are inherited, `rigor: off`);
+2. it assembles a mini-run from that card **into the same integration branch** — so the commits
+   land in the draft PR that is already open, not in a second one. The order gate lets this run
+   overtake the queue: it is the thing unblocking it;
+3. when the fix reaches `ready`, the parent's **acceptance replays itself**. Green → the PR body
+   is refreshed and the draft flag comes off.
+
+Two rounds (`GRACE_FIX_ROUNDS`), then it stops and says so: notice on the run, `fix-exhausted`
+on the webhook, PR left as a draft. Card-level defects never enter this loop — those are fixed
+inside the card's own build session by `verify → implementing`.
 
 `stand.is_production: true` demotes any deploy policy to "waits for a human",
 **regardless of autonomy** — the mechanical floor sits before the policy, not after it.
