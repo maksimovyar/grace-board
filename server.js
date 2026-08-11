@@ -2787,6 +2787,16 @@ function planCloseTick(board) {
       const deployCmd = stand.deploy_cmd || null;    // lives in .grace/local.md (not in git)
       const finish = (text, level) => { plan.closeStatus = "done"; plan.closeStep = "closed"; planNotice(plan, text, level || "ok"); plan.archived = true; changed = true; };
       if (pol.deploy === "off") { finish(`Прогон закрыт: смержено, деплой выключен политикой.`); continue; }
+      // A4.2: релиз тегом — санкционированный автопуть с собственным smoke и автооткатом в
+      // deploy.yml приложения, поэтому проверяется ДО пола is_production: пол защищает
+      // произвольную команду выкатки, а не тег. С проверкой ПОСЛЕ пола автотег на проде не
+      // срабатывал никогда (найдено 11.08.2026: прогон 296240a6 health-intelligence встал в
+      // awaiting-deploy при stand.release: tag и явном решении владельца «автотег сразу»).
+      // Политика deploy=ask главнее тега: человек попросил решать ему.
+      if (pol.deploy !== "ask" && releaseMode(projectDir).mode === "tag") {
+        plan.closeStep = "tag"; changed = true;
+        continue;
+      }
       if (pol.deploy === "ask" || isProd) {
         plan.closeStatus = "done"; plan.closeStep = "awaiting-deploy";
         plan.result.deploy = { status: "awaiting-human", reason: isProd && pol.deploy !== "ask"
@@ -2795,13 +2805,6 @@ function planCloseTick(board) {
         planNotice(plan, `Смержено. Деплой ждёт человека: ${plan.result.deploy.reason}`, "warn");
         logPlan(plan, "plan-deploy-hold", { reason: plan.result.deploy.reason });
         changed = true; continue;
-      }
-      // A4.2: у приложения релиз может ехать ТЕГОМ, а не командой выкатки — тогда доска ставит
-      // `v*`, а всё остальное (snapshot → smoke по публичному URL → автооткат) делает deploy.yml
-      // самого приложения. Включается явно, `stand.release: tag`: без ключа — как было.
-      if (releaseMode(projectDir).mode === "tag") {
-        plan.closeStep = "tag"; changed = true;
-        continue;
       }
       if (!deployCmd) {
         plan.result.deploy = { status: "no-command", reason: "stand.deploy_cmd не задан в .grace/local.md" };
