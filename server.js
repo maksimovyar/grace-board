@@ -1403,7 +1403,10 @@ function planRelease(plan) {
   const step = plan.closeStep || null;
   const since = plan.closeStepAt || plan.createdAt || null;
   const ageMinutes = since ? Math.max(0, Math.round((Date.now() - (Date.parse(since) || Date.now())) / 60000)) : null;
-  const waitingHuman = RELEASE_WAITING.has(step);
+  // Ш1.3 · проваленный прогон ЖДЁТ ЧЕЛОВЕКА ровно так же, как `merge-failed`: его ветка не
+  // доехала до main, а гейт порядка держит на ней всю очередь проекта. Шаг у него «closed»,
+  // поэтому в RELEASE_WAITING он не попадал — и «сколько уже стоит» не показывалось нигде.
+  const waitingHuman = RELEASE_WAITING.has(step) || plan.closeStatus === "failed";
   return { step, state: releaseState(plan), status: plan.closeStatus || null,
     since, ageMinutes, approx: !!plan.closeStepApprox, waitingHuman,
     stale: !!(waitingHuman && ageMinutes !== null && ageMinutes >= RELEASE_STALE_MIN) };
@@ -2010,6 +2013,57 @@ function ciClassify(text) {
     failed: failed.map((f) => f.name), pending: pending.map((p) => p.name),
     failedUrls: failed.map((f) => f.url).filter(Boolean) };
 }
+// Ш1.3 · ЗАПАСНОЙ путь чтения CI — через Actions API вместо statusCheckRollup. Активный токен
+// репозитория (fine-grained PAT) на rollup отвечает «Resource not accessible by personal access
+// token», причём GitHub прямым текстом говорит: fine-grained PAT с правом `checks:read` создать
+// СЕЙЧАС НЕЛЬЗЯ. Для доски это значило вечный `unreadable` → ci-timeout 90 мин → «мерж за
+// человеком» на каждом прогоне, то есть автомержа не существовало в принципе. `gh run list` тем
+// же токеном читается нормально, и на вопрос «зелёный ли коммит» отвечает исчерпывающе.
+// Считается по ГОЛОВНОМУ коммиту PR: прогоны на прошлых коммитах ветки — это история, не вердикт.
+function ciClassifyRuns(prText, runsText) {
+  let pr = null, runs = null;
+  try { pr = JSON.parse((String(prText).match(/\{[\s\S]*\}/) || [""])[0]); } catch {}
+  try { runs = JSON.parse((String(runsText).match(/\[[\s\S]*\]/) || [""])[0]); } catch {}
+  if (!pr || !Array.isArray(runs)) return null;
+  const prState = String(pr.state || "").toUpperCase();
+  const mergeState = String(pr.mergeStateStatus || "").toUpperCase() || null;
+  const head = String(pr.headRefOid || "");
+  // Один workflow — один вердикт: перезапуск после починки не должен тонуть в старых попытках.
+  const latest = new Map();
+  for (const r of runs) {
+    if (head && String(r.headSha || "") !== head) continue;
+    const key = String(r.name || r.workflowName || "проверка");
+    const prev = latest.get(key);
+    if (!prev || Number(r.databaseId || 0) > Number(prev.databaseId || 0)) latest.set(key, r);
+  }
+  const checks = [...latest.values()].map((r) => ({
+    name: String(r.name || "проверка"),
+    done: String(r.status || "").toLowerCase() === "completed",
+    verdict: String(r.conclusion || r.status || "").toUpperCase(),
+    url: r.url || (r.databaseId ? `/actions/runs/${r.databaseId}` : null) }));
+  const failed = checks.filter((c) => c.done && CI_FAIL.has(c.verdict));
+  const pending = checks.filter((c) => !c.done);
+  // Прогонов на головном коммите ещё нет — это «CI не стартовал», а не «проверок нет»: сказать
+  // «none» значит разрешить мерж вслепую через секунду после пуша.
+  const status = prState === "MERGED" ? "merged"
+    : prState === "CLOSED" ? "closed"
+    : failed.length ? "red"
+    : mergeState === "DIRTY" ? "conflict"
+    : (pending.length || !checks.length || mergeState === "UNKNOWN") ? "pending"
+    : "green";
+  return { status, checks, prState: prState || null, mergeStateStatus: mergeState, via: "actions-api",
+    failed: failed.map((f) => f.name), pending: pending.map((p) => p.name),
+    failedUrls: failed.map((f) => f.url).filter(Boolean) };
+}
+// Единая точка чтения CI: сперва rollup (богаче — видит и внешние статусы), при его отказе —
+// Actions API. Вход — вывод составной команды, разложенный по маркерам.
+function ciRead(text) {
+  const [rollupSeg, prSeg, runsSeg] = String(text).split(/^__(?:PR|RUNS)__$/m);
+  const main = ciClassify(rollupSeg || "");
+  if (main.status !== "unreadable" && (main.checks.length || main.prState)) return main;
+  const alt = ciClassifyRuns(prSeg || "", runsSeg || "");
+  return alt || main;
+}
 // The workflow run behind a failed check — the only thing that makes `ci-red` actionable is the
 // tail of THAT job's log, and it is one `gh run view` away.
 const ciRunIdOf = (urls) => {
@@ -2348,6 +2402,18 @@ function planCloseTick(board) {
         logPlan(plan, "plan-acceptance-relaunch", { launched: !!relaunch.launched, deaths: (plan.acceptanceDeaths || []).length });
         changed = true; continue;
       }
+      // Ш1.3 · вердикт — это ДОПИСАННЫЙ файл, а не первый попавшийся. Ран приёмки пишет
+      // acceptance.json ИТЕРАТИВНО: сценарий, упавший по дороге, он сохраняет снимком, чинит
+      // и переписывает файл целиком. 12.08 прогон 4848999c поймал ровно такой снимок (Playwright
+      // не дождался формы логина: `checks:[]`, `failed:[]`, `passed:false`) — доска вынесла
+      // «красная приёмка, чинить нечего», оставила PR черновиком, автомерж не состоялся, и гейт
+      // порядка встал на ВСЕЙ очереди проекта. Через 4 минуты тот же ран дописал `passed:true`
+      // с 15 pass, но вердикт уже был вынесен по недописанному файлу. Поэтому: пока ран жив и не
+      // отчитался кодом возврата, любой файл — промежуточный, и читать его нельзя.
+      const arun = plan.acceptanceRun || {};
+      const writing = arun.launched && !readRunExit(arun.log, arun.pid) && isAlive(arun.pid)
+        && Date.now() - (Date.parse(arun.startedAt || "") || 0) <= STALL_MS;
+      if (writing) continue;            // сталл разберёт ветка ниже, когда выйдет срок STALL_MS
       let raw = null;
       try { raw = JSON.parse(fs.readFileSync(path.join(dir, "acceptance.json"), "utf8")); } catch {}
       if (raw && typeof raw === "object") {
@@ -2547,7 +2613,11 @@ function planCloseTick(board) {
     //    этому прогону уже стоит на человеке, а CI здесь — не гейт мержа, а ФАКТ в вердикте.
     if (plan.closeStep === "accept-ci") {
       try { fs.mkdirSync(dir, { recursive: true }); } catch {}
-      const cmd = `${GH_BIN} pr view ${shq(plan.result.pr.url)} --json state,mergeStateStatus,statusCheckRollup`;
+      // Ш1.3 · три ответа в одном шаге: rollup (если токен его отдаёт), состояние PR без rollup
+      // и прогоны Actions по ветке. Разбирает ciRead: rollup — основной, Actions — запасной.
+      const cmd = `${GH_BIN} pr view ${shq(plan.result.pr.url)} --json state,mergeStateStatus,statusCheckRollup 2>&1`
+        + `; echo __PR__; ${GH_BIN} pr view ${shq(plan.result.pr.url)} --json state,mergeStateStatus,headRefOid 2>&1`
+        + `; echo __RUNS__; ${GH_BIN} run list --branch ${shq(plan.integrationBranch)} --limit 20 --json databaseId,name,status,conclusion,headSha 2>&1`;
       const st = spawnStep(projectDir, cmd, path.join(dir, "acc-ci.out"));
       plan.accCiRun = { ...st, startedAt: new Date().toISOString() };
       plan.closeStep = "accept-ci-wait"; changed = true;
@@ -2557,7 +2627,7 @@ function planCloseTick(board) {
       const r = readStep(path.join(dir, "acc-ci.out"));
       const started = Date.parse((plan.accCiRun || {}).startedAt || "") || 0;
       if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.accCiRun || {}).started) continue;
-      planAcceptanceBroken(board, plan, r ? ciClassify(r.text) : null);
+      planAcceptanceBroken(board, plan, r ? ciRead(r.text) : null);
       changed = true; continue;
     }
 
@@ -2565,7 +2635,11 @@ function planCloseTick(board) {
     if (plan.closeStep === "ci") {
       if (plan.ciNextAt && Date.parse(plan.ciNextAt) > Date.now()) continue;   // waiting out the poll interval
       try { fs.mkdirSync(dir, { recursive: true }); } catch {}   // шаг может быть первым после ручной чистки
-      const cmd = `${GH_BIN} pr view ${shq(plan.result.pr.url)} --json state,mergeStateStatus,statusCheckRollup`;
+      // Ш1.3 · три ответа в одном шаге: rollup (если токен его отдаёт), состояние PR без rollup
+      // и прогоны Actions по ветке. Разбирает ciRead: rollup — основной, Actions — запасной.
+      const cmd = `${GH_BIN} pr view ${shq(plan.result.pr.url)} --json state,mergeStateStatus,statusCheckRollup 2>&1`
+        + `; echo __PR__; ${GH_BIN} pr view ${shq(plan.result.pr.url)} --json state,mergeStateStatus,headRefOid 2>&1`
+        + `; echo __RUNS__; ${GH_BIN} run list --branch ${shq(plan.integrationBranch)} --limit 20 --json databaseId,name,status,conclusion,headSha 2>&1`;
       const st = spawnStep(projectDir, cmd, path.join(dir, "ci.out"));
       plan.ciRun = { ...st, startedAt: new Date().toISOString() };
       plan.closeStep = "ci-wait"; changed = true;
@@ -2575,7 +2649,7 @@ function planCloseTick(board) {
       const r = readStep(path.join(dir, "ci.out"));
       const started = Date.parse((plan.ciRun || {}).startedAt || "") || 0;
       if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.ciRun || {}).started) continue;
-      const ci = r ? ciClassify(r.text) : { status: "unreadable", checks: [], failed: [], pending: [], raw: "gh не ответил" };
+      const ci = r ? ciRead(r.text) : { status: "unreadable", checks: [], failed: [], pending: [], raw: "gh не ответил" };
       const sinceMs = Date.now() - (Date.parse(plan.ciSince || "") || Date.now());
       plan.result.ci = { ...ci, checkedAt: new Date().toISOString(), waitedSec: Math.round(sinceMs / 1000) };
       const stopMerge = (reason, text) => {
