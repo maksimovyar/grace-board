@@ -4372,12 +4372,29 @@ function serveStatic(res, urlPath) {
 // ── api ──────────────────────────────────────────────────────────────────────
 // CSRF / DNS-rebinding guard (issue #3): a mutating request must target this loopback
 // host and, if it carries an Origin, that Origin must be this host too. GET stays open.
+//
+// GRACE_TRUSTED_HOSTS="dev.lighty.club,…" — public names of an authenticating TLS proxy in
+// front of the board. A mutation arriving through one of them must PROVE it came from the
+// board's own page, not from another site the browser holds our basic-auth creds for:
+// the browser-set Sec-Fetch-Site must be same-origin, or the Origin host must equal Host.
+// Requests without either (curl, old browsers) are refused — read stays open as before.
+const TRUSTED_HOSTS = new Set(
+  String(process.env.GRACE_TRUSTED_HOSTS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+);
 function sameOrigin(req) {
+  const host = String(req.headers.host || "").toLowerCase();
   const okHosts = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
-  if (!okHosts.has(req.headers.host || "")) return false;
   const origin = req.headers.origin;
-  if (origin) { try { if (!okHosts.has(new URL(origin).host)) return false; } catch { return false; } }
-  return true;
+  if (okHosts.has(host)) {
+    if (origin) { try { if (!okHosts.has(new URL(origin).host)) return false; } catch { return false; } }
+    return true;
+  }
+  if (TRUSTED_HOSTS.has(host)) {
+    if (req.headers["sec-fetch-site"] === "same-origin") return true;
+    if (origin) { try { return new URL(origin).host.toLowerCase() === host; } catch { return false; } }
+    return false;
+  }
+  return false;
 }
 
 async function handleApi(req, res, urlPath) {
