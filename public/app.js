@@ -763,7 +763,7 @@ function attention() {
       rows.push({ k: "arch", ic: "🧩", t: c.theme || c.id, s: `архитектор предлагает ${plural((c.archQuestions || []).length, "решение", "решения", "решений")}${stood}`, go: "Разобрать", card: c.id });
     // Пауза по лимиту ждёт часы, а не человека — она в баннере, не здесь.
     if (c.column === "blocked" && !c.paused)
-      rows.push({ k: "block", ic: "⛔", t: c.theme || c.id, s: `${c.blockReason || "прогон остановлен"}${stood}`, go: "Открыть лог", card: c.id });
+      rows.push({ k: "block", ic: "⛔", t: c.theme || c.id, s: `${c.blockReason || "прогон остановлен"}${stood}`, go: "Открыть лог", card: c.id, dismiss: c.id });
     if ((c.autoFloorHeld || []).length || (c.result && c.result.floor || []).length)
       rows.push({ k: "floor", ic: "⚠", t: c.theme || c.id, s: "жёсткий пол — нужна подпись человека", go: "Разобрать", card: c.id });
   }
@@ -835,7 +835,11 @@ function renderAttn() {
       <span class="attn__ic">${r.ic}</span>
       <div class="attn__txt"><span class="attn__t">${esc(r.t)}</span><span class="attn__s">${esc(r.s)}</span></div>
       <button class="attn__go" type="button" ${r.card ? `data-attncard="${esc(r.card)}"` : `data-attnplan="${esc(r.plan)}"`}>${r.go} →</button>
+      ${r.dismiss ? `<button class="attn__dismiss" type="button" data-attndismiss="${esc(r.dismiss)}" title="Снять с доски: карточка уйдёт в архив, лог и история останутся">снять ×</button>` : ""}
     </div>`).join("")}</div>`;
+  // Ш4: остановку, которую человек разобрал и решил не чинить, надо уметь снять — иначе
+  // счётчик «ждут тебя» врёт, а вместе с ним и главный вопрос доски «нужен ли я сейчас».
+  host.querySelectorAll("[data-attndismiss]").forEach((b) => b.addEventListener("click", () => onCardDismiss(b.dataset.attndismiss)));
   host.querySelectorAll("[data-attncard]").forEach((b) => b.addEventListener("click", () => {
     const card = cardById(b.dataset.attncard);
     if (card && card.column === "asking") openAsk(card.id); else if (card) openLog(card.id);
@@ -1153,6 +1157,12 @@ function toastUndo(html, undo) {
     undo(); toastEl.hidden = true; toast("Удаление отменено");
   });
   toastTimer = setTimeout(() => (toastEl.hidden = true), UNDO_MS);
+}
+async function onCardDismiss(id) {
+  const card = cardById(id);
+  if (!confirm(`Снять «${((card && card.theme) || id).slice(0, 60)}» с доски? Карточка уйдёт в архив, лог и история останутся.`)) return;
+  try { await api(`/api/tasks/${id}/dismiss`, { method: "POST", body: "{}" }); toast("Снято с доски · карточка в архиве, лог на месте"); loadBoard(); }
+  catch (err) { toast("Не удалось снять: " + err.message); }
 }
 async function onRelaunch(e) {
   const id = e.currentTarget.dataset.relaunch;

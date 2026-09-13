@@ -4966,6 +4966,25 @@ async function handleApi(req, res, urlPath) {
     });
   }
 
+  // POST /api/tasks/:id/dismiss — v4 Ш4: снять остановку с доски РУКОЙ человека. Карточка в
+  // blocked (процесс мёртв, авто-исцеление не помогло, прогон уже на полке) висела в «Требует
+  // меня» без выхода: колонки blocked на экране нет, а DELETE стирает историю и лог. Снятие —
+  // это архив, не удаление: история, лог и вложения остаются, счётчик «закрыто» её видит.
+  // Слот проекта blocked не держит (hasActiveForProject его не считает), очередь не меняется.
+  const mdis = urlPath.match(/^\/api\/tasks\/([^/]+)\/dismiss$/);
+  if (mdis && req.method === "POST") {
+    const board = readBoard();
+    const card = board.cards.find((c) => c.id === mdis[1]);
+    if (!card) return sendJSON(res, 404, { error: "card not found" });
+    if (card.archived) return sendJSON(res, 200, { card, already: true });
+    if (card.column !== "blocked") return sendJSON(res, 409, { error: "снять с доски можно только остановленную карточку (blocked) — идущую сначала останови" });
+    const ts = new Date().toISOString();
+    card.archived = true; card.archivedAt = ts; card.paused = false; card.wardenPending = null;
+    card.history.push({ column: card.column, ts, via: "dismissed" });
+    writeBoard(board);
+    return sendJSON(res, 200, { card });
+  }
+
   // POST /api/tasks/:id/relaunch  -> re-spawn the run for a stuck/blocked card (issue #8)
   const mre = urlPath.match(/^\/api\/tasks\/([^/]+)\/relaunch$/);
   if (mre && req.method === "POST") {
