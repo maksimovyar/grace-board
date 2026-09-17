@@ -1880,6 +1880,7 @@ function launchGatedAcceptance(board, plan, projectDir, runDir, gate, scen, card
   return spawnRun(projectDir, runDir, prompt, "plan-acceptance.log", { model: modelFor(plan) });
 }
 const CI_NONE_GRACE_MS = Number(process.env.GRACE_CI_NONE_GRACE_SEC || 180) * 1000;
+const CI_NOT_STARTED = /job was not started because|spending limit needs to be increased|account payments have failed/i;
 // Красный CI на PR → круг починки (если круги остались). true = круг заведён, шаг ушёл в fix-wait.
 function ciFixRound(board, plan, logTail) {
   if ((plan.ciFixRounds || 0) >= CI_FIX_MAX_ROUNDS) return false;
@@ -2951,7 +2952,8 @@ function planCloseTick(board) {
       if (ci.status === "red") {
         const runId = ciRunIdOf(ci.failedUrls);
         if (runId) {   // fetch the tail of the failing job — a bare «CI красный» is not actionable
-          const st = spawnStep(projectDir, `${GH_BIN} run view ${runId} --log-failed 2>&1 | grep -v '##\\[' | tail -n 150`, path.join(dir, "ci-log.out"));
+          const st = spawnStep(projectDir, `${GH_BIN} run view ${runId} --log-failed 2>&1 | grep -v '##\\[' | tail -n 150; `
+            + `${GH_BIN} run view ${runId} 2>&1 | grep -i 'was not started' | head -3`, path.join(dir, "ci-log.out"));
           plan.ciLogRun = { ...st, runId, startedAt: new Date().toISOString() };
           plan.closeStep = "ci-log"; changed = true; continue;
         }
@@ -2979,6 +2981,17 @@ function planCloseTick(board) {
       if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.ciLogRun || {}).started) continue;
       const tail = r ? r.text.slice(-6000) : "(лог упавшего job получить не удалось)";
       plan.result.ci = { ...(plan.result.ci || {}), logTail: tail, runId: (plan.ciLogRun || {}).runId || null };
+      if (CI_NOT_STARTED.test(tail)) {
+        // 17.09.2026: задания CI не стартовали (оплата/лимит GitHub) — кодом это не чинится,
+        // круг починки здесь только сжёг бы деньги. Стоп и человек.
+        plan.closeStatus = "done"; plan.closeStep = "merge-failed";
+        plan.result.merge = { ok: false, error: "ci-not-started", ci: plan.result.ci };
+        planNotice(plan, `CI не запустился: GitHub не стартует задания (оплата или лимит Actions). Код не проверен — доска не мержит. `
+          + `Когда Actions оживут — «↻ переиграть приёмку» или перезапуск CI на PR.`, "error");
+        logPlan(plan, "plan-merge-failed", { reason: "ci-not-started", runId: plan.result.ci.runId });
+        firePlanEvent(board, plan, "ci-red", { key: "pr", notStarted: true, prUrl: (plan.result.pr || {}).url || null });
+        changed = true; continue;
+      }
       if (ciFixRound(board, plan, tail)) { changed = true; continue; }
       plan.closeStatus = "done"; plan.closeStep = "merge-failed";
       plan.result.merge = { ok: false, error: "ci-red", ci: plan.result.ci };
@@ -3054,7 +3067,8 @@ function planCloseTick(board) {
       if (ci.status === "red") {
         const runId = (ci.failed[0] || {}).id || null;
         if (runId && !plan.pmLogRun) {   // хвост упавшего job — иначе карточка починки бессодержательна
-          const st = spawnStep(projectDir, `${GH_BIN} run view ${runId} --log-failed 2>&1 | tail -n 40`, path.join(dir, "pm-log.out"));
+          const st = spawnStep(projectDir, `${GH_BIN} run view ${runId} --log-failed 2>&1 | tail -n 40; `
+            + `${GH_BIN} run view ${runId} 2>&1 | grep -i 'was not started' | head -3`, path.join(dir, "pm-log.out"));
           plan.pmLogRun = { ...st, runId, startedAt: new Date().toISOString() };
           plan.pmFailed = ci.failed;
           plan.closeStep = "post-merge-log"; changed = true; continue;
@@ -3080,6 +3094,16 @@ function planCloseTick(board) {
       const started = Date.parse((plan.pmLogRun || {}).startedAt || "") || 0;
       if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.pmLogRun || {}).started) continue;
       const failedNames = (plan.result.postMergeCi || {}).failed || [];
+      if (r && CI_NOT_STARTED.test(r.text)) {
+        plan.closeStatus = "done"; plan.closeStep = "postmerge-red";
+        plan.result.deploy = { status: "blocked-by-ci", reason: "задания CI/CD на main не стартовали (оплата или лимит Actions)" };
+        plan.result.postMergeCi = { ...(plan.result.postMergeCi || {}), status: "not-started",
+          failedRuns: (plan.pmFailed || []).filter((x) => x.workflowId).map((x) => ({ name: x.name, workflowId: x.workflowId, createdAt: x.createdAt })) };
+        planNotice(plan, `Смержено, но CI/CD на main не стартовали (оплата или лимит GitHub Actions) — выката не было. `
+          + `Когда Actions оживут, перезапусти CD: доска сутки перепроверяет и продолжит закрытие сама.`, "error");
+        logPlan(plan, "plan-postmerge-not-started", { failed: failedNames });
+        changed = true; continue;
+      }
       postMergeRed(board, plan, { failed: plan.pmFailed || failedNames.map((n) => ({ name: n })) }, r ? r.text.slice(-2000) : null);
       changed = true; continue;
     }
