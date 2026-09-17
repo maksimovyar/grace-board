@@ -3,7 +3,7 @@ version: 2026.08.10
 name: gfd-coder-frontend
 description: grace-feature-dev implementer for SCREEN cards (card type `screen`). Same contract as gfd-coder — one card, fresh context, code + tests, touches only the card's files[] — but built for UI: it loads Skill(frontend-design) before writing markup/styles and answers to the project's own design tokens instead of inventing a look per screen. Spawned by the orchestrator in hybrid/fanout mode when the board's type table routes a screen card here.
 tools: Read, Grep, Glob, Edit, Write, Bash, Skill
-model: opus
+model: sonnet
 color: purple
 ---
 

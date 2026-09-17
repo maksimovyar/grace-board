@@ -22,6 +22,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const readyGate = require("./lib/ready-gate");
 
 // Minimal zero-dependency .env loader: KEY=VALUE lines in ./.env seed process.env as
 // defaults (an already-exported environment variable always wins). Optional convenience.
@@ -347,9 +348,8 @@ function projectConfigBlock(card) {
 // ##   исполняется строго по таблице: две правды об одной строгости хуже одной неудобной.
 // ## - Множитель масштабирует БАЗУ предохранителя A1.1, а не заменяет её; порядок —
 // ##   база доски → множитель типа → override прогона (`--loops/--log-mb`), override побеждает.
-// ## @rationale Q: почему `screen` — hybrid, а не inline? A: фронтендер — это отдельная модель
-// ##   (Opus) и отдельный скилл (frontend-design), а получить их можно только у субагента:
-// ##   главный тред сессии один на карточку и его модель задаётся на весь ран.
+// ## @rationale Q: почему `screen` уходит субагенту? A: у фронтендера свой скилл (frontend-design),
+// ##   а получить его можно только у субагента. С 17.09 так же устроены и остальные типы (fanout).
 // ## @modulemap
 // ## FUNC 1[calc]  => cardType      — тип карточки (нет/мусор → backend)
 // ## FUNC 4[io]    => typeOverrides — клетки таблицы, переопределённые проектом (+ игнор без причины)
@@ -362,12 +362,15 @@ const CARD_TYPES = ["backend", "screen", "integration", "foundation", "fix"];
 const CARD_TYPE_RU = { backend: "бэкенд", screen: "экран", integration: "интеграция",
   foundation: "фундамент", fix: "починка" };
 // Клетки: строгость разметки · кодер, которому уходит код · режим сборки · множитель порога A1.1.
+// 17.09.2026: все типы — `fanout`. Разделение ролей grace-feature-dev: главный поток координирует,
+// каждую карточку декомпозиции пишет кодер в свежем контексте. При `inline` главный поток писал
+// весь код сам (2278 правок за 20 прогонов, 0 запусков gfd-coder) и тащил растущий контекст.
 const TYPE_TABLE = {
-  backend:     { rigor: "grace", coder: "gfd-coder",          buildMode: "inline", budget: 1.0 },
-  screen:      { rigor: "grace", coder: "gfd-coder-frontend", buildMode: "hybrid", budget: 0.8 },
-  integration: { rigor: "grace", coder: "gfd-coder",          buildMode: "inline", budget: 1.0 },
-  foundation:  { rigor: "grace", coder: "gfd-coder",          buildMode: "inline", budget: 0.7 },
-  fix:         { rigor: "off",   coder: "gfd-coder",          buildMode: "inline", budget: 0.5 },
+  backend:     { rigor: "grace", coder: "gfd-coder",          buildMode: "fanout", budget: 1.0 },
+  screen:      { rigor: "grace", coder: "gfd-coder-frontend", buildMode: "fanout", budget: 0.8 },
+  integration: { rigor: "grace", coder: "gfd-coder",          buildMode: "fanout", budget: 1.0 },
+  foundation:  { rigor: "grace", coder: "gfd-coder",          buildMode: "fanout", budget: 0.7 },
+  fix:         { rigor: "off",   coder: "gfd-coder",          buildMode: "fanout", budget: 0.5 },
 };
 const TYPE_DEFAULT = "backend";
 const cardType = (card) => (card && CARD_TYPES.includes(card.type)) ? card.type : TYPE_DEFAULT;
@@ -1550,14 +1553,25 @@ function flushPlanQueue() {
 // STRUCTURE: ▶ красная приёмка → ⊕ launchPlanFix(карточка+план) → ⚡ ready → ⎋ приёмка родителя заново
 
 const FIX_MAX_ROUNDS = Math.max(0, Number(process.env.GRACE_FIX_ROUNDS ?? 2));
+// 17.09.2026: красный CI на PR тоже чинится доской — раньше это был терминал «мерж за человеком»
+// (3 прогона из 20 встали ровно так). Свой счётчик: круги приёмки и круги CI не делят бюджет.
+const CI_FIX_MAX_ROUNDS = Math.max(0, Number(process.env.GRACE_CI_FIX_ROUNDS ?? 2));
 const uniqStr = (arr) => [...new Set(arr.filter((x) => typeof x === "string" && x.trim()))];
 
 // Постановка починки. Пишется для кодера и для человека одновременно: что не работает, что
 // приёмка при этом видела, где чинить и чего НЕ трогать. Границы здесь важнее объёма — карточка
 // починки без границ превращается в «доделай прогон», то есть во второй прогон.
-function fixBrief(board, plan, acc, round) {
+function fixBrief(board, plan, acc, round, kind) {
   const failedChecks = (acc.checks || []).filter((c) => c.status === "fail");
-  const L = [
+  const L = kind === "ci" ? [
+    `ПОЧИНКА КРАСНОГО CI ПРОГОНА «${plan.goal || plan.id}» — круг ${round} из ${CI_FIX_MAX_ROUNDS}.`,
+    ``,
+    `Приёмка прогона зелёная, PR открыт, но CI на GitHub (полный набор тестов и проверок) упал.`,
+    `CI — судья: его падение нельзя списать на «давнее» или «инфраструктуру». Если падение воспроизводится`,
+    `и на origin/main — докажи это запуском на main и почини всё равно минимально, иначе PR не сольётся.`,
+    `Воспроизводи ЛОКАЛЬНО ТОЛЬКО упавшие тесты/шаги из лога, не весь набор. После пуша CI перезапустится сам.`,
+    ``,
+  ] : [
     `ПОЧИНКА ПРИЁМКИ ПРОГОНА «${plan.goal || plan.id}» — круг ${round} из ${FIX_MAX_ROUNDS}.`,
     ``,
     `Все этапы прогона доехали до ready и прошли покарточную верификацию, но СКВОЗНАЯ приёмка`,
@@ -1587,11 +1601,14 @@ function fixBrief(board, plan, acc, round) {
 
 // Завести круг починки: карточка → мини-прогон в ветку родителя → в очередь проекта.
 // Возвращает созданный план (или null, если чинить нечего).
-function launchPlanFix(board, plan, acc) {
+function launchPlanFix(board, plan, acc, kind) {
   const failedChecks = (acc.checks || []).filter((c) => c.status === "fail");
   if (!failedChecks.length) return null;                 // красная «на слово» — чинить нечего
   const stages = planCards(board, plan);
-  const round = (plan.fixRounds || 0) + 1;
+  const ci = kind === "ci";
+  const round = ((ci ? plan.ciFixRounds : plan.fixRounds) || 0) + 1;
+  const maxRounds = ci ? CI_FIX_MAX_ROUNDS : FIX_MAX_ROUNDS;
+  const what = ci ? "CI" : "приёмки";
   // Контекст наследуется от ПРОГОНА, а не от одной карточки: приёмка сквозная, и починка
   // вправе трогать всё, что прогон писал. `id: null` — карточка починки не «хвост» этапа и не
   // должна попасть в список хвостов прогона (planTails), у неё своя природа.
@@ -1604,10 +1621,10 @@ function launchPlanFix(board, plan, acc) {
     type: "fix",
   };
   const card = spawnTailCard(board, context, {
-    theme: `Починка приёмки: ${plan.goal || plan.id}`.slice(0, 200),
-    description: fixBrief(board, plan, acc, round),
+    theme: `Починка ${what}: ${plan.goal || plan.id}`.slice(0, 200),
+    description: fixBrief(board, plan, acc, round, kind),
     acceptance: failedChecks.map((c) => c.title),
-    outOfScope: "Всё, кроме перечисленных провалившихся сценариев приёмки.",
+    outOfScope: ci ? "Всё, кроме упавших проверок CI." : "Всё, кроме перечисленных провалившихся сценариев приёмки.",
     // A5.1: тип «починка» — и `rigor: off` следует из него, а не из хардкода в двух местах.
     type: "fix",
     draft: false,   // единственное исключение: этот круг доска ведёт без человека
@@ -1618,7 +1635,7 @@ function launchPlanFix(board, plan, acc) {
   const id = crypto.randomUUID().slice(0, 8);
   const fixPlan = {
     id, project: plan.project,
-    goal: `Починка приёмки прогона «${plan.goal || plan.id}» · круг ${round}`,
+    goal: `Починка ${what} прогона «${plan.goal || plan.id}» · круг ${round}`,
     // Та же ветка — единственный способ довести уже открытый черновик PR до зелёного.
     integrationBranch: plan.integrationBranch,
     mode: "auto",                       // вопросов человеку в починке нет по определению
@@ -1629,7 +1646,7 @@ function launchPlanFix(board, plan, acc) {
     loopBudget: plan.loopBudget || null,
     decisions: Array.isArray(plan.decisions) ? plan.decisions : [],
     createdAt: new Date().toISOString(), result: null,
-    fixFor: plan.id, fixRound: round,
+    fixFor: plan.id, fixRound: round, fixKind: ci ? "ci" : "acceptance",
   };
   board.plans = board.plans || [];
   board.plans.push(fixPlan);
@@ -1646,15 +1663,15 @@ function launchPlanFix(board, plan, acc) {
     card.history.push({ column: "todo", ts: card.queuedAt, via: "plan-fix-queued" });
   }
 
-  plan.fixRounds = round;
+  if (ci) plan.ciFixRounds = round; else plan.fixRounds = round;
   plan.fixPlanId = id;
-  plan.fixHistory = [...(plan.fixHistory || []), { round, planId: id, cardId: card.id,
+  plan.fixHistory = [...(plan.fixHistory || []), { round, kind: fixPlan.fixKind, planId: id, cardId: card.id,
     at: fixPlan.createdAt, failed: failedChecks.map((c) => c.id) }];
-  planNotice(plan, `Приёмка красная — доска чинит сама (круг ${round} из ${FIX_MAX_ROUNDS}). `
+  planNotice(plan, `${ci ? "CI на PR красный" : "Приёмка красная"} — доска чинит сама (круг ${round} из ${maxRounds}). `
     + `Провалено: ${failedChecks.map((c) => c.title).join(", ")}. Карточка починки уже в работе, `
-    + `после неё приёмка переиграется автоматически. Твоего участия пока не нужно.`, "warn");
-  logPlan(plan, "plan-fix-start", { round, fixPlanId: id, cardId: card.id, failed: acc.failed });
-  firePlanEvent(board, plan, "fix-started", { key: `round${round}`, round, maxRounds: FIX_MAX_ROUNDS,
+    + `после неё ${ci ? "PR обновится и CI перезапустится" : "приёмка переиграется"} автоматически. Твоего участия пока не нужно.`, "warn");
+  logPlan(plan, "plan-fix-start", { round, kind: fixPlan.fixKind, fixPlanId: id, cardId: card.id, failed: acc.failed });
+  firePlanEvent(board, plan, "fix-started", { key: `${fixPlan.fixKind}-round${round}`, round, maxRounds,
     fixPlanId: id, fixCardId: card.id, failed: failedChecks.map((c) => c.title) });
   return fixPlan;
 }
@@ -1665,6 +1682,18 @@ function finishPlanFix(board, fixPlan, parent) {
   fixPlan.closeStatus = "done";
   fixPlan.closeStep = "closed";
   fixPlan.archived = true;                 // мини-прогон отработал, доске он больше не нужен
+  if (fixPlan.fixKind === "ci") {
+    planNotice(fixPlan, `Починка CI доехала до ready — PR прогона «${parent.goal || parent.id}» обновляется, CI перезапустится.`, "ok");
+    parent.closeStatus = "verifying";
+    parent.closeStep = "pr";                 // push + обновление тела → post-pr → ci (приёмка остаётся зелёной)
+    parent.fixPlanId = null;
+    parent.ciRun = null; parent.ciNextAt = null; parent.ciSince = null; parent.ciLogRun = null;
+    if (parent.result) { parent.result.ci = null; parent.result.merge = null; }
+    planNotice(parent, `Починка CI (круг ${fixPlan.fixRound}) закончена — ждём новый CI на PR.`, "info");
+    logPlan(parent, "plan-fix-done", { round: fixPlan.fixRound, kind: "ci", fixPlanId: fixPlan.id });
+    firePlanEvent(board, parent, "fix-done", { key: `ci-round${fixPlan.fixRound}`, round: fixPlan.fixRound, fixPlanId: fixPlan.id });
+    return;
+  }
   planNotice(fixPlan, `Починка доехала до ready — приёмка прогона «${parent.goal || parent.id}» переигрывается.`, "ok");
   parent.closeStatus = "verifying";
   parent.closeStep = "acceptance";
@@ -1733,7 +1762,8 @@ const ACCEPT_GRACE_MS = Number(process.env.GRACE_ACCEPT_GRACE_SEC || 60) * 1000;
 // yours by policy · `merge-failed` = the board promised to merge and could not), и `acceptance-broken`
 // говорит, что проверок НЕ БЫЛО вовсе. Collapsing any of them loses the only difference the human acts on.
 const CLOSE_KEEP_STEPS = new Set(["awaiting-merge", "awaiting-deploy", "pr-ready", "merge-failed", "acceptance-broken",
-  "postmerge-red"]);   // A4.3: смержено, но main красный — это отдельный исход, не «закрыт»
+  "postmerge-red",     // A4.3: смержено, но main красный — это отдельный исход, не «закрыт»
+  "stand-red", "stand-check-broken"]);   // 17.09: выкачено, но на стенде не работает / проверить не смогли
 
 // Release policy of a run: what was passed at assembly wins, then the project's
 // `deploy_policy`, then the built-in default (§5.1).
@@ -1778,6 +1808,8 @@ function launchPlanAcceptance(board, plan) {
   const scen = acceptanceScenarios(board, plan);
   const cardLevel = planCards(board, plan).flatMap(acceptanceItems).filter((a) => a.level === "card").length;
   const cmdLine = (k, label) => cmds[k] ? `• ${label}: ${cmds[k]}` : `• ${label}: не задана в .grace/project.md → пропусти, отметь check со status:"skip"`;
+  const gate = readyGate.gateConfig((cfg && cfg.cfg) || {});
+  if (gate && gate.runGate) return launchGatedAcceptance(board, plan, projectDir, runDir, gate, scen, cardLevel);
   const prompt = [
     `ПРИЁМКА ПРОГОНА «${plan.goal || plan.id}» — проверь, что оно РАБОТАЕТ. Это НЕ код-ревью: код уже прошёл`,
     `verify и review на каждом этапе. Твоя задача — предъявить работающий результат целиком.`, ``,
@@ -1807,6 +1839,57 @@ function launchPlanAcceptance(board, plan) {
     `ЗАПРЕТЫ: не мержь, не деплой, не правь код и не коммить в интеграционную ветку. Приёмка только читает.`,
   ].join("\n");
   return spawnRun(projectDir, runDir, prompt, "plan-acceptance.log", { model: modelFor(plan) });
+}
+// 17.09.2026 · приёмка проекта с проверкой по правилу (card_gate/run_gate). Отличия от старой:
+//   • полного набора тестов нет — он идёт в CI на PR; здесь проверка прогона по тому же правилу выбора;
+//   • приложение НЕ поднимается и живых сценариев нет: ветка ещё не на стенде, отсюда были «skip»
+//     и «красная приёмка, чинить нечего» (7 прогонов из 20). Живой проход — после выката (stand-check);
+//   • каждый критерий подтверждается ТЕСТОМ, который его проверяет и зелёный; нет теста — fail,
+//     и круг починки его пишет. «skip» для критерия запрещён.
+function launchGatedAcceptance(board, plan, projectDir, runDir, gate, scen, cardLevel) {
+  const wt = path.join(runDir, "wt");
+  const out = path.join(runDir, "run-gate.json");
+  const prompt = [
+    `ПРИЁМКА ПРОГОНА «${plan.goal || plan.id}» — до слияния. Проверь, что каждый сквозной критерий прогона`,
+    `РЕАЛИЗОВАН и ПОКРЫТ ТЕСТОМ. Это не код-ревью (оно было на этапах) и не живой проход (он будет на`,
+    `стенде после выката). Полный набор тестов НЕ запускай — он идёт в CI на PR.`, ``,
+    `1) ЧИСТЫЙ ЧЕКАУТ, рабочий каталог проекта не трогай:`,
+    `   git worktree add --detach "${wt}" "${plan.integrationBranch}"`,
+    `   ln -s "${path.join(projectDir, "backend", ".venv")}" "${path.join(wt, "backend", ".venv")}" 2>/dev/null;`,
+    `   ln -s "${path.join(projectDir, "frontend", "node_modules")}" "${path.join(wt, "frontend", "node_modules")}" 2>/dev/null`,
+    `   В конце: git worktree remove --force "${wt}".`, ``,
+    `2) ПРОВЕРКА ПРОГОНА (одна команда, решает код возврата):`,
+    `   cd "${wt}" && SELECT_TESTS_GRAPH="${path.join(projectDir, "graphify-out", "graph.json")}" \\`,
+    `     ${gate.runGate} --run --base $(git merge-base origin/main HEAD) --out "${out}" 2>&1 | tail -n 60`,
+    `   Каждый её шаг — отдельный check kind:"deterministic" (название шага, pass/fail, хвост вывода).`,
+    `   Упавший шаг объяснять «давним», «чужим» или «инфраструктурой» ЗАПРЕЩЕНО — это fail. Если уверен, что`,
+    `   падение не от прогона, докажи запуском того же теста на origin/main в отдельном worktree и приложи вывод.`, ``,
+    `3) КРИТЕРИИ. Для каждого пункта ниже найди тест в ветке, который проверяет именно это поведение`,
+    `   (запрос к API или отрисовка экрана; тест, читающий исходник как текст, не годится), и убедись, что он`,
+    `   входил в проверку шага 2 и зелёный. check kind:"functional": pass — с путём к тесту в "evidence";`,
+    `   fail — «нет теста» / «тест не про это» / «тест красный». status:"skip" для критерия НЕ ставь.`,
+    scen.length ? scen.filter((x) => x.kind !== "ручная проверка").map((x, i) => `   ${i + 1}) ${x.text}   ← из «${x.from}»`).join("\n")
+      : cardLevel ? `   (сквозных критериев нет — все ${cardLevel} закрыты на карточках; ограничься шагом 2)`
+        : `   (критериев нет вовсе — отметь это check со status:"fail": принять прогон «на слово» нельзя)`, ``,
+    `4) РЕЗУЛЬТАТ — строго в ${path.join(runDir, "acceptance.json")}:`,
+    `   {"checks":[{"id":"d1|c1","title":"…","kind":"deterministic|functional","status":"pass|fail",`,
+    `   "output":"хвост вывода / почему","evidence":"путь к тесту или пусто"}],"passed":true|false,"failed":["id",…],`,
+    `   "notes":"кратко о рисках"}. passed:true ТОЛЬКО без единого fail. Пиши файл даже если всё упало.`, ``,
+    `ЗАПРЕТЫ: не мержь, не деплой, не правь код и не коммить. Приёмка только читает и запускает проверку.`,
+  ].join("\n");
+  return spawnRun(projectDir, runDir, prompt, "plan-acceptance.log", { model: modelFor(plan) });
+}
+const CI_NONE_GRACE_MS = Number(process.env.GRACE_CI_NONE_GRACE_SEC || 180) * 1000;
+// Красный CI на PR → круг починки (если круги остались). true = круг заведён, шаг ушёл в fix-wait.
+function ciFixRound(board, plan, logTail) {
+  if ((plan.ciFixRounds || 0) >= CI_FIX_MAX_ROUNDS) return false;
+  const failed = ((plan.result || {}).ci || {}).failed || [];
+  const acc = { checks: [{ id: "ci", title: `CI на PR: ${failed.join(", ") || "упала проверка"}`, kind: "deterministic",
+    status: "fail", output: logTail }], failed: ["ci"] };
+  if (!launchPlanFix(board, plan, acc, "ci")) return false;
+  plan.closeStatus = "verifying";
+  plan.closeStep = "fix-wait";
+  return true;
 }
 // A plain child process for the deterministic steps (gh / deploy): stdout+stderr into one file the
 // next tick reads. No model, no tokens, and the output IS the evidence.
@@ -2116,7 +2199,8 @@ function releaseMode(projectDir) {
 // приезжают с head_branch = имя тега, и считать их пост-мерж проверкой нельзя — они идут ПОСЛЕ.
 function classifyPostMerge(text) {
   const runs = String(text || "").split("\n").filter((l) => l.startsWith("RUN\t"))
-    .map((l) => { const p = l.split("\t"); return { id: p[1], name: p[2], branch: p[3], status: p[4], conclusion: p[5] }; })
+    .map((l) => { const p = l.split("\t"); return { id: p[1], name: p[2], branch: p[3], status: p[4], conclusion: p[5],
+      workflowId: p[6] || null, createdAt: p[7] || null }; })
     .filter((r) => r.branch === "main");
   if (!runs.length) return { status: "none", runs: [], failed: [] };
   if (runs.some((r) => r.status !== "completed")) return { status: "pending", runs, failed: [] };
@@ -2163,6 +2247,176 @@ function postMergeRedCard(board, plan, ci, logTail) {
   logPlan(plan, "plan-postmerge-red-card", { cardId: card.id, failed: (ci.failed || []).map((r) => r.name) });
   return card;
 }
+// region FUNC_standCheck — прогон кончается «выкачено и проверено» (17.09.2026)
+// ## @purpose Выкат делает CD проекта по пушу в main; зелёный пост-мерж (CI + CD) значит «на стенде».
+// ##   Дальше — единственное место, где сценарии проходятся ЖИВЬЁМ: браузером и запросами к стенду
+// ##   под нужными ролями. До слияния этого сделать нельзя (ветки на стенде нет) — отсюда 7 из 20
+// ##   прогонов с «красной приёмкой, чинить нечего».
+// ## @invariants
+// ## - Включается проектом: stand.release: ci + stand.url. Иначе — старый шаг deploy.
+// ## - Провал на стенде НЕ откатывает стенд (решение владельца 17.09, вариант А): черновик карточки
+// ##   починки в следующий прогон + громкое сообщение. Стенд тестовый.
+// ## - Учётки стенда — в файле вне репозитория (stand.accounts_file в .grace/local.md), в промпт
+// ##   попадает только путь.
+const STAND_MAX_TRIES = 2;
+function standCheckConfig(projectDir) {
+  const cfg = (readProjectConfig(projectDir) || {}).cfg || {};
+  const st = cfg.stand || {};
+  if (String(st.release || "").trim() !== "ci" || !st.url || String(st.check) === "false") return null;
+  const cmds = cfg.commands || {};
+  return { url: String(st.url).trim(), accountsFile: st.accounts_file ? String(st.accounts_file).trim() : null,
+    onGreen: typeof cmds.on_stand_green === "string" && cmds.on_stand_green.trim() ? cmds.on_stand_green.trim() : null };
+}
+function launchStandCheck(board, plan, projectDir, dir, conf) {
+  const scen = acceptanceScenarios(board, plan);
+  const allCriteria = planCards(board, plan).flatMap((c) => acceptanceItems(c).map((a) => ({ from: c.theme || c.id, text: a.text })));
+  const list = [...scen, ...allCriteria.filter((a) => !scen.some((x) => x.text === a.text))];
+  const shots = path.join(projectDir, ".playwright-mcp", `plan-${plan.id}`);
+  try { fs.mkdirSync(shots, { recursive: true }); } catch {}
+  const prompt = [
+    `ПРОВЕРКА НА СТЕНДЕ ПОСЛЕ ВЫКАТА — прогон «${plan.goal || plan.id}».`,
+    `Код прогона слит в main и выкачен на тестовый стенд ${conf.url} (CI и CD зелёные). Пройди сценарии ЖИВЬЁМ`,
+    `на стенде: экраны — браузером (инструменты mcp__playwright__*), API — curl. Это не код-ревью и не тесты.`, ``,
+    `1) Стенд жив: GET ${conf.url.replace(/\/$/, "")}/health → status ok. Нет — check "стенд недоступен" fail и заверши.`,
+    conf.accountsFile
+      ? `2) Учётки ролей — в файле ${conf.accountsFile} (прочитай; пароли НИКУДА не выписывай). Вход под каждой ролью,`
+        + ` нужной сценариям; сценарий идёт под той ролью, о которой он говорит.`
+      : `2) Файла с учётками стенда нет (stand.accounts_file) — сценарии, где нужен вход, отметь fail «нет учётки».`,
+    `3) Сценарии (для каждого — check kind:"functional"; доказательство — скриншот в ${shots} или код ответа):`,
+    list.length ? list.map((x, i) => `   ${i + 1}) ${x.text}   ← из «${x.from}»`).join("\n") : `   (сценариев нет — проверь только вход под каждой ролью кабинета)`,
+    `   Данные, которые создаёшь, помечай в названии «[board-check]». Чужие данные не меняй и не удаляй.`,
+    `   Сценарий, который на стенде проверить нельзя (нужен внешний сервис, письмо, дата в будущем), — status:"skip"`,
+    `   с причиной; skip НЕ валит проверку, но попадает в отчёт человеку.`, ``,
+    `4) РЕЗУЛЬТАТ — строго в ${path.join(dir, "stand-check.json")}:`,
+    `   {"checks":[{"id":"s1","title":"…","kind":"functional","status":"pass|fail|skip","output":"что увидел",`,
+    `   "evidence":"путь к скриншоту"}],"passed":true|false,"failed":["id",…],"notes":"…"}`,
+    `   passed:true — ни одного fail. Пиши файл даже если стенд лежит.`, ``,
+    `ЗАПРЕТЫ: не правь код, не коммить, не деплой, не ходи по ssh, не меняй настройки стенда.`,
+  ].join("\n");
+  const npx = BIN_PATH_HINT.split(path.delimiter).map((d) => path.join(d, "npx")).find((f) => fs.existsSync(f)) || "npx";
+  const mcpConfig = { mcpServers: { playwright: { type: "stdio", command: npx,
+    args: ["-y", "@playwright/mcp@latest", "--headless", "--isolated", "--output-dir", shots] } } };
+  return spawnRun(projectDir, dir, prompt, "stand-check.log", { model: modelFor(plan), mcpConfig });
+}
+function standCheckTick(board, plan, projectDir, dir) {
+  const conf = standCheckConfig(projectDir);
+  if (!conf) { plan.closeStep = "deploy"; return true; }
+  const outFile = path.join(dir, "stand-check.json");
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  if (plan.closeStep === "stand-check") {
+    try { fs.unlinkSync(outFile); } catch {}
+    const launch = launchStandCheck(board, plan, projectDir, dir, conf);
+    plan.standCheckRun = { pid: launch.pid || null, log: launch.log || null, launched: !!launch.launched,
+      from: launch.from || 0, error: launch.error || null, startedAt: new Date().toISOString() };
+    plan.closeStep = "stand-check-wait";
+    planNotice(plan, `Смержено и выкачено (CI и CD зелёные) — прохожу сценарии прогона на стенде ${conf.url}.`, "info");
+    logPlan(plan, "plan-stand-check", { launched: !!launch.launched, error: launch.error || null });
+    return true;
+  }
+  const run = plan.standCheckRun || {};
+  const started = Date.parse(run.startedAt || "") || 0;
+  const alive = run.launched && run.pid && isAlive(run.pid) && !readRunExit(run.log, run.pid);
+  if (alive && Date.now() - started <= STALL_MS) return false;
+  if (alive) { try { process.kill(run.pid, "SIGTERM"); } catch {} }
+  let raw = null;
+  try { raw = JSON.parse(fs.readFileSync(outFile, "utf8")); } catch {}
+  if (!raw || typeof raw !== "object") {
+    const stop = detectQuotaStop(run.log, Date.now(), run.from || 0);
+    if (stop) { plan.closeStep = "stand-check"; planQuotaHold(board, plan, stop, "проверка на стенде", "standCheckRun"); return true; }
+    plan.standCheckDeaths = (plan.standCheckDeaths || 0) + 1;
+    if (plan.standCheckDeaths < STAND_MAX_TRIES) {
+      plan.closeStep = "stand-check";
+      planNotice(plan, `Проверка на стенде не отчиталась (попытка ${plan.standCheckDeaths} из ${STAND_MAX_TRIES}) — переигрываю.`, "warn");
+      return true;
+    }
+    plan.closeStatus = "done"; plan.closeStep = "stand-check-broken";
+    plan.result.deploy = { status: "deployed-unchecked", reason: "проверка на стенде не смогла отработать" };
+    planNotice(plan, `Смержено и выкачено, но проверить на стенде не удалось (${STAND_MAX_TRIES} попытки). Лог: ${run.log || "нет"}.`, "error");
+    logPlan(plan, "plan-stand-broken", { tries: plan.standCheckDeaths });
+    firePlanEvent(board, plan, "stand-broken", { key: "stand", log: run.log || null });
+    return true;
+  }
+  const v = normalizeAcceptance(raw);
+  plan.result.standCheck = { ...v, at: new Date().toISOString(), url: conf.url };
+  const skipped = (v.checks || []).filter((c) => c.status === "skip").map((c) => c.title);
+  if (v.passed) {
+    plan.closeStatus = "done"; plan.closeStep = "closed"; plan.archived = true;
+    plan.result.deploy = { status: "deployed-checked", url: conf.url, checks: (v.checks || []).length, skipped };
+    planNotice(plan, `Прогон закрыт: смержено, выкачено на стенд и проверено (${(v.checks || []).length} сценариев`
+      + `${skipped.length ? `, без проверки: ${skipped.join("; ")}` : ""}).`, "ok");
+    logPlan(plan, "plan-stand-green", { checks: (v.checks || []).length, skipped: skipped.length });
+    firePlanEvent(board, plan, "stand-green", { key: "stand", url: conf.url, skipped });
+    if (conf.onGreen) {
+      const env = `export GRACE_PLAN_ID=${shq(plan.id)} GRACE_PLAN_GOAL=${shq(plan.goal || "")};`;
+      spawnStep(projectDir, `${env} ${conf.onGreen}`, path.join(dir, "stand-green-hook.out"));
+    }
+    return true;
+  }
+  const byId = new Map((v.checks || []).map((c) => [c.id, c]));
+  const failed = (v.failed || []).map((id) => byId.get(id)).filter(Boolean);
+  const card = spawnTailCard(board, { id: null, project: plan.project, type: "fix" }, {
+    theme: `Стенд: не работает после прогона «${plan.goal || plan.id}»`.slice(0, 200),
+    type: "fix",
+    outOfScope: "Всё, кроме сценариев, не прошедших на стенде. Новую функциональность не добавлять.",
+    acceptance: failed.map((c) => `на стенде: ${c.title}`),
+    description: [
+      `После выката прогона «${plan.goal || plan.id}» (ветка ${plan.integrationBranch}) сценарии не прошли на стенде ${conf.url}:`,
+      ...failed.map((c, i) => `${i + 1}) ${c.title}\n   что увидела проверка: ${String(c.output || "").slice(0, 800)}${c.evidence ? `\n   доказательство: ${c.evidence}` : ""}`),
+      ``, `Код уже в main и на стенде — чинить вперёд, стенд не откатывать. Тест, который это ловит, обязателен.`,
+    ].join("\n"),
+  });
+  card.standFor = plan.id;
+  plan.closeStatus = "done"; plan.closeStep = "stand-red";
+  plan.result.deploy = { status: "deployed-red", url: conf.url, fixCardId: card.id };
+  planNotice(plan, `Выкачено, но на стенде не работает: ${failed.map((c) => c.title).join("; ") || "см. отчёт"}. `
+    + `Стенд не откатывал. Заведён черновик «${card.theme}» — в следующий прогон.`, "error");
+  logPlan(plan, "plan-stand-red", { failed: failed.map((c) => c.id), cardId: card.id });
+  firePlanEvent(board, plan, "stand-red", { key: "stand", failed: failed.map((c) => c.title), fixCardId: card.id });
+  return true;
+}
+// endregion FUNC_standCheck
+
+// 17.09.2026 · сбой после слияния, перекрытый повторным успешным запуском того же workflow на main
+// (R5: CD упал на пропавшем образе, повторный выкат с починкой прошёл), провалом не считается:
+// раз в 5 минут в течение суток доска перепроверяет и, если всё перекрыто, продолжает закрытие.
+const PM_RECHECK_MS = 5 * 60 * 1000, PM_RECHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
+function postMergeRecheck(board, plan, projectDir, dir) {
+  const pm = (plan.result || {}).postMergeCi || {};
+  const failedRuns = pm.failedRuns || [];
+  if (!failedRuns.length) return false;
+  if (Date.now() - (Date.parse(pm.checkedAt || "") || 0) > PM_RECHECK_WINDOW_MS) return false;
+  const outFile = path.join(dir, "pm-recheck.out");
+  if (plan.pmRecheckRun) {
+    const r = readStep(outFile);
+    const started = Date.parse(plan.pmRecheckRun.startedAt || "") || 0;
+    if (!r) { if (Date.now() - started < 3 * 60 * 1000) return false; plan.pmRecheckRun = null; return true; }
+    plan.pmRecheckRun = null;
+    plan.pmRecheckAt = new Date().toISOString();
+    const later = r.text.split("\n").filter((l) => l.startsWith("LATER\t")).map((l) => {
+      const p = l.split("\t"); return { workflowId: p[1], status: p[3], conclusion: p[4], createdAt: p[5] };
+    });
+    const covered = failedRuns.every((f) => later.some((l) => l.workflowId === String(f.workflowId)
+      && l.status === "completed" && String(l.conclusion).toLowerCase() === "success"
+      && Date.parse(l.createdAt || "") > Date.parse(f.createdAt || "")));
+    if (!covered) return true;
+    const draft = pm.fixCardId ? board.cards.find((c) => c.id === pm.fixCardId) : null;
+    if (draft && draft.draft && draft.column === "backlog") { draft.archived = true; draft.archivedAt = new Date().toISOString(); }
+    plan.result.postMergeCi = { ...pm, status: "green-superseded" };
+    plan.result.deploy = null;
+    plan.closeStatus = "verifying";
+    plan.closeStep = standCheckConfig(projectDir) ? "stand-check" : "deploy";
+    planNotice(plan, `Сбой после слияния (${failedRuns.map((f) => f.name).join(", ")}) перекрыт повторным успешным запуском — закрытие продолжается.`, "ok");
+    logPlan(plan, "plan-postmerge-superseded", { runs: failedRuns.map((f) => f.name) });
+    return true;
+  }
+  if (plan.pmRecheckAt && Date.now() - Date.parse(plan.pmRecheckAt) < PM_RECHECK_MS) return false;
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  const cmd = `${GH_BIN} api "repos/{owner}/{repo}/actions/runs?branch=main&per_page=50" `
+    + `--jq '.workflow_runs[] | "LATER\\t\\(.workflow_id)\\t\\(.id)\\t\\(.status)\\t\\(.conclusion)\\t\\(.created_at)"'`;
+  plan.pmRecheckRun = { ...spawnStep(projectDir, cmd, outFile), startedAt: new Date().toISOString() };
+  return true;
+}
+
 // Итог прогона, чей main оказался красным. Прогон закрывается СВОИМ итогом (работа сделана и
 // смержена), но закрывается ГРОМКО: отдельный шаг, карточка починки и событие наружу — иначе
 // красный main обнаруживается утром, а это ровно то, что ночная вахта делала руками.
@@ -2170,7 +2424,8 @@ function postMergeRed(board, plan, ci, logTail) {
   const card = postMergeRedCard(board, plan, ci, logTail);
   const failed = (ci.failed || []).map((r) => r.name).join(", ") || "пост-мерж CI";
   plan.result.deploy = { status: "blocked-by-ci", reason: `пост-мерж CI на main красный (${failed}) — тег не ставился, выкатки не было` };
-  plan.result.postMergeCi = { ...(plan.result.postMergeCi || {}), status: "red", logTail: logTail || null, fixCardId: card.id };
+  plan.result.postMergeCi = { ...(plan.result.postMergeCi || {}), status: "red", logTail: logTail || null, fixCardId: card.id,
+    failedRuns: (ci.failed || []).filter((r) => r.workflowId).map((r) => ({ name: r.name, workflowId: r.workflowId, createdAt: r.createdAt })) };
   plan.closeStatus = "done";
   plan.closeStep = "postmerge-red";
   planNotice(plan, `Смержено, но CI на main КРАСНЫЙ: ${failed}. Тег не поставлен — прод остался на предыдущей версии, `
@@ -2383,7 +2638,14 @@ function planCloseTick(board) {
     // Terminal statuses stop the machine — but the steps in CLOSE_KEEP_STEPS carry the one thing
     // the human acts on (what is still owed, or how the run actually ended), so they survive.
     if (plan.closeStatus === "done" || plan.closeStatus === "failed") {
+      if (plan.closeStep === "postmerge-red" && postMergeRecheck(board, plan, projectDir, dir)) { changed = true; continue; }
       if (plan.closeStep !== "closed" && !CLOSE_KEEP_STEPS.has(plan.closeStep)) { plan.closeStep = "closed"; changed = true; }
+      continue;
+    }
+
+    // ── 17.09.2026 · проверка на стенде после выката: прогон кончается «выкачено и проверено» ──
+    if (plan.closeStep === "stand-check" || plan.closeStep === "stand-check-wait") {
+      if (standCheckTick(board, plan, projectDir, dir)) changed = true;
       continue;
     }
 
@@ -2507,7 +2769,7 @@ function planCloseTick(board) {
       const open = plan.result.pr;
       if (open && open.ok && open.url) {
         const undraft = open.draft && acc() && acc().passed;
-        const cmd = `${GH_BIN} pr edit ${shq(open.url)} --body-file ${shq(bodyFile)}`
+        const cmd = `git push -q origin ${shq(plan.integrationBranch)} 2>&1; ${GH_BIN} pr edit ${shq(open.url)} --body-file ${shq(bodyFile)}`
           + (undraft ? `; ${GH_BIN} pr ready ${shq(open.url)}` : "");
         const st = spawnStep(projectDir, cmd, path.join(dir, "pr-refresh.out"));
         plan.prRefreshRun = { ...st, undraft: !!undraft, startedAt: new Date().toISOString() };
@@ -2517,7 +2779,10 @@ function planCloseTick(board) {
       }
       const draft = !(acc() && acc().passed);
       const title = (plan.goal || `Прогон ${plan.id}`).slice(0, 160);
-      const cmd = `${GH_BIN} pr create --base main --head ${shq(plan.integrationBranch)} --title ${shq(title)} --body-file ${shq(bodyFile)}${draft ? " --draft" : ""}`;
+      // 17.09.2026: ветку пушит доска, а не агент карточки — «No commits between main and …» (F4-D)
+      // был ровно незапушенной веткой.
+      const cmd = `git push -q origin ${shq(plan.integrationBranch)} 2>&1; `
+        + `${GH_BIN} pr create --base main --head ${shq(plan.integrationBranch)} --title ${shq(title)} --body-file ${shq(bodyFile)}${draft ? " --draft" : ""}`;
       const st = spawnStep(projectDir, cmd, path.join(dir, "pr.out"));
       plan.prRun = { ...st, draft, startedAt: new Date().toISOString() };
       plan.closeStep = "pr-wait"; changed = true;
@@ -2661,6 +2926,14 @@ function planCloseTick(board) {
         // упавших проверок, чтобы не ходить за ним в GitHub самому.
         if (reason === "ci-red") firePlanEvent(board, plan, "ci-red", { key: "pr", failed: ci.failed, checks: ci.checks.length, prUrl: (plan.result.pr || {}).url || null });
       };
+      // 17.09.2026: сразу после пуша у новой головы PR проверок ещё нет — «none» в первые минуты
+      // значит «CI не успел зарегистрироваться», а не «CI в репозитории нет». Без паузы доска
+      // слила бы непроверенный коммит (после круга починки CI это штатный путь).
+      if (ci.status === "none" && sinceMs < CI_NONE_GRACE_MS) {
+        plan.ciNextAt = new Date(Date.now() + CI_POLL_MS).toISOString();
+        plan.closeStep = "ci"; changed = true;
+        continue;
+      }
       if (ci.status === "green" || ci.status === "none") {
         logPlan(plan, "plan-ci-green", { checks: ci.checks.length, waitedSec: plan.result.ci.waitedSec });
         plan.closeStep = "merge"; changed = true; continue;
@@ -2678,10 +2951,11 @@ function planCloseTick(board) {
       if (ci.status === "red") {
         const runId = ciRunIdOf(ci.failedUrls);
         if (runId) {   // fetch the tail of the failing job — a bare «CI красный» is not actionable
-          const st = spawnStep(projectDir, `${GH_BIN} run view ${runId} --log-failed 2>&1 | tail -n 40`, path.join(dir, "ci-log.out"));
+          const st = spawnStep(projectDir, `${GH_BIN} run view ${runId} --log-failed 2>&1 | grep -v '##\\[' | tail -n 150`, path.join(dir, "ci-log.out"));
           plan.ciLogRun = { ...st, runId, startedAt: new Date().toISOString() };
           plan.closeStep = "ci-log"; changed = true; continue;
         }
+        if (ciFixRound(board, plan, "(лог упавшего job недоступен — смотри проверки PR: gh pr checks)")) { changed = true; continue; }
         stopMerge("ci-red", `CI красный — доска НЕ мержит. Упало: ${ci.failed.join(", ")}. Мерж за человеком после починки.`);
         changed = true; continue;
       }
@@ -2703,8 +2977,9 @@ function planCloseTick(board) {
       const r = readStep(path.join(dir, "ci-log.out"));
       const started = Date.parse((plan.ciLogRun || {}).startedAt || "") || 0;
       if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.ciLogRun || {}).started) continue;
-      const tail = r ? r.text.slice(-2000) : "(лог упавшего job получить не удалось)";
+      const tail = r ? r.text.slice(-6000) : "(лог упавшего job получить не удалось)";
       plan.result.ci = { ...(plan.result.ci || {}), logTail: tail, runId: (plan.ciLogRun || {}).runId || null };
+      if (ciFixRound(board, plan, tail)) { changed = true; continue; }
       plan.closeStatus = "done"; plan.closeStep = "merge-failed";
       plan.result.merge = { ok: false, error: "ci-red", ci: plan.result.ci };
       planNotice(plan, `CI красный — доска НЕ мержит. Упало: ${(plan.result.ci.failed || []).join(", ")}. Хвост лога job'а — в результате прогона.`, "error");
@@ -2753,7 +3028,7 @@ function planCloseTick(board) {
       const url = shq((plan.result.pr || {}).url || "");
       const cmd = `SHA=$(${GH_BIN} pr view ${url} --json mergeCommit --jq '.mergeCommit.oid' 2>/dev/null); echo "SHA:$SHA"; `
         + `[ -n "$SHA" ] && ${GH_BIN} api "repos/{owner}/{repo}/actions/runs?head_sha=$SHA&per_page=20" `
-        + `--jq '.workflow_runs[] | "RUN\\t\\(.id)\\t\\(.name)\\t\\(.head_branch)\\t\\(.status)\\t\\(.conclusion)"'`;
+        + `--jq '.workflow_runs[] | "RUN\\t\\(.id)\\t\\(.name)\\t\\(.head_branch)\\t\\(.status)\\t\\(.conclusion)\\t\\(.workflow_id)\\t\\(.created_at)"'`;
       const st = spawnStep(projectDir, cmd, path.join(dir, "postmerge.out"));
       plan.postMergeRun = { ...st, startedAt: new Date().toISOString() };
       plan.closeStep = "post-merge-wait"; changed = true;
@@ -2781,8 +3056,10 @@ function planCloseTick(board) {
         if (runId && !plan.pmLogRun) {   // хвост упавшего job — иначе карточка починки бессодержательна
           const st = spawnStep(projectDir, `${GH_BIN} run view ${runId} --log-failed 2>&1 | tail -n 40`, path.join(dir, "pm-log.out"));
           plan.pmLogRun = { ...st, runId, startedAt: new Date().toISOString() };
+          plan.pmFailed = ci.failed;
           plan.closeStep = "post-merge-log"; changed = true; continue;
         }
+        plan.pmFailed = ci.failed;
         postMergeRed(board, plan, ci, null);
         changed = true; continue;
       }
@@ -2795,7 +3072,7 @@ function planCloseTick(board) {
         changed = true; continue;
       }
       logPlan(plan, "plan-postmerge-green", { status: ci.status, runs: plan.result.postMergeCi.runs, waitedSec: plan.result.postMergeCi.waitedSec });
-      plan.closeStep = "deploy"; changed = true;
+      plan.closeStep = standCheckConfig(projectDir) ? "stand-check" : "deploy"; changed = true;
       continue;
     }
     if (plan.closeStep === "post-merge-log") {
@@ -2803,7 +3080,7 @@ function planCloseTick(board) {
       const started = Date.parse((plan.pmLogRun || {}).startedAt || "") || 0;
       if (!r && Date.now() - started < 3 * 60 * 1000 && (plan.pmLogRun || {}).started) continue;
       const failedNames = (plan.result.postMergeCi || {}).failed || [];
-      postMergeRed(board, plan, { failed: failedNames.map((n) => ({ name: n })) }, r ? r.text.slice(-2000) : null);
+      postMergeRed(board, plan, { failed: plan.pmFailed || failedNames.map((n) => ({ name: n })) }, r ? r.text.slice(-2000) : null);
       changed = true; continue;
     }
 
@@ -2950,6 +3227,15 @@ function dispatch(card) {
       milestones: [],
       cards: [],
     };
+    // 17.09.2026 · проверка карточки — команда ПРОЕКТА, а не выдумка агента. База сравнения
+    // фиксируется здесь, в момент старта: от неё проект считает, какие тесты обязательны.
+    const gate = readyGate.gateConfig((readProjectConfig(projectDir) || {}).cfg);
+    if (gate) {
+      card.gateBase = readyGate.baseFor(projectDir, card.integrationBranch || null);
+      seed.gateBase = card.gateBase;
+      seed.verifyGate = `${gate.cardGate} --card-dir ${path.join(".grace-feature-dev", card.slug)}`;
+      event.gateBase = card.gateBase;
+    }
     fs.writeFileSync(path.join(runDir, "board.json"), JSON.stringify(seed, null, 2));
     event.seed = path.join(runDir, "board.json");
   } catch (e) {
@@ -3049,11 +3335,29 @@ function planDecisionsBlock(card) {
 // ##   check degrades safely and costs one stat() per spawn.
 // GREP_SUMMARY: lean context, start context, setting-sources, strict-mcp-config, harness trim
 const LEAN = process.env.GRACE_LEAN !== "0";
+// 17.09.2026 · ещё −25k старта (замер на DocsInside2: 45.6k → 20.9k токенов при тех же флагах):
+//   • автопамять выключена — индекс памяти человека (стенд, портал, личное) агенту не нужен (−7k);
+//   • инструменты — только те, что зовёт конвейер (−11k схем);
+//   • полный CLAUDE.md проекта заменяется выжимкой `.grace/agent-context.md`, если проект её
+//     положил (правила безопасности и соглашения по коду; без разделов для человека). Нет файла —
+//     CLAUDE.md остаётся: его правила безопасности терять нельзя.
+// MCP для шагов, которым нужен браузер, подключается отдельно (opts.mcpConfig в spawnRun).
+const LEAN_TOOLS = (process.env.GRACE_LEAN_TOOLS || "Bash,Read,Edit,Write,Grep,Glob,Agent,TodoWrite,Skill").trim();
+const AGENT_CONTEXT_FILE = path.join(".grace", "agent-context.md");
 function leanFlags(projectDir) {
   if (!LEAN) return [];
   const has = (...p) => fs.existsSync(path.join(projectDir, ".claude", ...p));
   const prepared = has("skills", "grace-feature-dev") && has("agents", "gfd-coder.md") && has("commands", `${GRACE_COMMAND}.md`);
-  return prepared ? ["--setting-sources", "project", "--strict-mcp-config"] : [];
+  if (!prepared) return [];
+  const settings = { autoMemoryEnabled: false };
+  const extra = [];
+  const ctx = path.join(projectDir, AGENT_CONTEXT_FILE);
+  if (fs.existsSync(ctx)) {
+    settings.claudeMdExcludes = [path.join(projectDir, "CLAUDE.md")];
+    extra.push("--append-system-prompt-file", ctx);
+  }
+  return ["--setting-sources", "project", "--strict-mcp-config", "--settings", JSON.stringify(settings),
+    ...(LEAN_TOOLS ? ["--tools", LEAN_TOOLS] : []), ...extra];
 }
 // endregion FUNC_leanContext
 
@@ -3071,7 +3375,14 @@ function leanFlags(projectDir) {
 // ## - Plan-level `model` is stamped onto every stage card at assembly (see POST /api/plans),
 // ##   so the prompt builders need only the card.
 // GREP_SUMMARY: model, --model, GRACE_CLAUDE_MODEL, sonnet, opus, main thread cost
-const CLAUDE_MODEL_DEFAULT = (process.env.GRACE_CLAUDE_MODEL || "").trim() || null;
+// 17.09.2026 (решение владельца): на доске все агенты, кроме архитектора, работают на Sonnet —
+// главный поток только координирует, код пишут кодеры. За 20 прогонов 02–15.09 главный поток
+// на модели аккаунта (Opus) стоил $777 из $904. Opus остаётся у gfd-architect (его frontmatter).
+// GRACE_CLAUDE_MODEL=default — вернуть модель аккаунта.
+const CLAUDE_MODEL_DEFAULT = (() => {
+  const v = (process.env.GRACE_CLAUDE_MODEL || "sonnet").trim();
+  return v && v !== "default" ? v : null;
+})();
 const modelFor = (owner) => (owner && typeof owner.model === "string" && owner.model.trim()) || CLAUDE_MODEL_DEFAULT;
 // endregion FUNC_runModel
 
@@ -3111,6 +3422,13 @@ function buildModeBlock(card, branch) {
 }
 // endregion FUNC_buildMode
 
+// 17.09.2026 · Mac не должен засыпать, пока работает агент: ночные «зависания» R5 и R7
+// (по ~5 ч в blocked) были сном машины, а сторож принимал его за зависший процесс.
+// `caffeinate -i -w <pid>` держит машину бодрой ровно до выхода процесса. Не macOS — no-op.
+function keepAwake(pid) {
+  if (process.platform !== "darwin" || !pid || process.env.GRACE_KEEP_AWAKE === "0") return;
+  try { spawn("/usr/bin/caffeinate", ["-i", "-s", "-w", String(pid)], { detached: true, stdio: "ignore" }).unref(); } catch {}
+}
 // region FUNC_spawnRun — detached headless Claude run (dir-scoped, logged)
 function spawnRun(projectDir, runDir, prompt, logName, opts) {
   if (!AUTORUN) return { launched: false, reason: "GRACE_AUTORUN=0" };
@@ -3124,9 +3442,15 @@ function spawnRun(projectDir, runDir, prompt, logName, opts) {
     const env = { ...process.env, PATH: `${BIN_PATH_HINT}:${process.env.PATH || ""}` };
     const lean = leanFlags(projectDir);
     const model = (opts && opts.model) || null;      // B3′: null ⇒ no --model ⇒ account default
+    const mcp = (opts && opts.mcpConfig) || null;    // шаг с браузером: свой MCP поверх --strict-mcp-config
+    // В `-p` MCP подключается асинхронно, и первый шаг модели идёт без его инструментов (замер 17.09:
+    // status "pending"). Этот флаг заставляет дождаться подключения до старта.
+    if (mcp) env.MCP_CONNECTION_NONBLOCKING = "0";
     const args = ["-p", prompt, "--permission-mode", "bypassPermissions", "--add-dir", projectDir,
-      ...(model ? ["--model", model] : []), ...lean];
+      ...(model ? ["--model", model] : []), ...lean,
+      ...(mcp ? ["--mcp-config", JSON.stringify(mcp)] : [])];
     const child = spawn(CLAUDE_BIN, args, { cwd: projectDir, env, detached: true, stdio: ["ignore", out, out] });
+    keepAwake(child.pid);
     // Ш1.2 · чёрный ящик рана. «Execution error» одной строкой не говорит НИЧЕГО: ни кода
     // возврата, ни сигнала, ни того, чем ран вообще был. Оба маркера пишет доска (у detached
     // процесса код возврата больше взять неоткуда), а `.exit` рядом с логом читает машина.
@@ -3382,9 +3706,7 @@ function buildDirectives(card, runDir, rigor) {
     `ВЫВОД КОМАНД — ХВОСТАМИ, НЕ ЦЕЛИКОМ. Любую шумную команду (тесты, сборка, typecheck, установка`,
     `зависимостей, миграции) запускай с обрезкой: "<команда> 2>&1 | tail -n 40". Полный вывод читай`,
     `ТОЛЬКО когда хвоста не хватило для диагноза, и тогда — grep'ом по конкретной ошибке, а не целиком.`,
-    `ПРОВЕРКИ — ОДНИМ ВЫЗОВОМ. Гоняй гейт цепочкой: "npx tsc --noEmit && <тест> && <сборка> 2>&1 | tail -n 40"`,
-    `(команды бери из .grace/project.md, если он есть). Цепочка встаёт на первом красном — это и нужно.`,
-    `Разбивай на отдельные вызовы, только когда уже что-то упало и ты сужаешь причину.`,
+    ...gateDirectives(card, runDir),
     `DEFINITION OF DONE (гейт перед "ready" — НЕ помечай карточку/слайс done, пока не выполнено):`,
     `карточка НЕ уходит в done/ready, если в её файлах остались TODO/FIXME/HACK/XXX/NotImplementedError/`,
     `заглушки (placeholder-возвраты, выброшенные значения), КРОМЕ случая, когда строка покрыта проходящим`,
@@ -3415,6 +3737,44 @@ function buildDirectives(card, runDir, rigor) {
     `в "finishNote" (или "Отложенное: нет", если deferred пуст). Не прячь отложенное внутри TODO в коде done-карточки.`,
     `Твой board.json: ${path.join(runDir, "board.json")}.`,
   ];
+}
+
+// 17.09.2026 · роли и проверка карточки. Две вещи, которые за 20 прогонов инструкцией не держались
+// (код писал главный поток, команду проверки агент сочинял сам), — теперь доска проверяет их
+// фактом при `ready` (lib/ready-gate.js), а здесь говорит агенту, что именно будет проверено.
+function gateDirectives(card, runDir) {
+  const projectDir = resolveProjectDir(card.project);
+  const gate = readyGate.gateConfig((readProjectConfig(projectDir) || {}).cfg);
+  const roles = [
+    `РОЛИ (как в grace-feature-dev, доска проверит по журналу сессии): ты — координатор. Код каждой`,
+    `карточки декомпозиции пишет кодер-субагент (${execFor(card).coder}), ты сам код НЕ пишешь. После зелёной`,
+    `проверки карточку смотрит gfd-verifier, затем минимум один gfd-reviewer. Карточка без кодера,`,
+    `проверяющего и ревьюера доской не принимается и уходит на повтор.`,
+  ];
+  if (!gate) {
+    return [...roles,
+      `ПРОВЕРКИ — ОДНИМ ВЫЗОВОМ. Гоняй гейт цепочкой: "npx tsc --noEmit && <тест> && <сборка> 2>&1 | tail -n 40"`,
+      `(команды бери из .grace/project.md, если он есть). Цепочка встаёт на первом красном — это и нужно.`,
+      `Разбивай на отдельные вызовы, только когда уже что-то упало и ты сужаешь причину.`];
+  }
+  const dir = path.relative(projectDir, runDir);
+  return [...roles,
+    `ПРОВЕРКА КАРТОЧКИ — ТОЛЬКО КОМАНДОЙ ПРОЕКТА, свою не сочиняй. board.verifyGate уже записан в board.json:`,
+    `  "${gate.cardGate} --card-dir ${dir}"`,
+    `Она сама выбирает тесты по изменённым файлам (все модульные + нужные интеграционные + фронтовые`,
+    `по связям). Полный набор тестов НЕ запускай нигде — он идёт только в CI на GitHub.`,
+    `Порядок перед КАЖДЫМ green-коммитом: "${gate.cardGate} --card-dir ${dir} --fix" (форматирование,`,
+    `линтер, перегенерация контракта API и кодов ошибок) → закоммить свои файлы и то, что поправил --fix.`,
+    `Перед "ready": всё закоммичено → "${gate.cardGate} --card-dir ${dir} 2>&1 | tail -n 60" → ЗЕЛЕНО.`,
+    `Отчёт ляжет в ${path.join(dir, "gate.json")}; доска сверит: проверка шла на последнем коммите ветки,`,
+    `зелёная, и запущены все обязательные тесты (список доска пересчитает сама).`,
+    `Пока правишь — гоняй только упавшее: конкретный тест-файл/тест, не весь каталог.`,
+    `Нужны тесты сверх правила (правило их не видит: права ролей в CSV, вызов по строке, экран от ответа`,
+    `API)? Допиши строкой "<путь к тесту> | <зачем>" в ${path.join(dir, "extra-tests.txt")} — добавлять можно,`,
+    `убирать обязательные нельзя.`,
+    `ТЕСТЫ, КОТОРЫЕ ПИШЕТ КОДЕР: на каждый пункт приёмки карточки — тест, проверяющий ПОВЕДЕНИЕ (запрос к API`,
+    `или отрисовка экрана); тест, читающий исходник как текст, не считается. Правила тестов проекта — в его`,
+    `контексте для агентов. Ревьюер проверяет соответствие «пункт приёмки → тест» и эти правила.`];
 }
 
 // BUILD — launched after the architecture decisions are chosen. Architect honors them.
@@ -4015,10 +4375,88 @@ function resumeRun(card, projectDir, runDir, rigor, recovery) {
   return { target, launch, kind };
 }
 
+// region FUNC_readyGate — «ready» агента проверяется фактами (17.09.2026)
+// ## @purpose См. lib/ready-gate.js. Здесь — только решение доски: принять, подождать или вернуть.
+// ## @io (board, card, projectDir, runDir) -> true = «ready» пока не зеркалим (ждём или вернули в работу)
+// ## @invariants
+// ## - Проект без card_gate/select_tests и карточка без gateBase (запущена до правки) — не проверяются.
+// ## - Живой процесс не трогаем: вердикт выносится после его выхода, ровно один раз на выход.
+// ## - Возвратов не больше GATE_MAX_REJECTS; дальше — эскалация (страж или человек), не бесконечный круг.
+const GATE_MAX_REJECTS = Number(process.env.GRACE_GATE_MAX_REJECTS || 2);
+function readyGateHold(board, card, projectDir, runDir) {
+  if (!card.gateBase || card.gateSkip) return false;
+  const gate = readyGate.gateConfig((readProjectConfig(projectDir) || {}).cfg);
+  if (!gate) return false;
+  if (card.runPid && isAlive(card.runPid)) return "wait";     // ещё пишет — решим после выхода
+  if (card.gateEscalatedRun && card.gateEscalatedRun === card.runStartedAt) return "wait";   // этот выход уже отдан стражу/человеку
+  const v = readyGate.checkReady({ projectDir, runDir, slug: card.slug, branch: branchFor(card),
+    base: card.gateBase, dispatchedAt: card.dispatchedAt, gate });
+  card.readyGate = { ts: new Date().toISOString(), ok: v.ok, problems: v.problems, roles: v.roles,
+    head: v.head || null, ran: v.report ? (v.report.ran || []).length : 0 };
+  try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.readyGate.ts, event: "ready-gate", cardId: card.id,
+    ok: v.ok, problems: v.problems, roles: v.roles }) + "\n"); } catch {}
+  if (v.ok) return false;
+  card.gateRejects = (card.gateRejects || 0) + 1;
+  const list = v.problems.map((x, i) => `${i + 1}) ${x}`).join("\n");
+  if (card.gateRejects > GATE_MAX_REJECTS) {
+    card.gateEscalatedRun = card.runStartedAt || new Date().toISOString();
+    escalate(board, card, `Доска не принимает «ready» уже ${card.gateRejects - 1} раз(а):\n${list}`,
+      { kind: "about-to-block", hint: "ready-gate" });
+    return true;
+  }
+  const recovery = [
+    `ВОЗВРАТ С ПРОВЕРКИ ДОСКИ (${card.gateRejects} из ${GATE_MAX_REJECTS}): карточка объявила ready, но доска её не приняла.`,
+    list,
+    `Исправь ровно это, продолжая с последнего зелёного чекпоинта ветки "${branchFor(card)}". Фичу заново НЕ начинай.`,
+  ].join("\n");
+  const { target, launch, kind } = resumeRun(card, projectDir, runDir, execFor(card).rigor, recovery);
+  if (launch && launch.launched) {
+    card.column = target;
+    card.blockReason = null;
+    card.lastColumnChangeAt = new Date().toISOString();
+    recordLaunch(card, launch, kind);
+    card.history.push({ column: target, ts: card.lastColumnChangeAt, via: "ready-gate" });
+    try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: card.lastColumnChangeAt, event: "ready-gate-reject",
+      cardId: card.id, round: card.gateRejects, launch }) + "\n"); } catch {}
+  } else {
+    card.gateEscalatedRun = card.runStartedAt || new Date().toISOString();
+    escalate(board, card, `Доска не приняла «ready», а перезапуск не стартовал${launch && launch.error ? ": " + launch.error : ""}:\n${list}`,
+      { kind: "about-to-block", hint: "ready-gate" });
+  }
+  return true;
+}
+// endregion FUNC_readyGate
+
+// 17.09.2026 · сон машины — не зависание. Тик доски идёт каждые пару секунд; разрыв больше минуты
+// значит, что Mac спал (или доска стояла). Всё, что меряет «сколько ждём», сдвигается на разрыв —
+// иначе проснувшийся агент тут же убивается как зависший (R5 13.09, R7 14.09: ~5 ч в blocked).
+const SLEEP_GAP_MS = Number(process.env.GRACE_SLEEP_GAP_SEC || 60) * 1000;
+let LAST_SYNC_AT = 0;
+function shiftClocks(board, gapMs) {
+  const shift = (iso) => (iso && Date.parse(iso) ? new Date(Date.parse(iso) + gapMs).toISOString() : iso);
+  let n = 0;
+  for (const c of board.cards || []) {
+    if (!c.dispatchedAt || c.column === TERMINAL || c.column === "blocked") continue;
+    c.lastColumnChangeAt = shift(c.lastColumnChangeAt);
+    c.runStartedAt = shift(c.runStartedAt);
+    n += 1;
+  }
+  for (const p of board.plans || []) {
+    if (!p.closeStatus || p.closeStep === "closed") continue;
+    for (const k of ["ciSince", "postMergeSince", "standCheckSince"]) p[k] = shift(p[k]);
+    for (const k of ["acceptanceRun", "standCheckRun"]) if (p[k]) p[k].startedAt = shift(p[k].startedAt);
+  }
+  try { fs.appendFileSync(DISPATCH_LOG, JSON.stringify({ ts: new Date().toISOString(), event: "sleep-gap",
+    gapSec: Math.round(gapMs / 1000), cards: n }) + "\n"); } catch {}
+}
+
 function syncFromPipeline() {
   let board, changed = false;
   try { board = readBoard(); } catch { return; }
   const now = Date.now();
+  const gap = LAST_SYNC_AT ? now - LAST_SYNC_AT : 0;
+  LAST_SYNC_AT = now;
+  if (gap > SLEEP_GAP_MS) { shiftClocks(board, gap); changed = true; }
   // S6 · 0) the clock first: cards that were waiting out a subscription limit go back to work
   // before the liveness watchdog gets a chance to read a just-resumed card as a dead one.
   if (quotaResumeTick(board, now)) changed = true;
@@ -4040,7 +4478,11 @@ function syncFromPipeline() {
       if (fs.existsSync(pipFile)) {
         pip = JSON.parse(fs.readFileSync(pipFile, "utf8"));
         const col = normalizeColumn(pip.column);
-        if (col && COLUMNS.includes(col) && col !== "backlog" && col !== card.column) {
+        // 17.09.2026 · «ready» принимается только после проверки фактов (lib/ready-gate.js).
+        // Пока процесс жив — ждём его выхода: он мог записать ready и ещё дописывать итоги.
+        const gateHold = col === TERMINAL && col !== card.column && readyGateHold(board, card, projectDir, runDir);
+        if (gateHold && gateHold !== "wait") changed = true;
+        if (col && COLUMNS.includes(col) && col !== "backlog" && col !== card.column && !gateHold) {
           card.column = col;
           card.lastColumnChangeAt = new Date().toISOString();
           if (col === "blocked" && pip.blockReason) card.blockReason = String(pip.blockReason);
