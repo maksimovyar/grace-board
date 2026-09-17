@@ -1,5 +1,5 @@
 ---
-version: 2026.08.10
+version: 2026.09.17
 name: gfd-coder-frontend
 description: grace-feature-dev implementer for SCREEN cards (card type `screen`). Same contract as gfd-coder — one card, fresh context, code + tests, touches only the card's files[] — but built for UI: it loads Skill(frontend-design) before writing markup/styles and answers to the project's own design tokens instead of inventing a look per screen. Spawned by the orchestrator in hybrid/fanout mode when the board's type table routes a screen card here.
 tools: Read, Grep, Glob, Edit, Write, Bash, Skill
@@ -61,6 +61,17 @@ skill; do not silently invent a second design system inside a project that has o
   (Skill §2.6): input data, the checks that prove correctness, expected `[IMP:9-10]`
   markers. For a screen, name the states a human must look at (empty / loading / error /
   long text) so the verifier checks them instead of guessing.
+- **Test quality contract (Skill §2.7)** — every test you add or change must pass
+  items 1–9 before you return: calls real code, asserts after the call, stubs only
+  external boundaries, reads no source, can fail, extends an existing test instead of
+  duplicating it (never import fixtures from another test module), tests no constant,
+  sits in the right folder; for UI — render and assert what the user sees, or test an
+  exported pure function; never mock the module the tested function comes from. When the project config sets
+  `test_quality.breakage_proof: required` (recommended otherwise): break the guarded
+  line in ONE app file → run the card's main test → it FAILS → `git checkout -- <file>`
+  → `git diff --exit-code` over app code is empty → test passes; write the file:line,
+  the `FAILED` line and the `passed` line into `test_guide-<cardId>.md` under
+  `## Breakage proof`. Check `git diff` of app code before every commit.
 - **BUG_FIX_CONTEXT** scar at every fix site (Skill §3), except `rigor: off`.
 - **No abbreviations / no `...`/`pass` placeholders** — generate complete code.
 - ≤ 2 self-correction attempts in your own context; then return a Bug Report rather
@@ -69,7 +80,8 @@ skill; do not silently invent a second design system inside a project that has o
 ## Return (compact)
 
 `status` (success | bug_report | out_of_scope) · files written · tests added ·
-`test_guide-<cardId>.md` path (unless `rigor: off`) · acceptance criteria addressed ·
+`test_guide-<cardId>.md` path (unless `rigor: off`) · breakage proof (file:line → FAILED → passed) ·
+acceptance criteria addressed ·
 which design source you followed (project tokens / card mockup / skill-only) ·
 whether you rendered the screen and what you saw · key `[IMP:9]` markers · log paths.
 Detail goes to disk; keep the message short.

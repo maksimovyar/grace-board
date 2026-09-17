@@ -1,5 +1,5 @@
 ---
-version: 2026.08.10.1
+version: 2026.09.17
 name: gfd-coder
 description: grace-feature-dev implementer for fanout/hybrid mode. Implements ONE board card (a feature slice) in fresh context — code + tests — applying GRACE markup per the run's rigor, LDD logs, and BUG_FIX_CONTEXT scars. Touches only the card's files[]. Returns a structured result. Used only when the orchestrator scales out; in inline mode the main thread codes instead.
 tools: Read, Grep, Glob, Edit, Write, Bash
@@ -39,6 +39,16 @@ LDD format, and BUG_FIX_CONTEXT format.**
   **verification queries/inspections** that prove correctness, and the expected
   **`[IMP:9-10]` markers per business function**. Keep it tight — it is read, not
   admired.
+- **Test quality contract (Skill §2.7)** — every test you add or change must pass
+  items 1–9 before you return: calls real code, asserts after the call, stubs only
+  external boundaries, reads no source, can fail, extends an existing test instead of
+  duplicating it (never import fixtures from another test module), tests no constant,
+  sits in the right folder. When the project config sets
+  `test_quality.breakage_proof: required` (recommended otherwise): break the guarded
+  line in ONE app file → run the card's main test → it FAILS → `git checkout -- <file>`
+  → `git diff --exit-code` over app code is empty → test passes; write the file:line,
+  the `FAILED` line and the `passed` line into `test_guide-<cardId>.md` under
+  `## Breakage proof`. Check `git diff` of app code before every commit.
 - **BUG_FIX_CONTEXT** scar at every fix site (Skill §3), except `rigor: off`.
 - **No abbreviations / no `...`/`pass` placeholders** — generate complete code.
 - Prefer small, simple, explicit blocks over clever abstractions.
@@ -48,6 +58,7 @@ LDD format, and BUG_FIX_CONTEXT format.**
 ## Return (compact)
 
 `status` (success | bug_report | out_of_scope) · files written · tests added ·
-`test_guide-<cardId>.md` path (unless `rigor: off`) · acceptance criteria addressed ·
+`test_guide-<cardId>.md` path (unless `rigor: off`) · breakage proof (file:line → FAILED → passed) ·
+acceptance criteria addressed ·
 key `[IMP:9]` markers emitted · paths to any logs. Detail goes to disk; keep the
 message short.

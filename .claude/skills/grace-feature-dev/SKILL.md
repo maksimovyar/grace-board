@@ -50,7 +50,7 @@ Location (in the **target project**, never in `~/.claude`):
 .grace-feature-dev/<feature-slug>/requirements.md   ← swarm-memory artifact (from clarify)
 .grace-feature-dev/<feature-slug>/DevelopmentPlan.md← swarm-memory artifact (from architecture)
 .grace-feature-dev/<feature-slug>/app.log           ← LDD trace (when rigor != off)
-.grace-feature-dev/<feature-slug>/test_guide-<cardId>.md ← per-card verification contract (coder → verifier, §2.6)
+.grace-feature-dev/<feature-slug>/test_guide-<cardId>.md ← per-card verification contract (coder → verifier, §2.6; breakage proof §2.7)
 ```
 
 **board.json is the ONE source of truth.** The task list is NOT kept in chat or
@@ -244,6 +244,56 @@ The verifier's first step is to load this guide (gfd-verifier §0). A **missing*
 guide when `rigor != off` is itself a Verify failure (`missing-test-guide`
 signature) — verification without a contract is untrusted.
 
+### 2.7 Test quality contract (every card that adds or changes a test)
+
+A green test is evidence only if it can go red. Audit of one product (09.2026): 75 % of its
+test functions came from board runs, ≈22 % of the backend suite and ≈45 % of the frontend
+suite could not catch a regression, and acceptance passed them all. A test is accepted only
+if **all** of 1–9 hold (every product):
+
+1. **Calls real application code** — an HTTP request to the app, a service, or an exported
+   function. It does not re-implement the app's logic inside the test ("copied the filter,
+   tested the copy").
+2. **Asserts after the call.** Seeding by direct DB writes is fine; asserting what is in the
+   DB without the app's code running between seed and assert is not.
+3. **Does not stub what it checks.** Stubs only at external boundaries (mail, object
+   storage, antivirus, KMS, clock, broker) — never the function under test or its
+   permission check.
+4. **Does not read source** — no `inspect.getsource`/`signature`, `read_text`/`open` on
+   `.py`/`.ts(x)`, `readFileSync` of a component, regexes over code, `hasattr(module, …)`
+   instead of a call. Exceptions: the project's allowlisted guards only.
+5. **Can fail.** No `or True`, no `assert x in <set declared in the test>`, no `pass`
+   bodies, no guarded asserts that silently pass (`if container: …`).
+6. **Is not a duplicate.** Before a new file, search for an existing test of this behaviour
+   (project graph, or grep the function name under the tests dir); if found, extend it.
+   "One test file per card" is not a rule. Never import fixtures from another test module —
+   module-scoped seeds run again and change what other modules see.
+7. **Does not test the library or a constant** — not "field is optional", "enum has X",
+   "schema builds", "constant equals N". Project-level exceptions only (e.g. input
+   validation required by a security rule).
+8. **Lives in the right place** — no database → unit tests; database → integration tests.
+9. **Frontend:** render the component and assert what the user sees, or test an exported
+   pure function directly. Never mock the module the tested function comes from (use
+   `importOriginal`/`vi.importActual` for partial mocks).
+10. **Breakage proof** — *required when the project config says so*
+    (`test_quality.breakage_proof: required` in `.grace/project.md`), recommended otherwise:
+    - the **implementer** (coder) breaks it, never the verifier: a temporary edit in ONE
+      application file → run the card's main test → it FAILS → `git checkout -- <file>` →
+      `git diff --exit-code` over application code is empty;
+    - the implementer records in `test_guide-<cardId>.md` (§2.6), section
+      `## Breakage proof`: the file:line broken and how, the `FAILED` line, the `passed` line
+      after the revert;
+    - the **verifier stays read-only**: it checks the record exists, the broken place exists
+      in the code, and the card's commit carries no trace of the breakage. Missing record →
+      Verify failure with signature `test-quality`;
+    - crash safety: the implementer checks `git diff` of application code before every
+      commit; the verifier works on the clean snapshot (§2.1), where an uncommitted breakage
+      is invisible and a committed one shows in the diff.
+
+A violation of 1–5 is a Verify failure (`test-quality` signature) even when every test is
+green. 6–9 are Review findings (Critical when the test cannot fail). Project-specific
+allowlists and paths live in the project (`.grace/agent-context.md` or CLAUDE.md), never here.
+
 ---
 
 ## 3. GRACE markup — conditional by `rigor`
@@ -398,6 +448,6 @@ of the contract, not left to per-run judgement.
     focus any more** (С2): that focus was mandatory on every grace card and spent a
     whole session per card on what a script answers for free.
   - Reviewers keep the axes that need judgement: **simplicity/DRY** and
-    **bugs/correctness**. Placeholder code (`...`/`pass`/stub returns) stays a
+    **bugs/correctness**; the test quality contract (§2.7) is part of both. Placeholder code (`...`/`pass`/stub returns) stays a
     reviewer's Critical — a linter cannot tell a placeholder from a valid ellipsis.
   - In `inline` mode the main thread reviews; the same checklist applies.

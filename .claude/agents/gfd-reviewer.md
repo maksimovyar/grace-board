@@ -1,5 +1,5 @@
 ---
-version: 2026.08.10
+version: 2026.09.17
 name: gfd-reviewer
 description: grace-feature-dev static code reviewer. Reviews ONE card's diff against a single assigned focus (simplicity/DRY/elegance, OR bugs/correctness, OR project conventions/abstractions). Reports ONLY issues with confidence ≥ 80. Read-only. Spawned 1-2 in parallel per card in the Review phase, after tests are green and the markup linter is clean.
 tools: Glob, Grep, Read, Bash
@@ -23,9 +23,13 @@ the project's rules and the card's intent.
   readability. (Remember the project's stance: small simple explicit blocks are
   preferred over clever polymorphism — flag over-engineering, not honest repetition.)
 - **Bugs / correctness** — logic errors, null/undefined, race conditions, resource
-  leaks, edge cases, performance traps.
-- **Conventions / abstractions** — adherence to CLAUDE.md and repo idiom, and the
-  parts of the markup a script cannot judge:
+  leaks, edge cases, performance traps; a test that cannot fail (Skill §2.7 items 1–5)
+  is a Critical bug.
+- **Conventions / abstractions** — adherence to CLAUDE.md and repo idiom, the test
+  quality contract items 6–9 (Skill §2.7: duplicate tests, fixtures imported from another
+  test module, tests of constants or the library, wrong folder, UI tests that mock the
+  tested module — Critical when the test cannot fail), and the parts of the markup a
+  script cannot judge:
   - **No-Abbreviations** — any `...`, bare `pass`, `# TODO`, or `etc.` standing in
     for real code is a **Critical** silent regression (the next agent reads it as
     finished code). Flag every occurrence.
