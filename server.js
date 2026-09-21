@@ -2186,7 +2186,7 @@ const ciRunIdOf = (urls) => {
 // STRUCTURE: ▶ merged → ⊕ post-merge(gh) → ⚡ green? → ⎋ tag → deploy.yml · red? → ⎋ draft «почини CI»
 
 const POSTMERGE_GRACE_MS = Number(process.env.GRACE_POSTMERGE_GRACE_SEC || 120) * 1000;  // прогонов ещё нет — они регистрируются не мгновенно
-const POSTMERGE_BUDGET_MS = Number(process.env.GRACE_POSTMERGE_WAIT_MIN || 30) * 60 * 1000;
+const POSTMERGE_BUDGET_MS = Number(process.env.GRACE_POSTMERGE_WAIT_MIN || 45) * 60 * 1000;  // CI на main идёт 26–30 мин: при 30 ADD-6 (18.09) уехал к человеку на 4 с перебора
 const TAG_PREFIX_DEFAULT = "v";
 // Режим релиза объявляется проектом. Ничего не объявлено — старое поведение, без тегов.
 function releaseMode(projectDir) {
