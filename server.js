@@ -4036,7 +4036,8 @@ function spawnTailCard(board, parent, opts) {
 // ##   транскриптах (~50 МБ JSONL на прогон), а возврат verify→implementing — это ровно тот
 // ##   цикл, который их и порождает. G2 была бы поймана на втором возврате, то есть ~$20 вместо $49.
 // ## @modulemap
-// ## FUNC 2[calc] => countLoops     — возвраты verifying/reviewing → implementing по history
+// ## FUNC 2[calc] => countLoops     — возвраты verifying/reviewing → implementing (подкарточки / history)
+// ## FUNC 2[calc] => trackSubLoops  — возвраты по каждой подкарточке пайплайна (тик синхронизации)
 // ## FUNC 2[calc] => runLogBytes    — размер вывода ТЕКУЩЕГО рана, байты
 // ## FUNC 3[calc] => loopBudgetFor  — порог: константа доски → override прогона
 // ## FUNC 4[calc] => loopSignals    — сводка сигналов + список пробитых порогов
@@ -4049,7 +4050,12 @@ const LOG_MAX_MB_DEFAULT = Number(process.env.GRACE_LOG_MAX_MB || 6);    // ра
 // Возврат = переход в `implementing` ПОСЛЕ того, как карточка уже была на гейте (verify/review).
 // Счёт совпадает с `metrics.loops` (lib/plan-metrics.js) — там он делается по той же history,
 // только когда прогон уже закрыт. Одна и та же правда, разное время чтения.
+// 26.09.2026 · Верхняя колонка пайплайна — одна на все подкарточки: t2 уходит в `implementing`
+// после того, как t1 прошла ревью, и по history это неотличимо от возврата. Прогон c562a546:
+// 7 «возвратов» и 5 заметок «похоже на цикл» при одном настоящем. Поэтому, когда доска видит
+// подкарточки (`trackSubLoops`), возврат считается по каждой подкарточке отдельно.
 function countLoops(card) {
+  if (card.subGate && Number.isFinite(card.subLoops)) return card.subLoops;
   let loops = 0, sawGate = false;
   for (const h of (card.history || [])) {
     if (!h || !h.column) continue;
@@ -4057,6 +4063,24 @@ function countLoops(card) {
     else if (h.column === "implementing" && sawGate) { loops += 1; sawGate = false; }
   }
   return loops;
+}
+// Возвраты по подкарточкам пайплайна: подкарточка, побывавшая на гейте, снова в `implementing`.
+// Вызывается на каждом тике синхронизации; `card.subGate` — какие подкарточки сейчас «после гейта».
+// Переход занимает минуты, тик — 2 с, так что шаг не теряется. Возвращает true, если что-то сменилось.
+function trackSubLoops(card, subs) {
+  if (!Array.isArray(subs) || !subs.length) return false;
+  let changed = !card.subGate;
+  const gate = card.subGate || {};
+  let loops = Number.isFinite(card.subLoops) ? card.subLoops : 0;
+  for (const s of subs) {
+    if (!s || !s.id) continue;
+    const col = normalizeColumn(s.column);
+    if ((col === "verifying" || col === "reviewing") && !gate[s.id]) { gate[s.id] = true; changed = true; }
+    else if (col === "implementing" && gate[s.id]) { loops += 1; gate[s.id] = false; changed = true; }
+  }
+  card.subGate = gate;
+  card.subLoops = loops;
+  return changed;
 }
 // Сколько байт вывалил ТЕКУЩИЙ ран. `runLogFrom` — смещение его старта: логи дописываются между
 // перезапусками, и без смещения предохранитель считал бы чужой хвост своим.
@@ -4616,6 +4640,7 @@ function syncFromPipeline() {
     try {
       if (fs.existsSync(pipFile)) {
         pip = JSON.parse(fs.readFileSync(pipFile, "utf8"));
+        if (trackSubLoops(card, pip.cards)) changed = true;
         const col = normalizeColumn(pip.column);
         // 17.09.2026 · «ready» принимается только после проверки фактов (lib/ready-gate.js).
         // Пока процесс жив — ждём его выхода: он мог записать ready и ещё дописывать итоги.
