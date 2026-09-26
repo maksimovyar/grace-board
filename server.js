@@ -1011,6 +1011,9 @@ function planOrderHold(board, card) {
   // одиночную fix-карточку. Ветка родителя не в main именно из-за красной приёмки, которую
   // эта починка и правит: заставить её ждать родителя значит заставить ждать саму себя.
   if (mine.fixFor) return null;
+  // 26.09: прогон починки красного стенда тоже не ждёт: код родителя уже в main и на стенде,
+  // а сломанный сценарий видят все, кто тестирует, — дольше, чем любой прогон в очереди.
+  if (mine.standFixFor) return null;
   const projectDir = resolveProjectDir(card.project);
   if (!isInsideRoot(projectDir)) return null;
   const mineAt = Date.parse(mine.createdAt || "") || 0;
@@ -1763,7 +1766,8 @@ const ACCEPT_GRACE_MS = Number(process.env.GRACE_ACCEPT_GRACE_SEC || 60) * 1000;
 // говорит, что проверок НЕ БЫЛО вовсе. Collapsing any of them loses the only difference the human acts on.
 const CLOSE_KEEP_STEPS = new Set(["awaiting-merge", "awaiting-deploy", "pr-ready", "merge-failed", "acceptance-broken",
   "postmerge-red",     // A4.3: смержено, но main красный — это отдельный исход, не «закрыт»
-  "stand-red", "stand-check-broken"]);   // 17.09: выкачено, но на стенде не работает / проверить не смогли
+  "stand-red", "stand-check-broken",     // 17.09: выкачено, но на стенде не работает / проверить не смогли
+  "stand-fixing"]);                      // 26.09: красный стенд чинит прогон починки, ждём его выката
 
 // Release policy of a run: what was passed at assembly wins, then the project's
 // `deploy_policy`, then the built-in default (§5.1).
@@ -2255,11 +2259,99 @@ function postMergeRedCard(board, plan, ci, logTail) {
 // ##   прогонов с «красной приёмкой, чинить нечего».
 // ## @invariants
 // ## - Включается проектом: stand.release: ci + stand.url. Иначе — старый шаг deploy.
-// ## - Провал на стенде НЕ откатывает стенд (решение владельца 17.09, вариант А): черновик карточки
-// ##   починки в следующий прогон + громкое сообщение. Стенд тестовый.
+// ## - Провал на стенде НЕ откатывает стенд (решение владельца 17.09). С 26.09 (решение владельца,
+// ##   вариант Б) доска сама заводит ОДИН прогон починки: своя ветка от свежего main, свой PR, CI,
+// ##   выкат и повторная проверка упавших сценариев (launchStandFix). Красный стенд у самого прогона
+// ##   починки второго круга не запускает — черновик карточки + громкое сообщение, как было до 26.09.
 // ## - Учётки стенда — в файле вне репозитория (stand.accounts_file в .grace/local.md), в промпт
 // ##   попадает только путь.
 const STAND_MAX_TRIES = 2;
+// Кругов авто-починки красного стенда. 0 — старое поведение: только черновик и сообщение.
+const STAND_FIX_MAX_ROUNDS = Math.max(0, Number(process.env.GRACE_STAND_FIX_ROUNDS ?? 1));
+
+// Постановка прогона починки стенда. Код родителя уже в main и на стенде, поэтому починка
+// живёт в СВОЕЙ ветке от свежего main (у родителя PR уже слит) и доезжает до стенда обычным
+// путём прогона: PR → CI → слияние → CD → проверка стенда по тем же сценариям.
+function standFixBrief(plan, failed, branch, url) {
+  return [
+    `ПОЧИНКА СТЕНДА ПОСЛЕ ПРОГОНА «${plan.goal || plan.id}» — авто-круг (второго не будет).`,
+    ``,
+    `Прогон прошёл приёмку и CI, слит в main и выкачен на стенд ${url}, но живая проверка на стенде нашла`,
+    `неработающее. Чинить нужно ровно это:`,
+    ``,
+    ...failed.map((c, i) => `${i + 1}) ${c.title}\n   что увидела проверка: ${String(c.output || "").slice(0, 1200).replace(/\n/g, "\n   ")}`
+      + `${c.evidence ? `\n   доказательство: ${c.evidence}` : ""}`),
+    ``,
+    `ВЕТКА. Код родителя уже в main — его ветка слита, в ней НЕ работай. Первым действием:`,
+    `  git fetch origin && git switch -c ${branch} origin/main`,
+    `Рабочее дерево может стоять на слитой ветке родителя «${plan.integrationBranch}» — это нормально, просто переключись.`,
+    ``,
+    `ГРАНИЦЫ. Чини ТОЛЬКО перечисленные сценарии: код уже на стенде, стенд не откатывать. Тест, который`,
+    `ловит дефект (красный без починки, зелёный с ней), обязателен. Не добавляй функциональность, не`,
+    `рефактори соседнее. Если причина в старом коде, который прогон не трогал, — почини минимально и`,
+    `напиши об этом в finishNote.`,
+  ].join("\n");
+}
+
+// Завести прогон починки красного стенда: карточка (не черновик) → прогон со своей веткой →
+// в очередь проекта вперёд остальных. Возвращает { fixPlan, card } или null, если чинить нечего.
+function launchStandFix(board, plan, failed, conf) {
+  if (!failed.length) return null;
+  const stages = planCards(board, plan);
+  const id = crypto.randomUUID().slice(0, 8);
+  const branch = `autodev/plan-${id}`;
+  const context = {
+    id: null, project: plan.project,
+    requirementsLink: (stages.find((c) => c.requirementsLink) || {}).requirementsLink || null,
+    sources: uniqStr(stages.flatMap((c) => c.sources || [])).slice(0, MAX_SOURCES),
+    files: uniqStr(stages.flatMap((c) => c.files || [])),
+    contract: null, contractResult: null,
+    type: "fix",
+  };
+  const card = spawnTailCard(board, context, {
+    theme: `Починка стенда: ${plan.goal || plan.id}`.slice(0, 200),
+    description: standFixBrief(plan, failed, branch, conf.url),
+    acceptance: failed.map((c) => c.title),
+    outOfScope: "Всё, кроме сценариев, не прошедших на стенде. Новую функциональность не добавлять.",
+    type: "fix",
+    draft: false,   // как у круга починки приёмки: этот круг доска ведёт без человека
+  });
+  card.standFor = plan.id;
+  card.fixRound = 1;
+  const cfgPol = ((readProjectConfig(resolveProjectDir(plan.project)) || {}).cfg || {}).deploy_policy || {};
+  const fixPlan = {
+    id, project: plan.project,
+    // Номера задач портала из цели родителя остаются в цели починки: хук зелёного стенда
+    // закроет их, когда стенд наконец станет зелёным.
+    goal: `Починка стенда после прогона «${plan.goal || plan.id}»`.slice(0, MAX_DESC),
+    integrationBranch: branch,
+    mode: "auto", cardIds: [card.id], status: "running",
+    policy: {
+      pr: [cfgPol.pr, DEPLOY_POLICY_DEFAULT.pr].find((v) => PR_MODES.includes(v)),
+      merge: [cfgPol.merge, DEPLOY_POLICY_DEFAULT.merge].find((v) => MERGE_MODES.includes(v)),
+      deploy: [cfgPol.deploy, DEPLOY_POLICY_DEFAULT.deploy].find((v) => DEPLOY_MODES.includes(v)),
+    },
+    model: plan.model || null, buildMode: plan.buildMode || null, loopBudget: plan.loopBudget || null,
+    decisions: Array.isArray(plan.decisions) ? plan.decisions : [],
+    createdAt: new Date().toISOString(), result: null,
+    standFixFor: plan.id,
+  };
+  board.plans = board.plans || [];
+  board.plans.push(fixPlan);
+  card.planId = id;
+  card.integrationBranch = branch;
+  card.autonomy = "auto";
+  card.planDecisions = fixPlan.decisions;
+  card.column = "todo";
+  if (canDispatchNow(board, card)) dispatchNow(board, card, "stand-fix");
+  else {
+    card.queued = true;
+    card.queuedAt = new Date().toISOString();
+    card.lastColumnChangeAt = card.queuedAt;
+    card.history.push({ column: "todo", ts: card.queuedAt, via: "stand-fix-queued" });
+  }
+  return { fixPlan, card };
+}
 function standCheckConfig(projectDir) {
   const cfg = (readProjectConfig(projectDir) || {}).cfg || {};
   const st = cfg.stand || {};
@@ -2347,6 +2439,14 @@ function standCheckTick(board, plan, projectDir, dir) {
       + `${skipped.length ? `, без проверки: ${skipped.join("; ")}` : ""}).`, "ok");
     logPlan(plan, "plan-stand-green", { checks: (v.checks || []).length, skipped: skipped.length });
     firePlanEvent(board, plan, "stand-green", { key: "stand", url: conf.url, skipped });
+    const parent = plan.standFixFor ? planById(board, plan.standFixFor) : null;
+    if (parent) {
+      parent.closeStep = "closed"; parent.archived = true;
+      parent.result = parent.result || {};
+      parent.result.deploy = { ...(parent.result.deploy || {}), status: "deployed-fixed", fixPlanId: plan.id };
+      planNotice(parent, `Стенд починен прогоном «${plan.goal || plan.id}»: сценарии прошли на стенде.`, "ok");
+      logPlan(parent, "plan-stand-fixed", { fixPlanId: plan.id });
+    }
     if (conf.onGreen) {
       const env = `export GRACE_PLAN_ID=${shq(plan.id)} GRACE_PLAN_GOAL=${shq(plan.goal || "")};`;
       spawnStep(projectDir, `${env} ${conf.onGreen}`, path.join(dir, "stand-green-hook.out"));
@@ -2355,6 +2455,21 @@ function standCheckTick(board, plan, projectDir, dir) {
   }
   const byId = new Map((v.checks || []).map((c) => [c.id, c]));
   const failed = (v.failed || []).map((id) => byId.get(id)).filter(Boolean);
+  // 26.09 (владелец, вариант Б): один круг авто-починки. Прогон починки сам на круг не имеет права.
+  if (!plan.standFixFor && STAND_FIX_MAX_ROUNDS > 0) {
+    const launched = launchStandFix(board, plan, failed, conf);
+    if (launched) {
+      plan.closeStatus = "done"; plan.closeStep = "stand-fixing";
+      plan.result.deploy = { status: "deployed-red", url: conf.url, fixPlanId: launched.fixPlan.id, fixCardId: launched.card.id };
+      planNotice(plan, `Выкачено, но на стенде не работает: ${failed.map((c) => c.title).join("; ")}. Стенд не откатывал. `
+        + `Доска чинит сама: прогон починки «${launched.fixPlan.id}» уже в работе (свой PR, CI, выкат, повторная проверка стенда). `
+        + `Твоего участия пока не нужно.`, "warn");
+      logPlan(plan, "plan-stand-fix-start", { failed: failed.map((c) => c.id), fixPlanId: launched.fixPlan.id, cardId: launched.card.id });
+      firePlanEvent(board, plan, "stand-fix-started", { key: "stand-fix", failed: failed.map((c) => c.title),
+        fixPlanId: launched.fixPlan.id, fixCardId: launched.card.id });
+      return true;
+    }
+  }
   const card = spawnTailCard(board, { id: null, project: plan.project, type: "fix" }, {
     theme: `Стенд: не работает после прогона «${plan.goal || plan.id}»`.slice(0, 200),
     type: "fix",
@@ -2370,7 +2485,7 @@ function standCheckTick(board, plan, projectDir, dir) {
   plan.closeStatus = "done"; plan.closeStep = "stand-red";
   plan.result.deploy = { status: "deployed-red", url: conf.url, fixCardId: card.id };
   planNotice(plan, `Выкачено, но на стенде не работает: ${failed.map((c) => c.title).join("; ") || "см. отчёт"}. `
-    + `Стенд не откатывал. Заведён черновик «${card.theme}» — в следующий прогон.`, "error");
+    + `Стенд не откатывал.${plan.standFixFor ? " Авто-починка стенда не помогла." : ""} Заведён черновик «${card.theme}» — в следующий прогон.`, "error");
   logPlan(plan, "plan-stand-red", { failed: failed.map((c) => c.id), cardId: card.id });
   firePlanEvent(board, plan, "stand-red", { key: "stand", failed: failed.map((c) => c.title), fixCardId: card.id });
   return true;
