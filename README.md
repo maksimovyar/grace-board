@@ -134,7 +134,7 @@ over it. See [`.env.example`](.env.example).
 | `GRACE_LOOP_MAX` | `2` | returns `verifying/reviewing → implementing` before the fuse calls the warden |
 | `GRACE_LOG_MAX_MB` | `6` | size of one run's output before the fuse calls the warden |
 | `GRACE_RELEASE_STALE_MIN` | `60` | how long a run may sit in a human-owed release stage before it is flagged |
-| `GRACE_POSTMERGE_WAIT_MIN` | `30` | how long to wait for the post-merge workflow on `main` before giving up on tagging |
+| `GRACE_POSTMERGE_WAIT_MIN` | `45` | how long to wait for the post-merge workflow on `main` before giving up on tagging |
 | `GRACE_POSTMERGE_GRACE_SEC` | `120` | grace window before "no runs yet" is read as "this repo has no post-merge CI" |
 | `GRACE_FIX_ROUNDS` | `2` | automatic repair rounds for a red acceptance before it goes to a human |
 | `GRACE_PLAN_HOOK_URL` | — | zero-config run-event webhook (same as registering `{kind:"http"}`) |

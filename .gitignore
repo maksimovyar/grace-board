@@ -31,3 +31,6 @@ dryrun_gfd/
 # screenshots: keep only the one the README uses; the rest are unrelated scratch
 /*.png
 !/board-screenshot.png
+
+# local git worktrees
+.worktrees/
