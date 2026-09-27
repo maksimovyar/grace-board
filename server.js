@@ -3585,6 +3585,11 @@ function spawnRun(projectDir, runDir, prompt, logName, opts) {
     // В `-p` MCP подключается асинхронно, и первый шаг модели идёт без его инструментов (замер 17.09:
     // status "pending"). Этот флаг заставляет дождаться подключения до старта.
     if (mcp) env.MCP_CONNECTION_NONBLOCKING = "0";
+    // С Claude Code 2.1.28x `-p` ждёт фоновые задачи только 600 с, потом обрывает их и выходит:
+    // оркестратор отдаёт карточку кодеру в фон и ждёт его — прогон умирал на «implementing»
+    // (27.09, план 01a9c949: «Background tasks still running after 600s; terminating»).
+    // Зависание всё равно ловит сторож доски по своему порогу.
+    if (!env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS) env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "0";
     const args = ["-p", prompt, "--permission-mode", "bypassPermissions", "--add-dir", projectDir,
       ...(model ? ["--model", model] : []), ...lean,
       ...(mcp ? ["--mcp-config", JSON.stringify(mcp)] : [])];
