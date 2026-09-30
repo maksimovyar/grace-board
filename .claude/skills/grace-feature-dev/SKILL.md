@@ -1,5 +1,5 @@
 ---
-version: 2026.08.10.1
+version: 2026.09.17.1
 name: grace-feature-dev
 description: Canonical board + phase + markup spec for the grace-feature-dev pipeline. Load when the /grace-feature-dev command (or its agents) needs the board.json schema, the kanban lifecycle (how a card moves through build phases), the run-level phase state machine, the GRACE semantic-exoskeleton markup template, the LDD log format, or the Anti-Loop signature rule. This file is the single source of truth for those formats.
 ---
@@ -91,6 +91,10 @@ TodoWrite — it is read from / written to this file. Anything else describing
       "rationale": "why this slice exists",
       "attempts": 0,                      // anti-loop counter (§4)
       "failSig": null,                    // last failure signature (§4)
+      "reviewBase": null,                 // HEAD before the card's first edit — base of review round 1
+      "reviewTree": null,                 // snapshot tree of the last review round — base of the next one
+      "reviewRound": 0,                   // review rounds done, cap 3
+      "notes": [],                        // non-blocking review NOTES (never send the card back)
       "verdict": null,                    // filled on done/blocked: short result + artifact paths
       "artifacts": []                     // files/logs this card produced
     }
@@ -399,13 +403,17 @@ The orchestrator owns ONE counter per card (`card.attempts` + `card.failSig`):
 - Track the **failure signature** (the content: key error / failed AC / finding
   set), **NOT** the gate name.
 - **Same signature repeats → `attempts += 1`. A different finding → reset to 1**
-  (a reviewer surfacing a *new* problem each pass is progress, not a loop).
+  (applies to gate and verifier failures).
+- **Review rounds are NOT governed by this reset.** A reviewer surfacing a new
+  finding each pass used to count as progress and made review endless. Review has
+  its own hard cap: `card.reviewRound` ≤ 3, only BLOCKING findings count (§ Review).
 - Escalation ladder by `attempts`:
   - 1-2: standard fix checklist.
   - 3: external lookup (docs / WebSearch / context7).
   - 4: WARNING — superposition of causes; list 2-3 alternative diagnoses.
   - ≥ `antiLoop.max` (default 3): set card `blocked`, record reason in `verdict`,
-    stop the loop, escalate to the human. This is the only hard stop.
+    stop the loop, escalate to the human. Together with the review-round cap
+    these are the only hard stops.
 
 ---
 
@@ -450,4 +458,18 @@ of the contract, not left to per-run judgement.
   - Reviewers keep the axes that need judgement: **simplicity/DRY** and
     **bugs/correctness**; the test quality contract (§2.7) is part of both. Placeholder code (`...`/`pass`/stub returns) stays a
     reviewer's Critical — a linter cannot tell a placeholder from a valid ellipsis.
+  - **Review is complete, not a sample** (09.2026: a T-028 card went through 5
+    review rounds, each reviewer read a different part of the code, a validation
+    bypass surfaced only in round 4, and a final "no issues" was produced by
+    nudging a reviewer that had stopped mid-way). Therefore:
+    - the reviewer gets the **diff file** (`review-<cardId>-rN.diff`) — round 1:
+      `card.reviewBase`..snapshot; round N≥2: previous snapshot..snapshot, i.e.
+      only the fix. No hand-written scope;
+    - it applies a **fixed checklist to every hunk** and returns a COVERAGE table
+      (one row per hunk) + `VERDICT:`. An answer without full coverage is re-run
+      with a fresh reviewer, never nudged; two incomplete answers → `blocked`;
+    - findings are **BLOCKING** (behaviour, bypass, crash, data, security, test that
+      cannot fail, unmet AC, stub) or **NOTES** (style, duplication, logging shape).
+      Only BLOCKING send the card back; NOTES go to `card.notes[]`;
+    - at most **3 review rounds** per card; BLOCKING in round 3 → `blocked`.
   - In `inline` mode the main thread reviews; the same checklist applies.

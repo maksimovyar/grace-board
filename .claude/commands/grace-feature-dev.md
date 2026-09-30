@@ -120,16 +120,24 @@ Loop until no card is `todo`/`backlog`-ready or a card is `blocked`:
    Verification (`[IMP:9]` when `rigor != off`; else behavior/ACs) + Chain-of-
    Verification. A missing test_guide when `rigor != off` is itself a failure.
    Returns a Bug Report.
-4. **reviewing** — move to `reviewing`. Spawn **`gfd-reviewer`** ×(1-3 by card
-   weight) in parallel (simplicity/DRY · bugs/correctness · conventions). When
-   `rigor != off` (and not pure `inline`), **always allocate one reviewer to the
-   conventions/GRACE-markup focus** (Skill §6) — markup violations are Critical.
-   Only confidence ≥ 80 findings count.
+4. **reviewing** — move to `reviewing`. Markup presence is checked by the linter
+   first (Skill §6), not by a reviewer. Then **review by diff file** (same procedure
+   as `grace-run.md` step 4): record `card.reviewBase` (HEAD) before the card's first
+   edit; round 1 reviews `git diff <reviewBase> <snap> -- <files[]>`, round N≥2
+   reviews only `git diff <previous snap> <snap> -- <files[]>`; the diff goes to
+   `<runDir>/review-<cardId>-rN.diff`. Spawn **`gfd-reviewer`** ×(1-2) with
+   `DIFF`, `ROUND`, `FOCUS` (`correctness` · `simplicity`) — no hand-written scope.
+   Accept an answer only with a COVERAGE row per hunk and a `VERDICT:`; an
+   incomplete answer is re-run with a fresh reviewer, never nudged for a verdict.
 5. **Resolve** (the commit is the LAST step — only on green, never before Verify):
    - Verify+Review green → the snapshot index already *is* `files[]`, so commit it to
      `autodev/<slug>` as the green-checkpoint: `git commit -m "green(<cardId>): <short
      title>"`, then `git worktree remove <wt> --force`. Move card to `done`, record
      `verdict`, journal it. See Skill §2.1.
+   - Only **BLOCKING** review findings are failures; **NOTES** go to `card.notes[]`
+     and the `verdict` and never send the card back. At most **3 review rounds** per
+     card: a blocking finding in round 3 → `blocked` (round 1 was incomplete — a
+     human looks). Keep the `<snap>` sha: it is the base of the next round's diff.
    - Any failure → `git worktree remove <wt> --force` + `git reset -- <files[]>`
      (unstage, keep the edits), move card back to `implementing` and fix. **Nothing is
      committed on a red card.** Update the **Anti-Loop** counter by failure
